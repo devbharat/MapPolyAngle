@@ -9,7 +9,9 @@
  * © 2025 <your-name>. MIT License.
  ***********************************************************************/
 
-import React, { useRef, useEffect, useState } from 'react';
+import React, { useRef, useEffect, useState }
+
+/* ------------------- terrain‑RGB tile helpers ---------------------- */ from 'react';
 import mapboxgl, { Map, LngLatLike, GeoJSONSource } from 'mapbox-gl';
 import MapboxDraw from '@mapbox/mapbox-gl-draw';
 
@@ -33,6 +35,8 @@ interface Props {
   terrainZoom?: number;
   /** Sample step for terrain analysis */
   sampleStep?: number;
+  /** Spacing between parallel flight lines (meters) */
+  lineSpacingM?: number;
   /** Callback when analysis is complete */
   onAnalysisComplete?: (result: AspectResult | null) => void;
   /** Callback when analysis starts */
@@ -48,6 +52,7 @@ export const MapFlightDirection: React.FC<Props> = ({
   zoom = 13,
   terrainZoom = 12,
   sampleStep = 2,
+  lineSpacingM = 150,
   onAnalysisComplete,
   onAnalysisStart,
   onError,
@@ -196,8 +201,8 @@ export const MapFlightDirection: React.FC<Props> = ({
         console.log(`Plane fit quality: ${res.fitQuality} (R²: ${res.rSquared?.toFixed(3) || 'N/A'}, RMSE: ${res.rmse?.toFixed(1) || 'N/A'}m, samples: ${res.samples})`);
       }
 
-      /* Draw the direction line --------------------------------------- */
-      addFlightLine(map, ring, res.contourDirDeg, res.fitQuality);
+      /* Draw the direction lines --------------------------------------- */
+      addFlightLine(map, ring, res.contourDirDeg, res.fitQuality, lineSpacingM);
       onAnalysisComplete?.(res);
     } catch (error) {
       if (error instanceof Error && (error.message.includes('cancelled') || error.message.includes('aborted'))) {
@@ -249,95 +254,165 @@ export const MapFlightDirection: React.FC<Props> = ({
 /* ------------------------- helper utils ----------------------------- */
 /* ==================================================================== */
 
-/* Remove previous flight‑line source/layer if present */
+/* Remove previous flight‑lines and related layers */
 function removeFlightLine(map: Map) {
+  // Remove all flight line related layers and sources
+  const layersToRemove = ['flight-lines', 'flight-lines-glow', 'flight-arrows'];
+  const sourcesToRemove = ['flight-lines', 'flight-arrows'];
+  
+  layersToRemove.forEach(layerId => {
+    if (map.getLayer(layerId)) map.removeLayer(layerId);
+  });
+  
+  sourcesToRemove.forEach(sourceId => {
+    if (map.getSource(sourceId)) map.removeSource(sourceId);
+  });
+
+  // Also remove old single-line layers for backward compatibility
   if (map.getLayer('flight-line')) map.removeLayer('flight-line');
+  if (map.getLayer('flight-line-glow')) map.removeLayer('flight-line-glow');
   if (map.getSource('flight-line')) map.removeSource('flight-line');
 }
 
-/* Add flight‑line with quality-based styling */
+/* Add multiple parallel flight lines covering the polygon */
 function addFlightLine(
   map: Map,
   ring: number[][],
   bearingDeg: number,
   fitQuality?: string,
-  lengthM = 1000,
+  lineSpacingM = 150, // Distance between parallel lines
 ) {
   removeFlightLine(map);
 
-  const centroid = ring.reduce(
-    (acc, p) => [acc[0] + p[0], acc[1] + p[1]],
-    [0, 0],
-  ).map((v) => v / ring.length) as [number, number];
-
-  const p1 = destination(centroid, bearingDeg, lengthM);
-  const p2 = destination(centroid, (bearingDeg + 180) % 360, lengthM);
-
+  // Calculate polygon bounds and dimensions
+  const bounds = getPolygonBounds(ring);
+  const { minLng, maxLng, minLat, maxLat, centroid } = bounds;
+  
+  // Calculate polygon dimensions in meters (approximate)
+  const widthM = haversineDistance([minLng, centroid[1]], [maxLng, centroid[1]]);
+  const heightM = haversineDistance([centroid[0], minLat], [centroid[0], maxLat]);
+  
+  // Determine the extent perpendicular to flight direction
+  const perpBearing = (bearingDeg + 90) % 360;
+  const maxExtentM = Math.max(widthM, heightM);
+  
+  // Calculate how many lines we need
+  const numLines = Math.ceil(maxExtentM / lineSpacingM);
+  const totalSpan = (numLines - 1) * lineSpacingM;
+  
   // Color and styling based on fit quality
   let lineColor = '#FF4081'; // Default pink
-  let lineWidth = 3;
-  let lineOpacity = 1;
+  let lineWidth = 2;
+  let lineOpacity = 0.8;
 
   switch (fitQuality) {
     case 'excellent':
       lineColor = '#00E676'; // Bright green
-      lineWidth = 4;
+      lineWidth = 2.5;
+      lineOpacity = 0.9;
       break;
     case 'good':
       lineColor = '#2196F3'; // Blue
-      lineWidth = 3;
+      lineWidth = 2;
+      lineOpacity = 0.85;
       break;
     case 'fair':
       lineColor = '#FF9800'; // Orange
-      lineWidth = 3;
-      lineOpacity = 0.8;
+      lineWidth = 2;
+      lineOpacity = 0.7;
       break;
     case 'poor':
       lineColor = '#F44336'; // Red
-      lineWidth = 2;
+      lineWidth = 1.5;
       lineOpacity = 0.6;
       break;
   }
 
-  const source: any = {
-    type: 'geojson',
-    data: {
-      type: 'Feature',
+  // Generate multiple parallel lines
+  const lines: number[][][] = [];
+  
+  for (let i = 0; i < numLines; i++) {
+    // Calculate offset from center line
+    const offsetM = (i - (numLines - 1) / 2) * lineSpacingM;
+    
+    // Find the center point of this line (offset perpendicular to flight direction)
+    const lineCenter = destination(centroid, perpBearing, offsetM);
+    
+    // Create a line extending in both directions along flight direction
+    const lineLength = maxExtentM * 1.2; // Make lines longer than polygon
+    const p1 = destination(lineCenter, bearingDeg, lineLength / 2);
+    const p2 = destination(lineCenter, (bearingDeg + 180) % 360, lineLength / 2);
+    
+    // Clip line to polygon bounds (simplified - using bounding box)
+    const clippedLine = clipLineToPolygon([p1, p2], ring);
+    if (clippedLine && clippedLine.length >= 2) {
+      lines.push(clippedLine);
+    }
+  }
+
+  // Create GeoJSON with all lines
+  const flightLines = {
+    type: 'FeatureCollection' as const,
+    features: lines.map((lineCoords, index) => ({
+      type: 'Feature' as const,
       geometry: {
-        type: 'LineString',
-        coordinates: [p1, p2],
+        type: 'LineString' as const,
+        coordinates: lineCoords,
       },
       properties: {
-        quality: fitQuality || 'unknown'
+        quality: fitQuality || 'unknown',
+        lineIndex: index,
+        isMainLine: index === Math.floor(lines.length / 2), // Middle line is main
       },
-    },
+    })),
   };
-  map.addSource('flight-line', source);
 
+  map.addSource('flight-lines', {
+    type: 'geojson',
+    data: flightLines,
+  });
+
+  // Add glow effect for high-quality fits
+  if (fitQuality === 'excellent' || fitQuality === 'good') {
+    map.addLayer({
+      id: 'flight-lines-glow',
+      type: 'line',
+      source: 'flight-lines',
+      paint: {
+        'line-color': lineColor,
+        'line-width': lineWidth + 3,
+        'line-opacity': 0.2,
+        'line-blur': 3,
+      },
+    });
+  }
+
+  // Add main flight lines
   map.addLayer({
-    id: 'flight-line',
+    id: 'flight-lines',
     type: 'line',
-    source: 'flight-line',
+    source: 'flight-lines',
     paint: {
       'line-color': lineColor,
-      'line-width': lineWidth,
-      'line-opacity': lineOpacity,
+      'line-width': [
+        'case',
+        ['get', 'isMainLine'],
+        lineWidth + 1, // Main line slightly thicker
+        lineWidth
+      ],
+      'line-opacity': [
+        'case',
+        ['get', 'isMainLine'],
+        Math.min(lineOpacity + 0.2, 1), // Main line more opaque
+        lineOpacity
+      ],
     },
   });
 
-  // Add a subtle glow effect for high-quality fits
-  if (fitQuality === 'excellent' || fitQuality === 'good') {
-    map.addLayer({
-      id: 'flight-line-glow',
-      type: 'line',
-      source: 'flight-line',
-      paint: {
-        'line-color': lineColor,
-        'line-width': lineWidth + 4,
-        'line-opacity': 0.3,
-        'line-blur': 2,
-      },
-    }, 'flight-line'); // Add behind the main line
+  // Add direction arrows on the main line
+  const mainLineIndex = Math.floor(lines.length / 2);
+  if (lines[mainLineIndex]) {
+    addDirectionArrows(map, lines[mainLineIndex], bearingDeg, lineColor);
   }
 }
 
@@ -365,7 +440,165 @@ function destination(
   return [(λ2 * 180) / Math.PI, (φ2 * 180) / Math.PI];
 }
 
-/* ------------------- terrain‑RGB tile helpers ---------------------- */
+/* ------------------- helper functions for multiple flight lines ---------------------- */
+
+/* Calculate polygon bounds and centroid */
+function getPolygonBounds(ring: number[][]) {
+  const lngs = ring.map(p => p[0]);
+  const lats = ring.map(p => p[1]);
+  
+  const minLng = Math.min(...lngs);
+  const maxLng = Math.max(...lngs);
+  const minLat = Math.min(...lats);
+  const maxLat = Math.max(...lats);
+  
+  const centroid = ring.reduce(
+    (acc, p) => [acc[0] + p[0], acc[1] + p[1]],
+    [0, 0],
+  ).map((v) => v / ring.length) as [number, number];
+  
+  return { minLng, maxLng, minLat, maxLat, centroid };
+}
+
+/* Calculate distance between two points using Haversine formula */
+function haversineDistance([lng1, lat1]: [number, number], [lng2, lat2]: [number, number]): number {
+  const R = 6371000; // Earth radius in meters
+  const φ1 = lat1 * Math.PI / 180;
+  const φ2 = lat2 * Math.PI / 180;
+  const Δφ = (lat2 - lat1) * Math.PI / 180;
+  const Δλ = (lng2 - lng1) * Math.PI / 180;
+
+  const a = Math.sin(Δφ/2) * Math.sin(Δφ/2) +
+            Math.cos(φ1) * Math.cos(φ2) *
+            Math.sin(Δλ/2) * Math.sin(Δλ/2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+
+  return R * c;
+}
+
+/* Clip line to polygon bounds (simplified version using polygon bounding box and basic intersection) */
+function clipLineToPolygon(line: [number, number][], polygonRing: number[][]): number[][] | null {
+  const [start, end] = line;
+  const result: number[][] = [];
+  
+  // Sample points along the line and check if they're inside the polygon
+  const numSamples = 50;
+  let lastInside = false;
+  let currentSegment: number[][] = [];
+  
+  for (let i = 0; i <= numSamples; i++) {
+    const t = i / numSamples;
+    const point: [number, number] = [
+      start[0] + t * (end[0] - start[0]),
+      start[1] + t * (end[1] - start[1])
+    ];
+    
+    const isInside = isPointInPolygon(point[0], point[1], polygonRing.map(p => p as [number, number]));
+    
+    if (isInside && !lastInside) {
+      // Entering polygon
+      currentSegment = [point];
+    } else if (isInside && lastInside) {
+      // Still inside
+      currentSegment.push(point);
+    } else if (!isInside && lastInside) {
+      // Exiting polygon
+      if (currentSegment.length > 0) {
+        currentSegment.push(point);
+        if (currentSegment.length >= 2) {
+          return currentSegment;
+        }
+      }
+    }
+    
+    lastInside = isInside;
+  }
+  
+  // If we end inside the polygon
+  if (currentSegment.length >= 2) {
+    return currentSegment;
+  }
+  
+  return null;
+}
+
+/* Point in polygon test */
+function isPointInPolygon(lng: number, lat: number, ring: [number, number][]): boolean {
+  let inside = false;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const [xi, yi] = ring[i];
+    const [xj, yj] = ring[j];
+
+    const intersect =
+      ((yi > lat) !== (yj > lat)) &&
+      (lng < (xj - xi) * (lat - yi) / (yj - yi + 1e-12) + xi);
+    if (intersect) inside = !inside;
+  }
+  return inside;
+}
+
+/* Add direction arrows to show flight direction */
+function addDirectionArrows(map: Map, lineCoords: number[][], bearingDeg: number, color: string) {
+  if (lineCoords.length < 2) return;
+  
+  // Create arrow symbols at intervals along the main line
+  const arrows: any[] = [];
+  const numArrows = Math.min(3, Math.floor(lineCoords.length / 10)); // 3 arrows max
+  
+  for (let i = 0; i < numArrows; i++) {
+    const t = (i + 1) / (numArrows + 1); // Position along line
+    const pointIndex = Math.floor(t * (lineCoords.length - 1));
+    const point = lineCoords[pointIndex];
+    
+    arrows.push({
+      type: 'Feature',
+      geometry: {
+        type: 'Point',
+        coordinates: point,
+      },
+      properties: {
+        bearing: bearingDeg,
+        color: color,
+      },
+    });
+  }
+  
+  if (arrows.length > 0) {
+    map.addSource('flight-arrows', {
+      type: 'geojson',
+      data: {
+        type: 'FeatureCollection',
+        features: arrows,
+      },
+    });
+
+    map.addLayer({
+      id: 'flight-arrows',
+      type: 'symbol',
+      source: 'flight-arrows',
+      layout: {
+        'icon-image': 'arrow', // Will fall back gracefully if not available
+        'icon-size': 0.5,
+        'icon-rotate': ['get', 'bearing'],
+        'icon-rotation-alignment': 'map',
+        'icon-allow-overlap': true,
+        'icon-ignore-placement': true,
+        // Fallback to text arrow if icon not available
+        'text-field': '→',
+        'text-size': 16,
+        'text-rotate': ['get', 'bearing'],
+        'text-rotation-alignment': 'map',
+        'text-allow-overlap': true,
+        'text-ignore-placement': true,
+      },
+      paint: {
+        'text-color': ['get', 'color'],
+        'text-halo-color': 'white',
+        'text-halo-width': 1,
+      },
+    });
+  }
+}
 
 /* Convert lng/lat → slippy tile (x,y) at zoom z */
 function lngLatToTile(lng: number, lat: number, z: number) {
