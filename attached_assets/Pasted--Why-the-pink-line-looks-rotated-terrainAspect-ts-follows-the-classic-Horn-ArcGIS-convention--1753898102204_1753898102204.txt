@@ -1,0 +1,100 @@
+### Why the pink line looks rotated
+
+`terrainAspect.ts` follows the *classic Horn/ArcGIS convention*:
+
+| Direction | Horn aspect (`aspectRad`) |
+| --------- | ------------------------- |
+| **0 °**   | **East**                  |
+| 90 °      | South                     |
+| 180 °     | West                      |
+| 270 °     | North                     |
+
+Mapbox (and every “compass bearing” API you will ever feed into) uses
+
+| Direction | Compass / Mapbox bearing |
+| --------- | ------------------------ |
+| **0 °**   | **North**                |
+| 90 °      | East                     |
+| 180 °     | South                    |
+| 270 °     | West                     |
+
+So the value coming out of the utility is **rotated –90 ° w\.r.t. compass bearings** (or, equivalently, you need to **add 90 °** to turn it into a Mapbox bearing).
+
+Because the library already adds +90 ° to go from *aspect* to *contour direction*,
+
+```
+contourEast0 = aspectEast0 + 90
+```
+
+you must add one more quarter‑turn when you feed that into any function that
+expects a *north‑up* bearing (Mapbox, the `destination()` helper, etc.):
+
+```
+contourNorth0 = (contourEast0 + 90) % 360
+              = (aspectEast0 + 180) % 360
+```
+
+### Quick‑fix in **`MapFlightDirection.tsx`**
+
+Right before you draw the line:
+
+```ts
+/* Compute dominant aspect / flight direction -------------------- */
+const res = dominantContourDirection(polygon, tiles, {
+  statistic: 'mean',
+  sampleStep,
+});
+
+/* --- NEW: convert to compass / Mapbox bearing ----------------- */
+const bearingForMap = (res.contourDirDeg + 90) % 360;
+
+/* Draw the direction line -------------------------------------- */
+addFlightLine(map, ring, bearingForMap);
+onAnalysisComplete?.({ ...res, contourDirDeg: bearingForMap });
+```
+
+Everything else (the Haversine `destination()` helper, the line‑layer, etc.)
+already assumes compass bearings, so no further changes are required.
+
+### If you prefer to fix it at the **library** level
+
+Replace the last few lines of `dominantContourDirection()` with:
+
+```ts
+// Convert East‑0° aspect/contour to North‑0° compass bearing
+const contourBearing = (radToDeg(contourRad) + 90) % 360;
+
+return {
+  aspectDeg: (radToDeg(aspectRad) + 90) % 360, // aspect in compass system
+  contourDirDeg: contourBearing,               // ready for Mapbox
+  samples: aspects.length,
+};
+```
+
+That way every caller gets compass‑oriented angles and you can leave the
+React component unchanged.
+
+### Sanity check
+
+Pick an obvious landform in your AOI:
+
+1. **Ridge / valley running roughly East‑West** → contour line should plot
+   East‑West (≈ 90 ° / 270 °).
+2. **South‑facing slope** (steepest descent ≈ 180 °) → contour line should be
+   East‑West (≈ 90 ° / 270 °).
+3. **North‑facing slope** (steepest descent ≈ 0 °) → contour line should be
+   East‑West again.
+
+After applying the fix, the magenta line will align with those expectations.
+
+---
+
+#### Other minor observations (not related to the rotation issue)
+
+| Issue                                                                                                                                          | Impact      | Suggested tweak                                                                                   |
+| ---------------------------------------------------------------------------------------------------------------------------------------------- | ----------- | ------------------------------------------------------------------------------------------------- |
+| `pixelResolution()` is called with `tile.width`, but the parameter name inside the method is `tilePx`; that is fine but a bit cryptic.         | None        | Rename the argument for clarity.                                                                  |
+| You centre the flight line on the **arithmetic centroid** of the ring. For concave polygons the visual centroid might lie outside the polygon. | Cosmetic    | Use a proper polygon centroid (Shoelace formula) if needed.                                       |
+| You sample every `sampleStep` pixel but still walk the entire tile grid, which can be slow at high zoom & large AOIs.                          | Performance | Consider precalculating the union bounding box at raster resolution and clipping the scan window. |
+
+Fix the 90‑degree offset and the direction you see on the map will line up with the contour lines.

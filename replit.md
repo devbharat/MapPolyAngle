@@ -118,3 +118,4 @@ Preferred communication style: Simple, everyday language.
 - **Compact Design**: Made panels thinner and more space-efficient for better user experience
 - **3D Terrain Visualization**: Added 3D elevation with 45° pitch and enhanced navigation controls
 - **Error Handling**: Implemented comprehensive AbortError handling for smooth map interactions
+- **Coordinate System Fix**: Fixed flight direction rotation by converting from Horn/ArcGIS (East=0°) to compass bearing (North=0°) convention
