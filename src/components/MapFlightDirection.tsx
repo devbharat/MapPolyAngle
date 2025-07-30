@@ -1,12 +1,12 @@
 /***********************************************************************
  * MapFlightDirection.tsx
  *
- * Minimal demo: draw a polygon, compute dominant aspect inside it,
- * show the 90 ° "constant‑height" flight direction on the map.
+ * Updated version: draw a polygon, compute dominant aspect using hybrid
+ * plane fitting approach, show the 90° "constant-height" flight direction.
  *
  * Required npm packages (peer deps): react, mapbox-gl, @mapbox/mapbox-gl-draw
  *
- * © 2025 <your‑name>. MIT License.
+ * © 2025 <your-name>. MIT License.
  ***********************************************************************/
 
 import React, { useRef, useEffect, useState } from 'react';
@@ -17,11 +17,11 @@ import 'mapbox-gl/dist/mapbox-gl.css';
 import '@mapbox/mapbox-gl-draw/dist/mapbox-gl-draw.css';
 
 import {
-  dominantContourDirection,
+  dominantContourDirectionPlaneFit,
   Polygon as AspectPolygon,
   TerrainTile,
   AspectResult,
-} from '../utils/terrainAspect';
+} from '../utils/terrainAspectHybrid';
 
 /* ----------------------------- props -------------------------------- */
 interface Props {
@@ -174,22 +174,30 @@ export const MapFlightDirection: React.FC<Props> = ({
         return;
       }
 
-      /* Compute dominant aspect / flight direction -------------------- */
-      const res = dominantContourDirection(polygon, tiles, {
-        statistic: 'mean',
+      /* Compute dominant aspect / flight direction using PLANE FITTING */
+      const res = dominantContourDirectionPlaneFit(polygon, tiles, {
         sampleStep,
       });
 
       if (signal.aborted) return;
 
       if (!Number.isFinite(res.contourDirDeg)) {
-        const errorMsg = 'Could not determine aspect (flat terrain?)';
+        const errorMsg = res.fitQuality === 'poor' 
+          ? 'Could not determine reliable direction (insufficient data or flat terrain)'
+          : 'Could not determine aspect (flat terrain?)';
         onError?.(errorMsg);
         return;
       }
 
+      // Enhanced quality feedback
+      if (res.fitQuality === 'poor') {
+        console.warn(`Low quality fit: ${res.fitQuality} (R²: ${res.rSquared?.toFixed(3) || 'N/A'}, samples: ${res.samples})`);
+      } else {
+        console.log(`Plane fit quality: ${res.fitQuality} (R²: ${res.rSquared?.toFixed(3) || 'N/A'}, RMSE: ${res.rmse?.toFixed(1) || 'N/A'}m, samples: ${res.samples})`);
+      }
+
       /* Draw the direction line --------------------------------------- */
-      addFlightLine(map, ring, res.contourDirDeg);
+      addFlightLine(map, ring, res.contourDirDeg, res.fitQuality);
       onAnalysisComplete?.(res);
     } catch (error) {
       if (error instanceof Error && (error.message.includes('cancelled') || error.message.includes('aborted'))) {
@@ -247,11 +255,12 @@ function removeFlightLine(map: Map) {
   if (map.getSource('flight-line')) map.removeSource('flight-line');
 }
 
-/* Add flight‑line as a simple 2‑km segment centred on polygon centroid */
+/* Add flight‑line with quality-based styling */
 function addFlightLine(
   map: Map,
   ring: number[][],
   bearingDeg: number,
+  fitQuality?: string,
   lengthM = 1000,
 ) {
   removeFlightLine(map);
@@ -264,6 +273,32 @@ function addFlightLine(
   const p1 = destination(centroid, bearingDeg, lengthM);
   const p2 = destination(centroid, (bearingDeg + 180) % 360, lengthM);
 
+  // Color and styling based on fit quality
+  let lineColor = '#FF4081'; // Default pink
+  let lineWidth = 3;
+  let lineOpacity = 1;
+
+  switch (fitQuality) {
+    case 'excellent':
+      lineColor = '#00E676'; // Bright green
+      lineWidth = 4;
+      break;
+    case 'good':
+      lineColor = '#2196F3'; // Blue
+      lineWidth = 3;
+      break;
+    case 'fair':
+      lineColor = '#FF9800'; // Orange
+      lineWidth = 3;
+      lineOpacity = 0.8;
+      break;
+    case 'poor':
+      lineColor = '#F44336'; // Red
+      lineWidth = 2;
+      lineOpacity = 0.6;
+      break;
+  }
+
   const source: any = {
     type: 'geojson',
     data: {
@@ -272,7 +307,9 @@ function addFlightLine(
         type: 'LineString',
         coordinates: [p1, p2],
       },
-      properties: {},
+      properties: {
+        quality: fitQuality || 'unknown'
+      },
     },
   };
   map.addSource('flight-line', source);
@@ -282,10 +319,26 @@ function addFlightLine(
     type: 'line',
     source: 'flight-line',
     paint: {
-      'line-color': '#FF4081',
-      'line-width': 3,
+      'line-color': lineColor,
+      'line-width': lineWidth,
+      'line-opacity': lineOpacity,
     },
   });
+
+  // Add a subtle glow effect for high-quality fits
+  if (fitQuality === 'excellent' || fitQuality === 'good') {
+    map.addLayer({
+      id: 'flight-line-glow',
+      type: 'line',
+      source: 'flight-line',
+      paint: {
+        'line-color': lineColor,
+        'line-width': lineWidth + 4,
+        'line-opacity': 0.3,
+        'line-blur': 2,
+      },
+    }, 'flight-line'); // Add behind the main line
+  }
 }
 
 /* Haversine destination (spheroid not needed for ~1 km) */
