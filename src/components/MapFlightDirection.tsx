@@ -190,7 +190,7 @@ export const MapFlightDirection = React.forwardRef<
           });
 
           // Add terrain layer for 3D visualization
-          map.setTerrain({ source: 'mapbox-dem', exaggeration: 1.5 });
+          map.setTerrain({ source: 'mapbox-dem', exaggeration: 2.5 });
 
           // Add 3D navigation controls
           map.addControl(new mapboxgl.NavigationControl({
