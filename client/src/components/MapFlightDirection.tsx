@@ -61,8 +61,6 @@ export const MapFlightDirection: React.FC<Props> = ({
   useEffect(() => {
     if (!mapContainer.current) return;
     
-    console.log('Initializing map with token:', mapboxToken ? 'Token present' : 'No token');
-    
     if (!mapboxToken) {
       console.error('Mapbox token is missing');
       return;
@@ -93,28 +91,14 @@ export const MapFlightDirection: React.FC<Props> = ({
     drawRef.current = draw;
     
     map.on('load', () => {
-      console.log('Map loaded successfully');
       map.addControl(draw, 'top-left');
-      console.log('Draw controls added');
       
       /* When user finishes (or updates) a polygon --------------------- */
-      map.on('draw.create', (e) => {
-        console.log('Draw create event:', e);
-        handleDraw();
-      });
-      map.on('draw.update', (e) => {
-        console.log('Draw update event:', e);
-        handleDraw();
-      });
-      map.on('draw.delete', (e) => {
-        console.log('Draw delete event:', e);
+      map.on('draw.create', handleDraw);
+      map.on('draw.update', handleDraw);
+      map.on('draw.delete', () => {
         removeFlightLine(map);
         onAnalysisComplete?.(null);
-      });
-      
-      // Add click handler for debugging
-      map.on('click', (e) => {
-        console.log('Map clicked at:', e.lngLat);
       });
     });
     
@@ -189,12 +173,14 @@ export const MapFlightDirection: React.FC<Props> = ({
       addFlightLine(map, ring, res.contourDirDeg);
       onAnalysisComplete?.(res);
     } catch (error) {
-      if (error instanceof Error && error.message.includes('cancelled')) {
-        console.log('Analysis cancelled due to new polygon');
+      if (error instanceof Error && (error.message.includes('cancelled') || error.message.includes('aborted'))) {
+        // Silently ignore cancelled requests
         return;
       }
       const errorMsg = error instanceof Error ? error.message : 'Analysis failed';
       onError?.(errorMsg);
+    } finally {
+      abortControllerRef.current = null;
     }
   };
 
@@ -426,5 +412,13 @@ async function fetchTilesForPolygon(
 ): Promise<TerrainTile[]> {
   const tilesXY = tilesCoveringPolygon(polygon, z);
   const promises = tilesXY.map((t) => fetchTerrainTile(t.x, t.y, z, token, signal));
-  return Promise.all(promises);
+  
+  try {
+    return await Promise.all(promises);
+  } catch (error) {
+    if (error instanceof Error && error.name === 'AbortError') {
+      throw new Error('Terrain tile fetch was cancelled');
+    }
+    throw error;
+  }
 }
