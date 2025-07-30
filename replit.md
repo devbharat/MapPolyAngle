@@ -107,3 +107,12 @@ Preferred communication style: Simple, everyday language.
 - Static asset optimization through Vite
 - Efficient terrain tile caching strategies
 - Mobile-responsive design for cross-device usage
+
+## Recent Changes
+
+### 2025-01-30
+- **UI Layout Optimization**: Moved all control panels to right side to prevent overlap with Mapbox drawing tools
+- **Drawing Tools Integration**: Successfully integrated MapboxDraw with polygon drawing and terrain analysis
+- **Mapbox Authentication**: Configured VITE_MAPBOX_ACCESS_TOKEN for terrain data access
+- **Terrain Analysis**: Verified working end-to-end flow from polygon drawing to flight direction calculation
+- **Compact Design**: Made panels thinner and more space-efficient for better user experience

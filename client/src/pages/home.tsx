@@ -203,32 +203,48 @@ export default function Home() {
       </header>
 
       <div className="flex-1 relative">
-        {/* Control Panel */}
-        <div className="absolute top-4 left-4 z-40 max-w-sm">
-          <Card className="backdrop-blur-md bg-white/95">
-            <CardContent className="p-4">
-              <h3 className="font-medium text-gray-900 mb-3">Drawing Tools</h3>
+        {/* Right Side Panel - Combined Controls and Instructions */}
+        <div className="absolute top-4 right-4 z-40 w-80">
+          {/* Instructions */}
+          <Card className="backdrop-blur-md bg-white/95 mb-4">
+            <CardContent className="p-3">
+              <h3 className="font-medium text-gray-900 mb-2">How to Use</h3>
+              <ol className="text-xs text-gray-600 space-y-1">
+                <li className="flex items-start space-x-2">
+                  <span className="flex-shrink-0 w-4 h-4 bg-blue-600 text-white rounded-full flex items-center justify-center text-xs font-medium">1</span>
+                  <span>Click the square tool in the top-left corner</span>
+                </li>
+                <li className="flex items-start space-x-2">
+                  <span className="flex-shrink-0 w-4 h-4 bg-blue-600 text-white rounded-full flex items-center justify-center text-xs font-medium">2</span>
+                  <span>Click points on the map to create polygon</span>
+                </li>
+                <li className="flex items-start space-x-2">
+                  <span className="flex-shrink-0 w-4 h-4 bg-blue-600 text-white rounded-full flex items-center justify-center text-xs font-medium">3</span>
+                  <span>Double-click to finish drawing</span>
+                </li>
+                <li className="flex items-start space-x-2">
+                  <span className="flex-shrink-0 w-4 h-4 bg-blue-600 text-white rounded-full flex items-center justify-center text-xs font-medium">4</span>
+                  <span>View terrain analysis results below</span>
+                </li>
+              </ol>
+            </CardContent>
+          </Card>
+
+          {/* Drawing Controls */}
+          <Card className="backdrop-blur-md bg-white/95 mb-4">
+            <CardContent className="p-3">
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="font-medium text-gray-900">Controls</h3>
+                <Button size="sm" variant="destructive" onClick={clearDrawings}>
+                  <Trash2 className="w-3 h-3" />
+                </Button>
+              </div>
               
               <div className="space-y-3">
-                <div className="space-y-2">
-                  <div className="flex items-center justify-between">
-                    <span className="text-sm text-gray-600">Draw Polygon</span>
-                    <Button size="sm" variant="destructive" onClick={clearDrawings}>
-                      <Trash2 className="w-4 h-4" />
-                    </Button>
-                  </div>
-                  <div className="text-xs text-gray-500 bg-blue-50 p-2 rounded">
-                    <strong>Look for both tools in the top-left corner:</strong><br/>
-                    • Square icon: Draw polygon<br/>
-                    • Trash icon: Delete shapes<br/>
-                    Click the square icon, then click points on the map to draw your polygon
-                  </div>
-                </div>
-                
-                <div className="border-t pt-3">
-                  <Label className="text-sm font-medium text-gray-700 mb-2">Terrain Zoom Level</Label>
+                <div>
+                  <Label className="text-xs font-medium text-gray-700">Terrain Zoom: {terrainZoom}</Label>
                   <Select value={terrainZoom.toString()} onValueChange={(value) => setTerrainZoom(parseInt(value))}>
-                    <SelectTrigger className="w-full">
+                    <SelectTrigger className="w-full h-8 text-xs">
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
@@ -241,17 +257,17 @@ export default function Home() {
                   </Select>
                 </div>
                 
-                <div className="border-t pt-3">
-                  <Label className="text-sm font-medium text-gray-700 mb-2">Sample Step: {sampleStep}</Label>
+                <div>
+                  <Label className="text-xs font-medium text-gray-700">Sample Step: {sampleStep}</Label>
                   <Input
                     type="range"
                     min="1"
                     max="5"
                     value={sampleStep}
                     onChange={(e) => setSampleStep(parseInt(e.target.value))}
-                    className="mt-2"
+                    className="mt-1 h-6"
                   />
-                  <div className="flex justify-between text-xs text-gray-500 mt-1">
+                  <div className="flex justify-between text-xs text-gray-500">
                     <span>Accurate</span>
                     <span>Fast</span>
                   </div>
@@ -261,77 +277,50 @@ export default function Home() {
           </Card>
 
           {/* Analysis Results */}
-          <Card className="backdrop-blur-md bg-white/95 mt-4">
-            <CardContent className="p-4">
-              <h3 className="font-medium text-gray-900 mb-3">Analysis Results</h3>
+          <Card className="backdrop-blur-md bg-white/95">
+            <CardContent className="p-3">
+              <h3 className="font-medium text-gray-900 mb-2">Analysis Results</h3>
               
               {isAnalyzing && (
-                <div className="flex items-center justify-center py-8">
+                <div className="flex items-center justify-center py-6">
                   <div className="text-center">
-                    <LoadingSpinner className="mx-auto mb-4" />
-                    <p className="text-gray-600">Calculating terrain aspect...</p>
+                    <LoadingSpinner size="sm" className="mx-auto mb-2" />
+                    <p className="text-xs text-gray-600">Calculating...</p>
                   </div>
                 </div>
               )}
               
               {!isAnalyzing && !analysisResult && (
-                <div className="text-center py-8 text-gray-500">
-                  <p className="text-sm">Draw a polygon to analyze terrain</p>
+                <div className="text-center py-6 text-gray-500">
+                  <p className="text-xs">Draw a polygon to start analysis</p>
                 </div>
               )}
 
               {!isAnalyzing && analysisResult && (
-                <div className="space-y-3">
+                <div className="space-y-2">
                   <div className="flex justify-between items-center">
-                    <span className="text-sm text-gray-600">Terrain Aspect:</span>
-                    <span className="font-mono text-sm font-medium">{analysisResult.aspectDeg.toFixed(1)}°</span>
+                    <span className="text-xs text-gray-600">Terrain Aspect:</span>
+                    <span className="font-mono text-xs font-medium">{analysisResult.aspectDeg.toFixed(1)}°</span>
                   </div>
                   
                   <div className="flex justify-between items-center">
-                    <span className="text-sm text-gray-600">Flight Direction:</span>
-                    <span className="font-mono text-sm font-medium text-pink-600">{analysisResult.contourDirDeg.toFixed(1)}°</span>
+                    <span className="text-xs text-gray-600">Flight Direction:</span>
+                    <span className="font-mono text-xs font-medium text-pink-600">{analysisResult.contourDirDeg.toFixed(1)}°</span>
                   </div>
                   
                   <div className="flex justify-between items-center">
-                    <span className="text-sm text-gray-600">Sample Points:</span>
-                    <span className="font-mono text-sm font-medium">{analysisResult.samples.toLocaleString()}</span>
+                    <span className="text-xs text-gray-600">Sample Points:</span>
+                    <span className="font-mono text-xs font-medium">{analysisResult.samples.toLocaleString()}</span>
                   </div>
                   
-                  <div className="border-t pt-3">
-                    <div className="flex items-center space-x-2 text-sm text-green-600">
-                      <CheckCircle className="w-4 h-4" />
+                  <div className="border-t pt-2 mt-2">
+                    <div className="flex items-center space-x-2 text-xs text-green-600">
+                      <CheckCircle className="w-3 h-3" />
                       <span>Analysis Complete</span>
                     </div>
                   </div>
                 </div>
               )}
-            </CardContent>
-          </Card>
-        </div>
-
-        {/* Instructions Panel */}
-        <div className="absolute top-4 right-4 z-40 max-w-xs">
-          <Card className="backdrop-blur-md bg-white/95">
-            <CardContent className="p-4">
-              <h3 className="font-medium text-gray-900 mb-3">How to Use</h3>
-              <ol className="text-sm text-gray-600 space-y-2">
-                <li className="flex items-start space-x-2">
-                  <span className="flex-shrink-0 w-5 h-5 bg-blue-600 text-white rounded-full flex items-center justify-center text-xs font-medium">1</span>
-                  <span>Click the polygon tool to start drawing</span>
-                </li>
-                <li className="flex items-start space-x-2">
-                  <span className="flex-shrink-0 w-5 h-5 bg-blue-600 text-white rounded-full flex items-center justify-center text-xs font-medium">2</span>
-                  <span>Click points on the map to create your polygon</span>
-                </li>
-                <li className="flex items-start space-x-2">
-                  <span className="flex-shrink-0 w-5 h-5 bg-blue-600 text-white rounded-full flex items-center justify-center text-xs font-medium">3</span>
-                  <span>Double-click to finish the polygon</span>
-                </li>
-                <li className="flex items-start space-x-2">
-                  <span className="flex-shrink-0 w-5 h-5 bg-blue-600 text-white rounded-full flex items-center justify-center text-xs font-medium">4</span>
-                  <span>View the calculated flight direction</span>
-                </li>
-              </ol>
             </CardContent>
           </Card>
         </div>
