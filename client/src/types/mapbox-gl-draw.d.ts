@@ -1,5 +1,5 @@
 declare module '@mapbox/mapbox-gl-draw' {
-  import { Control } from 'mapbox-gl';
+  import { IControl, Map } from 'mapbox-gl';
   
   interface DrawOptions {
     displayControlsDefault?: boolean;
@@ -13,8 +13,12 @@ declare module '@mapbox/mapbox-gl-draw' {
     };
   }
 
-  class MapboxDraw extends Control {
+  class MapboxDraw implements IControl {
     constructor(options?: DrawOptions);
+    
+    onAdd(map: Map): HTMLElement;
+    onRemove(map: Map): void;
+    
     getAll(): {
       type: 'FeatureCollection';
       features: Array<{

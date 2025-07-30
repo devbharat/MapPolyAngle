@@ -34,6 +34,13 @@ export default function Home() {
     import.meta.env.VITE_MAPBOX_ACCESS_TOKEN || 
     ""
   );
+  
+  // Debug environment variables
+  console.log('Environment variables:', {
+    VITE_MAPBOX_TOKEN: import.meta.env.VITE_MAPBOX_TOKEN ? 'Present' : 'Missing',
+    VITE_MAPBOX_ACCESS_TOKEN: import.meta.env.VITE_MAPBOX_ACCESS_TOKEN ? 'Present' : 'Missing',
+    mapboxToken: mapboxToken ? 'Present' : 'Missing'
+  });
   const [center, setCenter] = useState<[number, number]>([8.54, 47.37]);
   const [initialZoom, setInitialZoom] = useState(13);
   const [configOpen, setConfigOpen] = useState(false);

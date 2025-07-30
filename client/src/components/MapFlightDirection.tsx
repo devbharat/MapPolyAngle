@@ -59,30 +59,50 @@ export const MapFlightDirection: React.FC<Props> = ({
   /* init map once ---------------------------------------------------- */
   useEffect(() => {
     if (!mapContainer.current) return;
+    
+    console.log('Initializing map with token:', mapboxToken ? 'Token present' : 'No token');
+    
+    if (!mapboxToken) {
+      console.error('Mapbox token is missing');
+      return;
+    }
 
     mapboxgl.accessToken = mapboxToken;
 
     const map = new mapboxgl.Map({
       container: mapContainer.current,
-      style: 'mapbox://styles/mapbox/outdoors-v12',
+      style: 'mapbox://styles/mapbox/satellite-streets-v12',
       center,
       zoom,
+      attributionControl: true,
     });
     mapRef.current = map;
 
     const draw = new MapboxDraw({
       displayControlsDefault: false,
-      controls: { polygon: true, trash: true },
+      controls: { 
+        polygon: true, 
+        trash: true 
+      },
     });
     drawRef.current = draw;
-    map.addControl(draw, 'top-left');
-
-    /* When user finishes (or updates) a polygon --------------------- */
-    map.on('draw.create', handleDraw);
-    map.on('draw.update', handleDraw);
-    map.on('draw.delete', () => {
-      removeFlightLine(map);
-      onAnalysisComplete?.(null);
+    
+    map.on('load', () => {
+      console.log('Map loaded successfully');
+      map.addControl(draw, 'top-left');
+      
+      /* When user finishes (or updates) a polygon --------------------- */
+      map.on('draw.create', handleDraw);
+      map.on('draw.update', handleDraw);
+      map.on('draw.delete', () => {
+        removeFlightLine(map);
+        onAnalysisComplete?.(null);
+      });
+    });
+    
+    map.on('error', (e) => {
+      console.error('Map error:', e);
+      onError?.(`Map loading error: ${e.error?.message || 'Unknown error'}`);
     });
 
     return () => {
