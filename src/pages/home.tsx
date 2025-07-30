@@ -39,18 +39,21 @@ export default function Home() {
   // Updated handlers for multi-polygon support - memoized to prevent re-renders
   const handleAnalysisStart = useCallback((polygonId: string) => {
     setAnalyzingPolygons(prev => new Set(prev).add(polygonId));
-    toast({
-      title: "Analysis Started",
-      description: `Analyzing polygon ${polygonId.slice(0, 8)}...`,
-    });
-  }, [toast]);
+    // Only show toast on desktop (skip on mobile)
+    if (!isMobile) {
+      toast({
+        title: "Analysis Started",
+        description: `Analyzing polygon ${polygonId.slice(0, 8)}...`,
+      });
+    }
+  }, [toast, isMobile]);
 
   const handleAnalysisComplete = useCallback((results: PolygonAnalysisResult[]) => {
     setPolygonResults(results);
     setAnalyzingPolygons(new Set()); // Clear all analyzing states
     
-    // Show toast for the most recently completed analysis
-    if (results.length > 0) {
+    // Show toast for the most recently completed analysis (skip on mobile)
+    if (results.length > 0 && !isMobile) {
       const latestResult = results[results.length - 1];
       if (latestResult.result.samples > 0) {
         const qualityText = latestResult.result.fitQuality ? ` (${latestResult.result.fitQuality} quality)` : '';
@@ -60,7 +63,7 @@ export default function Home() {
         });
       }
     }
-  }, [toast]);
+  }, [toast, isMobile]);
 
   const handleError = useCallback((error: string, polygonId?: string) => {
     if (polygonId) {
