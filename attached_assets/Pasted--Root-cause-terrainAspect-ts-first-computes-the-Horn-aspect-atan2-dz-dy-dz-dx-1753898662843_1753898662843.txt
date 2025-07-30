@@ -1,0 +1,130 @@
+**Root‑cause**
+
+* `terrainAspect.ts` first computes the **Horn “aspect”** ( `atan2(dz / dy, ‑dz / dx)` ) but then
+  assumes that value is already a *compass bearing* (North = 0°, East = 90°).
+  In reality Horn’s raw output is rotated +90° (East = 0°), therefore the later
+  `+ 90°` shift that you apply to get the contour heading is wrong:
+
+```
+trueContour =  ⟂gradient  =  (Horn aspect – 90°)         // rotate to North‑0 system
+                + 90°                                     // rotate a further 90° to be perpendicular
+              =  Horn aspect          ❶   (no change!)
+```
+
+Because step ❶ never happens in your code, the “pink line” ends up
+**90° off** (and sometimes 180° off after you add another +90° in the React
+component).
+
+---
+
+## Fix: skip the ambiguous “aspect” altogether
+
+Compute the contour‑line bearing **directly from the gradient** for every
+pixel, then average those circular values.
+That removes all convention pitfalls.
+
+```ts
+/* ------------------------------------------------------------------ */
+/* Return circular‑average contour bearing (North‑0°, clockwise)       */
+/* ------------------------------------------------------------------ */
+export function dominantContourDirection(
+  polygon: Polygon,
+  tiles: TerrainTile[],
+  opts: Options = {},
+): AspectResult {
+  const { statistic = 'mean', sampleStep = 1 } = opts;
+
+  const bearings: number[] = [];          // radians 0–2π
+
+  for (const tile of tiles) {
+    const proj = new WebMercatorProjector(tile.z);
+
+    for (let py = 1; py < tile.height - 1; py += sampleStep) {
+      for (let px = 1; px < tile.width - 1; px += sampleStep) {
+        const [lng, lat] = proj.pixelToLngLat(
+          tile.x, tile.y, px + 0.5, py + 0.5, tile.width,
+        );
+        if (!pointInPolygon(lng, lat, polygon.coordinates)) continue;
+
+        const z = neighbourhood9(tile, px, py);
+        if (!z) continue;
+
+        const res = proj.pixelResolution(lat, tile.width);
+
+        // Horn gradient components (uphill ‑> north/east positive)
+        const dzdx = ((z[2] + 2*z[5] + z[8]) - (z[0] + 2*z[3] + z[6])) / (8*res);
+        const dzdy = ((z[6] + 2*z[7] + z[8]) - (z[0] + 2*z[1] + z[2])) / (8*res);
+
+        if (!Number.isFinite(dzdx) || !Number.isFinite(dzdy)) continue;
+        if (dzdx === 0 && dzdy === 0) continue;     // flat cell
+
+        /* ------------ bearing of local contour segment ------------- *
+         * Gradient  g = (dzdx, dzdy)  (uphill)                        *
+         * Contour tangent is perpendicular: t = (‑dzdy, dzdx)         *
+         * Bearing = atan2(  t.x , t.y )  where                        *
+         *   x = east, y = north                                       */
+        const theta = Math.atan2(-dzdy, dzdx);      // –π..π
+        bearings.push(theta < 0 ? theta + 2*Math.PI : theta);
+      }
+    }
+  }
+
+  if (!bearings.length) {
+    return { aspectDeg: NaN, contourDirDeg: NaN, samples: 0 };
+  }
+
+  /* ---------------- circular mean / median ------------------------ */
+  const dirRad = (statistic === 'median')
+    ? circularMedian(bearings)
+    : circularMean(bearings);
+
+  return {
+    aspectDeg: NaN,                           // no longer exposed (avoid confusion)
+    contourDirDeg: radToDeg(dirRad),
+    samples: bearings.length,
+  };
+}
+
+/* Utilities */
+function circularMean(arr: number[]) {
+  let sx = 0, sy = 0;
+  for (const a of arr) { sx += Math.cos(a); sy += Math.sin(a); }
+  return (Math.atan2(sy, sx) + 2*Math.PI) % (2*Math.PI);
+}
+```
+
+### What changed?
+
+| Before                                 | After (fixed)                          |
+| -------------------------------------- | -------------------------------------- |
+| Compute **aspect** first, then add 90° | Compute **contour bearing** directly   |
+| Aspect assumed *North = 0°* (wrong)    | Bearing returned in true compass frame |
+| Needed extra +90° in React component   | **Remove** that compensation           |
+
+---
+
+## Minimal changes in **`MapFlightDirection.tsx`**
+
+1. **Delete** the manual correction:
+
+```diff
+- const bearingForMap = (res.contourDirDeg + 90) % 360;
+- addFlightLine(map, ring, bearingForMap);
+- onAnalysisComplete?.({ ...res, contourDirDeg: bearingForMap });
++ addFlightLine(map, ring, res.contourDirDeg);
++ onAnalysisComplete?.(res);
+```
+
+2. No other code paths change—the `destination()` helper and Mapbox layers
+   already expect a compass bearing.
+
+---
+
+### Quick visual sanity‑check
+
+* Draw a rectangle over a uniform south‑facing slope
+  → the line should plot *east‑west* (≈ 90°/270°).
+* Draw it over a ridge running NE‑SW
+  → the line should align NE‑SW.
+
+After the patch the behaviour matches those expectations.

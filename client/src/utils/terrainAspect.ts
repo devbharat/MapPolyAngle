@@ -76,9 +76,9 @@ export function dominantContourDirection(
   } = opts;
 
   /* ------------------------------------------------------------------ */
-  /* Gather per‑pixel aspect values (radians) inside the polygon        */
+  /* Gather per‑pixel contour bearings (radians) inside the polygon     */
   /* ------------------------------------------------------------------ */
-  const aspects: number[] = [];
+  const bearings: number[] = [];          // radians 0–2π
 
   for (const tile of tiles) {
     const proj = new WebMercatorProjector(tile.z);
@@ -97,44 +97,40 @@ export function dominantContourDirection(
         // Horizontal resolution (metres) at this latitude and zoom
         const res = proj.pixelResolution(lat, tile.width);
 
-        const aspectRad = hornAspect(elev, res);
-        if (!Number.isFinite(aspectRad)) continue;
+        // Horn gradient components (uphill -> north/east positive)
+        const dzdx = ((elev[2] + 2*elev[5] + elev[8]) - (elev[0] + 2*elev[3] + elev[6])) / (8*res);
+        const dzdy = ((elev[6] + 2*elev[7] + elev[8]) - (elev[0] + 2*elev[1] + elev[2])) / (8*res);
 
-        aspects.push(aspectRad);
+        if (!Number.isFinite(dzdx) || !Number.isFinite(dzdy)) continue;
+        if (dzdx === 0 && dzdy === 0) continue;     // flat cell
+
+        /* ------------ bearing of local contour segment ------------- *
+         * Gradient  g = (dzdx, dzdy)  (uphill)                        *
+         * Contour tangent is perpendicular: t = (-dzdy, dzdx)         *
+         * Bearing = atan2(  t.x , t.y )  where                        *
+         *   x = east, y = north                                       */
+        const theta = Math.atan2(-dzdy, dzdx);      // –π..π
+        bearings.push(theta < 0 ? theta + 2*Math.PI : theta);
       }
     }
   }
 
-  if (aspects.length === 0) {
+  if (!bearings.length) {
     return { aspectDeg: NaN, contourDirDeg: NaN, samples: 0 };
   }
 
   /* ------------------------------------------------------------------ */
-  /* Combine aspects (circular statistic)                               */
+  /* Combine bearings (circular statistic)                              */
   /* ------------------------------------------------------------------ */
 
-  let aspectRad: number;
-
-  if (statistic === 'mean') {
-    // Circular mean via vector summation
-    let sx = 0, sy = 0;
-    for (const a of aspects) {
-      sx += Math.cos(a);
-      sy += Math.sin(a);
-    }
-    aspectRad = Math.atan2(sy, sx); // ‑π..π
-    if (aspectRad < 0) aspectRad += 2 * Math.PI;
-  } else {
-    // Circular median via angular distance minimisation (Weiss, 1966)
-    aspectRad = circularMedian(aspects);
-  }
-
-  const contourRad = (aspectRad + Math.PI / 2) % (2 * Math.PI);
+  const dirRad = (statistic === 'median')
+    ? circularMedian(bearings)
+    : circularMean(bearings);
 
   return {
-    aspectDeg: radToDeg(aspectRad),
-    contourDirDeg: radToDeg(contourRad),
-    samples: aspects.length,
+    aspectDeg: NaN,                           // no longer exposed (avoid confusion)
+    contourDirDeg: radToDeg(dirRad),
+    samples: bearings.length,
   };
 }
 
@@ -160,18 +156,14 @@ function neighbourhood9(tile: TerrainTile, px: number, py: number): number[] | n
   return elev;
 }
 
-/** Horn (1981) aspect in *radians 0–2π*, following GIS conventions. */
-function hornAspect(z: number[], res: number): number {
-  // z index mapping:
-  // 0 1 2
-  // 3 4 5
-  // 6 7 8
-  const dzdx = ((z[2] + 2 * z[5] + z[8]) - (z[0] + 2 * z[3] + z[6])) / (8 * res);
-  const dzdy = ((z[6] + 2 * z[7] + z[8]) - (z[0] + 2 * z[1] + z[2])) / (8 * res);
-
-  // Aspect measured clockwise from north: atan2(dz/dy, -dz/dx)
-  const aspect = Math.atan2(dzdy, -dzdx);
-  return (aspect < 0) ? aspect + 2 * Math.PI : aspect;
+/** Circular mean of angles in radians. */
+function circularMean(arr: number[]): number {
+  let sx = 0, sy = 0;
+  for (const a of arr) { 
+    sx += Math.cos(a); 
+    sy += Math.sin(a); 
+  }
+  return (Math.atan2(sy, sx) + 2*Math.PI) % (2*Math.PI);
 }
 
 /** Read elevation (metres) for pixel (px,py) in a tile. */

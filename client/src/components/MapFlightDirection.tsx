@@ -188,12 +188,9 @@ export const MapFlightDirection: React.FC<Props> = ({
         return;
       }
 
-      /* Convert from Horn/ArcGIS convention (East=0°) to compass bearing (North=0°) */
-      const bearingForMap = (res.contourDirDeg + 90) % 360;
-
       /* Draw the direction line --------------------------------------- */
-      addFlightLine(map, ring, bearingForMap);
-      onAnalysisComplete?.({ ...res, contourDirDeg: bearingForMap });
+      addFlightLine(map, ring, res.contourDirDeg);
+      onAnalysisComplete?.(res);
     } catch (error) {
       if (error instanceof Error && (error.message.includes('cancelled') || error.message.includes('aborted'))) {
         // Silently ignore cancelled requests
