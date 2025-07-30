@@ -158,7 +158,7 @@ export const MapFlightDirection = React.forwardRef<
 
         const map = new mapboxgl.Map({
           container: mapContainer.current,
-          style: 'mapbox://styles/mapbox/satellite-streets-v12',
+          style: 'mapbox://styles/mapbox/satellite-v9',
           center,
           zoom,
           pitch: 45, // Enable 3D perspective
