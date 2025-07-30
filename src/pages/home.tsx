@@ -5,6 +5,7 @@ import { Card, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { LoadingSpinner } from '@/components/ui/loading-spinner';
 import { useToast } from '@/hooks/use-toast';
+import { useIsMobile } from '@/hooks/use-mobile';
 import { Map, Trash2, CheckCircle, AlertCircle, TrendingUp, Target, X } from 'lucide-react';
 
 // Updated interface to match the new multi-polygon component
@@ -16,6 +17,7 @@ interface PolygonAnalysisResult {
 
 export default function Home() {
   const { toast } = useToast();
+  const isMobile = useIsMobile();
   const mapRef = useRef<any>(null); // Ref to access map methods
   
   // Updated state for multiple polygons
@@ -162,203 +164,205 @@ export default function Home() {
       </header>
 
       <div className="flex-1 relative">
-        {/* Right Side Panel - Combined Controls and Instructions */}
-        <div className="absolute top-4 right-4 z-40 w-80 max-h-[calc(100vh-120px)] overflow-y-auto">
-          {/* Instructions */}
-          <Card className="backdrop-blur-md bg-white/95 mb-4">
-            <CardContent className="p-3">
-              <h3 className="font-medium text-gray-900 mb-2">How to Use</h3>
-              <ol className="text-xs text-gray-600 space-y-1">
-                <li className="flex items-start space-x-2">
-                  <span className="flex-shrink-0 w-4 h-4 bg-blue-600 text-white rounded-full flex items-center justify-center text-xs font-medium">1</span>
-                  <span>Use 3D navigation controls (top-right) to rotate the map</span>
-                </li>
-                <li className="flex items-start space-x-2">
-                  <span className="flex-shrink-0 w-4 h-4 bg-blue-600 text-white rounded-full flex items-center justify-center text-xs font-medium">2</span>
-                  <span>Click the square tool (top-left) to draw polygons</span>
-                </li>
-                <li className="flex items-start space-x-2">
-                  <span className="flex-shrink-0 w-4 h-4 bg-blue-600 text-white rounded-full flex items-center justify-center text-xs font-medium">3</span>
-                  <span>Click points on terrain to create each polygon</span>
-                </li>
-                <li className="flex items-start space-x-2">
-                  <span className="flex-shrink-0 w-4 h-4 bg-blue-600 text-white rounded-full flex items-center justify-center text-xs font-medium">4</span>
-                  <span>Double-click to finish - analyze multiple areas!</span>
-                </li>
-              </ol>
-              <div className="mt-2 pt-2 border-t">
-                <p className="text-xs text-gray-500">
-                  <strong>New:</strong> Multi-polygon support with individual analysis results
-                </p>
-              </div>
-            </CardContent>
-          </Card>
-
-          {/* Analysis Results */}
-          <Card className="backdrop-blur-md bg-white/95">
-            <CardContent className="p-3">
-              <div className="flex items-center justify-between mb-2">
-                <h3 className="font-medium text-gray-900">Analysis Results</h3>
-                <Button size="sm" variant="outline" onClick={clearAllDrawings}>
-                  <Trash2 className="w-3 h-3 mr-1" />
-                  Clear All
-                </Button>
-              </div>
-              
-              {isAnalyzing && (
-                <div className="flex items-center justify-center py-4 border-b mb-3">
-                  <div className="text-center">
-                    <LoadingSpinner size="sm" className="mx-auto mb-2" />
-                    <p className="text-xs text-gray-600">
-                      Analyzing {analyzingPolygons.size} polygon{analyzingPolygons.size !== 1 ? 's' : ''}...
-                    </p>
-                  </div>
-                </div>
-              )}
-              
-              {!isAnalyzing && !hasResults && (
-                <div className="text-center py-6 text-gray-500">
-                  <p className="text-xs">Draw polygons to start analysis</p>
-                  <p className="text-xs mt-1 text-gray-400">Support for multiple areas!</p>
-                </div>
-              )}
-
-              {/* Multiple Polygon Results */}
-              {hasResults && (
-                <div className="space-y-4 max-h-96 overflow-y-auto">
-                  {polygonResults.map((polygonResult, index) => {
-                    const { polygonId, result } = polygonResult;
-                    const shortId = polygonId.slice(0, 8);
-                    
-                    return (
-                      <div key={polygonId} className="border rounded-lg p-3 bg-white">
-                        {/* Polygon Header */}
-                        <div className="flex items-center justify-between mb-2">
-                          <div className="flex items-center space-x-2">
-                            <span className="text-sm font-medium text-gray-900">
-                              Polygon {index + 1}
-                            </span>
-                            <span className="text-xs text-gray-500 font-mono">
-                              #{shortId}
-                            </span>
-                          </div>
-                          <div className="flex items-center space-x-2">
-                            {/* Quality Indicator */}
-                            {result.fitQuality && (
-                              <div className={`flex items-center space-x-1 px-2 py-0.5 rounded-full text-xs font-medium ${getQualityIndicator(result.fitQuality).bgColor} ${getQualityIndicator(result.fitQuality).color}`}>
-                                <span>{getQualityIndicator(result.fitQuality).icon}</span>
-                                <span>{getQualityIndicator(result.fitQuality).label}</span>
-                              </div>
-                            )}
-                            <Button 
-                              size="sm" 
-                              variant="ghost" 
-                              className="h-6 w-6 p-0 text-gray-400 hover:text-red-500"
-                              onClick={() => clearSpecificPolygon(polygonId)}
-                            >
-                              <X className="w-3 h-3" />
-                            </Button>
-                          </div>
-                        </div>
-
-                        {/* Flight Direction - Primary Result */}
-                        <div className="bg-blue-50 rounded-lg p-2 mb-2">
-                          <div className="flex items-center justify-between">
-                            <div className="flex items-center space-x-2">
-                              <Target className="w-4 h-4 text-blue-600" />
-                              <span className="text-sm font-medium text-blue-900">Flight Direction:</span>
-                            </div>
-                            <span className="font-mono text-lg font-bold text-blue-700">
-                              {result.contourDirDeg.toFixed(1)}°
-                            </span>
-                          </div>
-                        </div>
-                        
-                        {/* Secondary Metrics */}
-                        <div className="space-y-1 text-xs">
-                          <div className="flex justify-between items-center">
-                            <span className="text-gray-600">Terrain Aspect:</span>
-                            <span className="font-mono font-medium">{result.aspectDeg.toFixed(1)}°</span>
-                          </div>
-                          
-                          <div className="flex justify-between items-center">
-                            <span className="text-gray-600">Sample Points:</span>
-                            <span className="font-mono font-medium">{result.samples.toLocaleString()}</span>
-                          </div>
-
-                          {/* Advanced Metrics */}
-                          {result.rSquared !== undefined && (
-                            <div className="flex justify-between items-center">
-                              <span className="text-gray-600">R² (fit accuracy):</span>
-                              <span className="font-mono font-medium">{result.rSquared.toFixed(3)}</span>
-                            </div>
-                          )}
-
-                          {result.rmse !== undefined && (
-                            <div className="flex justify-between items-center">
-                              <span className="text-gray-600">RMSE:</span>
-                              <span className="font-mono font-medium">{result.rmse.toFixed(1)}m</span>
-                            </div>
-                          )}
-
-                          {result.slopeMagnitude !== undefined && (
-                            <div className="flex justify-between items-center">
-                              <span className="text-gray-600">Terrain Slope:</span>
-                              <span className="font-mono font-medium">{(result.slopeMagnitude * 100).toFixed(1)}%</span>
-                            </div>
-                          )}
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-
-              {/* Summary for multiple polygons */}
-              {hasResults && polygonResults.length > 1 && (
-                <div className="border-t pt-2 mt-3">
-                  <div className="flex items-center justify-between text-xs">
-                    <div className="flex items-center space-x-2 text-green-600">
-                      <CheckCircle className="w-3 h-3" />
-                      <span>{polygonResults.length} Areas Analyzed</span>
-                    </div>
-                    <div className="flex items-center space-x-1 text-gray-500">
-                      <TrendingUp className="w-3 h-3" />
-                      <span>3D Plane Fitting</span>
-                    </div>
-                  </div>
-                </div>
-              )}
-            </CardContent>
-          </Card>
-
-          {/* Quality Legend (only show when there are results) */}
-          {hasResults && (
-            <Card className="backdrop-blur-md bg-white/95 mt-4">
+        {/* Right Side Panel - Combined Controls and Instructions - Hidden on mobile */}
+        {!isMobile && (
+          <div className="absolute top-4 right-4 z-40 w-80 max-h-[calc(100vh-120px)] overflow-y-auto">
+            {/* Instructions */}
+            <Card className="backdrop-blur-md bg-white/95 mb-4">
               <CardContent className="p-3">
-                <h4 className="font-medium text-gray-900 mb-2 text-sm">Quality Guide</h4>
-                <div className="space-y-1 text-xs">
-                  <div className="flex items-center space-x-2">
-                    <span className="text-green-600">● Excellent:</span>
-                    <span className="text-gray-600">R² &gt; 0.95, highly reliable</span>
-                  </div>
-                  <div className="flex items-center space-x-2">
-                    <span className="text-blue-600">● Good:</span>
-                    <span className="text-gray-600">R² &gt; 0.85, reliable</span>
-                  </div>
-                  <div className="flex items-center space-x-2">
-                    <span className="text-orange-600">● Fair:</span>
-                    <span className="text-gray-600">R² &gt; 0.7, use with caution</span>
-                  </div>
-                  <div className="flex items-center space-x-2">
-                    <span className="text-red-600">● Poor:</span>
-                    <span className="text-gray-600">Low confidence, check terrain</span>
-                  </div>
+                <h3 className="font-medium text-gray-900 mb-2">How to Use</h3>
+                <ol className="text-xs text-gray-600 space-y-1">
+                  <li className="flex items-start space-x-2">
+                    <span className="flex-shrink-0 w-4 h-4 bg-blue-600 text-white rounded-full flex items-center justify-center text-xs font-medium">1</span>
+                    <span>Use 3D navigation controls (top-right) to rotate the map</span>
+                  </li>
+                  <li className="flex items-start space-x-2">
+                    <span className="flex-shrink-0 w-4 h-4 bg-blue-600 text-white rounded-full flex items-center justify-center text-xs font-medium">2</span>
+                    <span>Click the square tool (top-left) to draw polygons</span>
+                  </li>
+                  <li className="flex items-start space-x-2">
+                    <span className="flex-shrink-0 w-4 h-4 bg-blue-600 text-white rounded-full flex items-center justify-center text-xs font-medium">3</span>
+                    <span>Click points on terrain to create each polygon</span>
+                  </li>
+                  <li className="flex items-start space-x-2">
+                    <span className="flex-shrink-0 w-4 h-4 bg-blue-600 text-white rounded-full flex items-center justify-center text-xs font-medium">4</span>
+                    <span>Double-click to finish - analyze multiple areas!</span>
+                  </li>
+                </ol>
+                <div className="mt-2 pt-2 border-t">
+                  <p className="text-xs text-gray-500">
+                    <strong>New:</strong> Multi-polygon support with individual analysis results
+                  </p>
                 </div>
               </CardContent>
             </Card>
-          )}
-        </div>
+
+            {/* Analysis Results */}
+            <Card className="backdrop-blur-md bg-white/95">
+              <CardContent className="p-3">
+                <div className="flex items-center justify-between mb-2">
+                  <h3 className="font-medium text-gray-900">Analysis Results</h3>
+                  <Button size="sm" variant="outline" onClick={clearAllDrawings}>
+                    <Trash2 className="w-3 h-3 mr-1" />
+                    Clear All
+                  </Button>
+                </div>
+                
+                {isAnalyzing && (
+                  <div className="flex items-center justify-center py-4 border-b mb-3">
+                    <div className="text-center">
+                      <LoadingSpinner size="sm" className="mx-auto mb-2" />
+                      <p className="text-xs text-gray-600">
+                        Analyzing {analyzingPolygons.size} polygon{analyzingPolygons.size !== 1 ? 's' : ''}...
+                      </p>
+                    </div>
+                  </div>
+                )}
+                
+                {!isAnalyzing && !hasResults && (
+                  <div className="text-center py-6 text-gray-500">
+                    <p className="text-xs">Draw polygons to start analysis</p>
+                    <p className="text-xs mt-1 text-gray-400">Support for multiple areas!</p>
+                  </div>
+                )}
+
+                {/* Multiple Polygon Results */}
+                {hasResults && (
+                  <div className="space-y-4 max-h-96 overflow-y-auto">
+                    {polygonResults.map((polygonResult, index) => {
+                      const { polygonId, result } = polygonResult;
+                      const shortId = polygonId.slice(0, 8);
+                      
+                      return (
+                        <div key={polygonId} className="border rounded-lg p-3 bg-white">
+                          {/* Polygon Header */}
+                          <div className="flex items-center justify-between mb-2">
+                            <div className="flex items-center space-x-2">
+                              <span className="text-sm font-medium text-gray-900">
+                                Polygon {index + 1}
+                              </span>
+                              <span className="text-xs text-gray-500 font-mono">
+                                #{shortId}
+                              </span>
+                            </div>
+                            <div className="flex items-center space-x-2">
+                              {/* Quality Indicator */}
+                              {result.fitQuality && (
+                                <div className={`flex items-center space-x-1 px-2 py-0.5 rounded-full text-xs font-medium ${getQualityIndicator(result.fitQuality).bgColor} ${getQualityIndicator(result.fitQuality).color}`}>
+                                  <span>{getQualityIndicator(result.fitQuality).icon}</span>
+                                  <span>{getQualityIndicator(result.fitQuality).label}</span>
+                                </div>
+                              )}
+                              <Button 
+                                size="sm" 
+                                variant="ghost" 
+                                className="h-6 w-6 p-0 text-gray-400 hover:text-red-500"
+                                onClick={() => clearSpecificPolygon(polygonId)}
+                              >
+                                <X className="w-3 h-3" />
+                              </Button>
+                            </div>
+                          </div>
+
+                          {/* Flight Direction - Primary Result */}
+                          <div className="bg-blue-50 rounded-lg p-2 mb-2">
+                            <div className="flex items-center justify-between">
+                              <div className="flex items-center space-x-2">
+                                <Target className="w-4 h-4 text-blue-600" />
+                                <span className="text-sm font-medium text-blue-900">Flight Direction:</span>
+                              </div>
+                              <span className="font-mono text-lg font-bold text-blue-700">
+                                {result.contourDirDeg.toFixed(1)}°
+                              </span>
+                            </div>
+                          </div>
+                          
+                          {/* Secondary Metrics */}
+                          <div className="space-y-1 text-xs">
+                            <div className="flex justify-between items-center">
+                              <span className="text-gray-600">Terrain Aspect:</span>
+                              <span className="font-mono font-medium">{result.aspectDeg.toFixed(1)}°</span>
+                            </div>
+                            
+                            <div className="flex justify-between items-center">
+                              <span className="text-gray-600">Sample Points:</span>
+                              <span className="font-mono font-medium">{result.samples.toLocaleString()}</span>
+                            </div>
+
+                            {/* Advanced Metrics */}
+                            {result.rSquared !== undefined && (
+                              <div className="flex justify-between items-center">
+                                <span className="text-gray-600">R² (fit accuracy):</span>
+                                <span className="font-mono font-medium">{result.rSquared.toFixed(3)}</span>
+                              </div>
+                            )}
+
+                            {result.rmse !== undefined && (
+                              <div className="flex justify-between items-center">
+                                <span className="text-gray-600">RMSE:</span>
+                                <span className="font-mono font-medium">{result.rmse.toFixed(1)}m</span>
+                              </div>
+                            )}
+
+                            {result.slopeMagnitude !== undefined && (
+                              <div className="flex justify-between items-center">
+                                <span className="text-gray-600">Terrain Slope:</span>
+                                <span className="font-mono font-medium">{(result.slopeMagnitude * 100).toFixed(1)}%</span>
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+
+                {/* Summary for multiple polygons */}
+                {hasResults && polygonResults.length > 1 && (
+                  <div className="border-t pt-2 mt-3">
+                    <div className="flex items-center justify-between text-xs">
+                      <div className="flex items-center space-x-2 text-green-600">
+                        <CheckCircle className="w-3 h-3" />
+                        <span>{polygonResults.length} Areas Analyzed</span>
+                      </div>
+                      <div className="flex items-center space-x-1 text-gray-500">
+                        <TrendingUp className="w-3 h-3" />
+                        <span>3D Plane Fitting</span>
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+
+            {/* Quality Legend (only show when there are results) */}
+            {hasResults && (
+              <Card className="backdrop-blur-md bg-white/95 mt-4">
+                <CardContent className="p-3">
+                  <h4 className="font-medium text-gray-900 mb-2 text-sm">Quality Guide</h4>
+                  <div className="space-y-1 text-xs">
+                    <div className="flex items-center space-x-2">
+                      <span className="text-green-600">● Excellent:</span>
+                      <span className="text-gray-600">R² &gt; 0.95, highly reliable</span>
+                    </div>
+                    <div className="flex items-center space-x-2">
+                      <span className="text-blue-600">● Good:</span>
+                      <span className="text-gray-600">R² &gt; 0.85, reliable</span>
+                    </div>
+                    <div className="flex items-center space-x-2">
+                      <span className="text-orange-600">● Fair:</span>
+                      <span className="text-gray-600">R² &gt; 0.7, use with caution</span>
+                    </div>
+                    <div className="flex items-center space-x-2">
+                      <span className="text-red-600">● Poor:</span>
+                      <span className="text-gray-600">Low confidence, check terrain</span>
+                    </div>
+                  </div>
+                </CardContent>
+              </Card>
+            )}
+          </div>
+        )}
 
         {/* Map Container */}
         <MapFlightDirection
