@@ -137,26 +137,28 @@ export default function Home() {
   return (
     <div className="h-screen flex flex-col bg-gray-50">
       {/* Header */}
-      <header className="bg-white shadow-sm border-b border-gray-200 px-6 py-4 relative z-50">
+      <header className="bg-white shadow-sm border-b border-gray-200 px-4 md:px-6 py-3 md:py-4 relative z-50">
         <div className="flex items-center justify-between">
-          <div className="flex items-center space-x-3">
-            <div className="w-8 h-8 bg-blue-600 rounded-lg flex items-center justify-center">
-              <Map className="w-5 h-5 text-white" />
+          <div className="flex items-center space-x-2 md:space-x-3">
+            <div className="w-6 h-6 md:w-8 md:h-8 bg-blue-600 rounded-lg flex items-center justify-center">
+              <Map className="w-4 h-4 md:w-5 md:h-5 text-white" />
             </div>
             <div>
-              <h1 className="text-xl font-medium text-gray-900">Terrain Flight Director</h1>
-              <p className="text-sm text-gray-500">Multi-polygon 3D plane fitting for optimal flight paths</p>
+              <h1 className="text-base md:text-xl font-medium text-gray-900">Terrain Flight Director</h1>
+              <p className="text-xs md:text-sm text-gray-500 hidden sm:block">Multi-polygon 3D plane fitting for optimal flight paths</p>
             </div>
           </div>
           
-          <div className="flex items-center space-x-4">
-            <div className="flex items-center space-x-2 bg-green-100 text-green-700 px-3 py-1 rounded-full text-sm">
-              <div className="w-2 h-2 bg-green-500 rounded-full"></div>
-              <span>Connected to Mapbox</span>
+          <div className="flex items-center space-x-2 md:space-x-4">
+            <div className="hidden sm:flex items-center space-x-1 md:space-x-2 bg-green-100 text-green-700 px-2 md:px-3 py-1 rounded-full text-xs md:text-sm">
+              <div className="w-1.5 h-1.5 md:w-2 md:h-2 bg-green-500 rounded-full"></div>
+              <span className="hidden sm:inline">Connected to Mapbox</span>
+              <span className="sm:hidden">Connected</span>
             </div>
             {hasResults && (
-              <div className="flex items-center space-x-2 bg-blue-100 text-blue-700 px-3 py-1 rounded-full text-sm">
-                <span>{polygonResults.length} polygon{polygonResults.length !== 1 ? 's' : ''} analyzed</span>
+              <div className="hidden sm:flex items-center space-x-1 md:space-x-2 bg-blue-100 text-blue-700 px-2 md:px-3 py-1 rounded-full text-xs md:text-sm">
+                <span className="hidden sm:inline">{polygonResults.length} polygon{polygonResults.length !== 1 ? 's' : ''} analyzed</span>
+                <span className="sm:hidden">{polygonResults.length} poly</span>
               </div>
             )}
           </div>
