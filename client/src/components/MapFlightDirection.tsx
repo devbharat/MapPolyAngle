@@ -55,6 +55,7 @@ export const MapFlightDirection: React.FC<Props> = ({
   const mapContainer = useRef<HTMLDivElement>(null);
   const mapRef = useRef<Map>();
   const drawRef = useRef<MapboxDraw>();
+  const abortControllerRef = useRef<AbortController | null>(null);
 
   /* init map once ---------------------------------------------------- */
   useEffect(() => {
@@ -123,6 +124,10 @@ export const MapFlightDirection: React.FC<Props> = ({
     });
 
     return () => {
+      // Cancel any ongoing requests
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+      }
       map.remove();
     };
   }, [mapboxToken, center, zoom]);
@@ -132,6 +137,11 @@ export const MapFlightDirection: React.FC<Props> = ({
     const map = mapRef.current!;
     const draw = drawRef.current!;
     const f = draw.getAll();
+
+    /* Cancel any ongoing analysis */
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+    }
 
     /* Expect exactly one polygon */
     if (!f.features.length || f.features[0].geometry.type !== 'Polygon') {
@@ -146,8 +156,15 @@ export const MapFlightDirection: React.FC<Props> = ({
     try {
       onAnalysisStart?.();
 
+      /* Create new abort controller for this analysis */
+      abortControllerRef.current = new AbortController();
+      const signal = abortControllerRef.current.signal;
+
       /* Fetch terrain tiles at desired zoom --------------------------- */
-      const tiles = await fetchTilesForPolygon(polygon, terrainZoom, mapboxToken);
+      const tiles = await fetchTilesForPolygon(polygon, terrainZoom, mapboxToken, signal);
+      
+      if (signal.aborted) return;
+      
       if (!tiles.length) {
         const errorMsg = 'Terrain tiles not found – polygon outside coverage?';
         onError?.(errorMsg);
@@ -160,6 +177,8 @@ export const MapFlightDirection: React.FC<Props> = ({
         sampleStep,
       });
 
+      if (signal.aborted) return;
+
       if (!Number.isFinite(res.contourDirDeg)) {
         const errorMsg = 'Could not determine aspect (flat terrain?)';
         onError?.(errorMsg);
@@ -170,6 +189,10 @@ export const MapFlightDirection: React.FC<Props> = ({
       addFlightLine(map, ring, res.contourDirDeg);
       onAnalysisComplete?.(res);
     } catch (error) {
+      if (error instanceof Error && error.message.includes('cancelled')) {
+        console.log('Analysis cancelled due to new polygon');
+        return;
+      }
       const errorMsg = error instanceof Error ? error.message : 'Analysis failed';
       onError?.(errorMsg);
     }
@@ -323,35 +346,73 @@ async function fetchTerrainTile(
   y: number,
   z: number,
   token: string,
+  signal?: AbortSignal,
 ): Promise<TerrainTile> {
   const url = `https://api.mapbox.com/v4/mapbox.terrain-rgb/${z}/${x}/${y}.pngraw?access_token=${token}`;
 
-  const img = await loadImage(url); // HTMLImageElement
-  const canvas = document.createElement('canvas');
-  canvas.width = img.width;
-  canvas.height = img.height;
-  const ctx = canvas.getContext('2d')!;
-  ctx.drawImage(img, 0, 0);
-  const imgData = ctx.getImageData(0, 0, img.width, img.height);
+  try {
+    const img = await loadImage(url, signal); // HTMLImageElement
+    const canvas = document.createElement('canvas');
+    canvas.width = img.width;
+    canvas.height = img.height;
+    const ctx = canvas.getContext('2d')!;
+    ctx.drawImage(img, 0, 0);
+    const imgData = ctx.getImageData(0, 0, img.width, img.height);
 
-  return {
-    x,
-    y,
-    z,
-    width: img.width,
-    height: img.height,
-    data: imgData.data,
-    format: 'terrain-rgb',
-  };
+    return {
+      x,
+      y,
+      z,
+      width: img.width,
+      height: img.height,
+      data: imgData.data,
+      format: 'terrain-rgb',
+    };
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') {
+      throw new Error('Terrain tile fetch was cancelled');
+    }
+    throw error;
+  }
 }
 
 /* Utility to load image via Blob */
-function loadImage(url: string): Promise<HTMLImageElement> {
+function loadImage(url: string, signal?: AbortSignal): Promise<HTMLImageElement> {
   return new Promise((res, rej) => {
     const img = new Image();
     img.crossOrigin = 'anonymous';
-    img.onload = () => res(img);
-    img.onerror = rej;
+    
+    const cleanup = () => {
+      img.onload = null;
+      img.onerror = null;
+      if (signal) {
+        signal.removeEventListener('abort', handleAbort);
+      }
+    };
+    
+    const handleAbort = () => {
+      cleanup();
+      rej(new DOMException('Image load aborted', 'AbortError'));
+    };
+    
+    img.onload = () => {
+      cleanup();
+      res(img);
+    };
+    
+    img.onerror = () => {
+      cleanup();
+      rej(new Error('Failed to load terrain tile image'));
+    };
+    
+    if (signal) {
+      if (signal.aborted) {
+        handleAbort();
+        return;
+      }
+      signal.addEventListener('abort', handleAbort);
+    }
+    
     img.src = url;
   });
 }
@@ -361,8 +422,9 @@ async function fetchTilesForPolygon(
   polygon: AspectPolygon,
   z: number,
   token: string,
+  signal?: AbortSignal,
 ): Promise<TerrainTile[]> {
   const tilesXY = tilesCoveringPolygon(polygon, z);
-  const promises = tilesXY.map((t) => fetchTerrainTile(t.x, t.y, z, token));
+  const promises = tilesXY.map((t) => fetchTerrainTile(t.x, t.y, z, token, signal));
   return Promise.all(promises);
 }
