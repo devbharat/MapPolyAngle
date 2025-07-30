@@ -144,10 +144,10 @@ export default function Home() {
       <div className="flex-1 relative">
         {/* Right Side Panel - Combined Controls and Instructions - Hidden on mobile */}
         {!isMobile && (
-          <div className="absolute top-4 right-4 z-40 w-80 max-h-[calc(100vh-120px)] overflow-y-auto">
+          <div className="absolute top-2 right-2 z-40 w-80 max-h-[calc(100vh-120px)] overflow-y-auto">
           {/* Instructions */}
           <Card className="backdrop-blur-md bg-white/95 mb-4">
-            <CardContent className="p-3">
+            <CardContent className="p-1">
               <h3 className="font-medium text-gray-900 mb-2">How to Use</h3>
               <ol className="text-xs text-gray-600 space-y-1">
                 <li className="flex items-start space-x-2">
