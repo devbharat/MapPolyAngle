@@ -11,6 +11,7 @@ declare module '@mapbox/mapbox-gl-draw' {
       combine_features?: boolean;
       uncombine_features?: boolean;
     };
+    defaultMode?: string;
   }
 
   class MapboxDraw implements IControl {
@@ -33,6 +34,7 @@ declare module '@mapbox/mapbox-gl-draw' {
     };
     deleteAll(): void;
     delete(featureId: string): void;
+    changeMode(mode: string): void;
   }
 
   export = MapboxDraw;

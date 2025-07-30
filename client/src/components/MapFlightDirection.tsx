@@ -84,19 +84,33 @@ export const MapFlightDirection: React.FC<Props> = ({
         polygon: true, 
         trash: true 
       },
+      defaultMode: 'simple_select'
     });
     drawRef.current = draw;
     
     map.on('load', () => {
       console.log('Map loaded successfully');
       map.addControl(draw, 'top-left');
+      console.log('Draw controls added');
       
       /* When user finishes (or updates) a polygon --------------------- */
-      map.on('draw.create', handleDraw);
-      map.on('draw.update', handleDraw);
-      map.on('draw.delete', () => {
+      map.on('draw.create', (e) => {
+        console.log('Draw create event:', e);
+        handleDraw();
+      });
+      map.on('draw.update', (e) => {
+        console.log('Draw update event:', e);
+        handleDraw();
+      });
+      map.on('draw.delete', (e) => {
+        console.log('Draw delete event:', e);
         removeFlightLine(map);
         onAnalysisComplete?.(null);
+      });
+      
+      // Add click handler for debugging
+      map.on('click', (e) => {
+        console.log('Map clicked at:', e.lngLat);
       });
     });
     
@@ -168,9 +182,19 @@ export const MapFlightDirection: React.FC<Props> = ({
     }
   };
 
-  /* Expose clear method via ref */
+  /* Public method to activate polygon drawing */
+  const startPolygonDrawing = () => {
+    const draw = drawRef.current;
+    if (draw) {
+      (draw as any).changeMode('draw_polygon');
+      console.log('Activated polygon drawing mode');
+    }
+  };
+
+  /* Expose methods via ref */
   React.useImperativeHandle(undefined, () => ({
     clearDrawings,
+    startPolygonDrawing,
   }), []);
 
   /* ------------------------ render div ----------------------------- */

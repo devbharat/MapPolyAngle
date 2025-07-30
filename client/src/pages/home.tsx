@@ -210,15 +210,15 @@ export default function Home() {
               <h3 className="font-medium text-gray-900 mb-3">Drawing Tools</h3>
               
               <div className="space-y-3">
-                <div className="flex items-center justify-between">
-                  <span className="text-sm text-gray-600">Draw Polygon</span>
-                  <div className="flex items-center space-x-2">
-                    <Button size="sm" className="bg-blue-600 hover:bg-blue-700">
-                      <Map className="w-4 h-4" />
-                    </Button>
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-sm text-gray-600">Draw Polygon</span>
                     <Button size="sm" variant="destructive" onClick={clearDrawings}>
                       <Trash2 className="w-4 h-4" />
                     </Button>
+                  </div>
+                  <div className="text-xs text-gray-500 bg-blue-50 p-2 rounded">
+                    Click the polygon tool (⬛) in the top-left corner of the map, then click points to draw your polygon
                   </div>
                 </div>
                 
