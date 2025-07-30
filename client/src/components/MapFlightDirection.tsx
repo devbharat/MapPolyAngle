@@ -73,6 +73,8 @@ export const MapFlightDirection: React.FC<Props> = ({
       style: 'mapbox://styles/mapbox/satellite-streets-v12',
       center,
       zoom,
+      pitch: 45, // Enable 3D perspective
+      bearing: 0,
       attributionControl: true,
     });
     mapRef.current = map;
@@ -91,6 +93,23 @@ export const MapFlightDirection: React.FC<Props> = ({
     drawRef.current = draw;
     
     map.on('load', () => {
+      // Add terrain source for 3D elevation
+      map.addSource('mapbox-dem', {
+        type: 'raster-dem',
+        url: 'mapbox://mapbox.mapbox-terrain-dem-v1',
+        tileSize: 512,
+        maxzoom: 14
+      });
+
+      // Add terrain layer for 3D visualization
+      map.setTerrain({ source: 'mapbox-dem', exaggeration: 1.5 });
+
+      // Add 3D navigation controls
+      map.addControl(new mapboxgl.NavigationControl({
+        visualizePitch: true
+      }), 'top-right');
+
+      // Add drawing controls
       map.addControl(draw, 'top-left');
       
       /* When user finishes (or updates) a polygon --------------------- */

@@ -207,19 +207,19 @@ export default function Home() {
               <ol className="text-xs text-gray-600 space-y-1">
                 <li className="flex items-start space-x-2">
                   <span className="flex-shrink-0 w-4 h-4 bg-blue-600 text-white rounded-full flex items-center justify-center text-xs font-medium">1</span>
-                  <span>Click the square tool in the top-left corner</span>
+                  <span>Use 3D navigation controls (top-right) to rotate the map</span>
                 </li>
                 <li className="flex items-start space-x-2">
                   <span className="flex-shrink-0 w-4 h-4 bg-blue-600 text-white rounded-full flex items-center justify-center text-xs font-medium">2</span>
-                  <span>Click points on the map to create polygon</span>
+                  <span>Click the square tool (top-left) to draw polygon</span>
                 </li>
                 <li className="flex items-start space-x-2">
                   <span className="flex-shrink-0 w-4 h-4 bg-blue-600 text-white rounded-full flex items-center justify-center text-xs font-medium">3</span>
-                  <span>Double-click to finish drawing</span>
+                  <span>Click points on terrain to create polygon</span>
                 </li>
                 <li className="flex items-start space-x-2">
                   <span className="flex-shrink-0 w-4 h-4 bg-blue-600 text-white rounded-full flex items-center justify-center text-xs font-medium">4</span>
-                  <span>View terrain analysis results below</span>
+                  <span>Double-click to finish and see flight direction</span>
                 </li>
               </ol>
             </CardContent>
