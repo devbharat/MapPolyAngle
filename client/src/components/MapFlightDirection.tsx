@@ -79,12 +79,15 @@ export const MapFlightDirection: React.FC<Props> = ({
     mapRef.current = map;
 
     const draw = new MapboxDraw({
-      displayControlsDefault: false,
+      displayControlsDefault: true,
       controls: { 
         polygon: true, 
-        trash: true 
-      },
-      defaultMode: 'simple_select'
+        trash: true,
+        line_string: false,
+        point: false,
+        combine_features: false,
+        uncombine_features: false
+      }
     });
     drawRef.current = draw;
     

@@ -218,7 +218,10 @@ export default function Home() {
                     </Button>
                   </div>
                   <div className="text-xs text-gray-500 bg-blue-50 p-2 rounded">
-                    Click the polygon tool (⬛) in the top-left corner of the map, then click points to draw your polygon
+                    <strong>Look for both tools in the top-left corner:</strong><br/>
+                    • Square icon: Draw polygon<br/>
+                    • Trash icon: Delete shapes<br/>
+                    Click the square icon, then click points on the map to draw your polygon
                   </div>
                 </div>
                 
