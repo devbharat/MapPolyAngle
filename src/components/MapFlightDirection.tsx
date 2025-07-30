@@ -1,18 +1,17 @@
 /***********************************************************************
  * MapFlightDirection.tsx
  *
- * Updated version: draw a polygon, compute dominant aspect using hybrid
- * plane fitting approach, show the 90° "constant-height" flight direction.
+ * Multi-polygon version: draw multiple polygons, compute dominant aspect 
+ * using hybrid plane fitting for each, show 90° "constant-height" flight 
+ * directions for all polygons simultaneously.
  *
  * Required npm packages (peer deps): react, mapbox-gl, @mapbox/mapbox-gl-draw
  *
  * © 2025 <your-name>. MIT License.
  ***********************************************************************/
 
-import React, { useRef, useEffect, useState }
-
-/* ------------------- terrain‑RGB tile helpers ---------------------- */ from 'react';
-import mapboxgl, { Map, LngLatLike, GeoJSONSource } from 'mapbox-gl';
+import React, { useRef, useEffect, useState } from 'react';
+import mapboxgl, { Map as MapboxMap, LngLatLike, GeoJSONSource } from 'mapbox-gl';
 import MapboxDraw from '@mapbox/mapbox-gl-draw';
 
 import 'mapbox-gl/dist/mapbox-gl.css';
@@ -24,6 +23,13 @@ import {
   TerrainTile,
   AspectResult,
 } from '../utils/terrainAspectHybrid';
+
+/* Enhanced result interface for multiple polygons */
+interface PolygonAnalysisResult {
+  polygonId: string;
+  result: AspectResult;
+  polygon: AspectPolygon;
+}
 
 /* ----------------------------- props -------------------------------- */
 interface Props {
@@ -37,16 +43,24 @@ interface Props {
   sampleStep?: number;
   /** Spacing between parallel flight lines (meters) */
   lineSpacingM?: number;
-  /** Callback when analysis is complete */
-  onAnalysisComplete?: (result: AspectResult | null) => void;
-  /** Callback when analysis starts */
-  onAnalysisStart?: () => void;
+  /** Callback when any polygon analysis completes - receives all results */
+  onAnalysisComplete?: (results: PolygonAnalysisResult[]) => void;
+  /** Callback when analysis starts for a specific polygon */
+  onAnalysisStart?: (polygonId: string) => void;
   /** Callback for errors */
-  onError?: (error: string) => void;
+  onError?: (error: string, polygonId?: string) => void;
 }
 
 /* ----------------------- main React component ----------------------- */
-export const MapFlightDirection: React.FC<Props> = ({
+export const MapFlightDirection = React.forwardRef<
+  {
+    clearAllDrawings: () => void;
+    clearPolygon: (polygonId: string) => void;
+    startPolygonDrawing: () => void;
+    getPolygonResults: () => PolygonAnalysisResult[];
+  },
+  Props
+>(({
   mapboxToken,
   center = [8.54, 47.37],
   zoom = 13,
@@ -56,190 +70,286 @@ export const MapFlightDirection: React.FC<Props> = ({
   onAnalysisComplete,
   onAnalysisStart,
   onError,
-}) => {
+}, ref) => {
   const mapContainer = useRef<HTMLDivElement>(null);
-  const mapRef = useRef<Map>();
+  const mapRef = useRef<MapboxMap>();
   const drawRef = useRef<MapboxDraw>();
-  const abortControllerRef = useRef<AbortController | null>(null);
+  const abortControllersRef = useRef<Map<string, AbortController>>(new Map());
+  
+  // Store analysis results for each polygon
+  const [polygonResults, setPolygonResults] = useState<Map<string, PolygonAnalysisResult>>(new Map());
+
+  /* Handle new polygon creation */
+  const handleDrawCreate = async (e: any) => {
+    const features = e.features;
+    for (const feature of features) {
+      if (feature.geometry.type === 'Polygon') {
+        await analyzePolygon(feature.id, feature);
+      }
+    }
+  };
+
+  /* Handle polygon updates */
+  const handleDrawUpdate = async (e: any) => {
+    const features = e.features;
+    for (const feature of features) {
+      if (feature.geometry.type === 'Polygon') {
+        await analyzePolygon(feature.id, feature);
+      }
+    }
+  };
+
+  /* Handle polygon deletion */
+  const handleDrawDelete = (e: any) => {
+    const features = e.features;
+    for (const feature of features) {
+      if (feature.geometry.type === 'Polygon') {
+        const polygonId = feature.id;
+        
+        // Cancel ongoing analysis for this polygon
+        const controller = abortControllersRef.current.get(polygonId);
+        if (controller) {
+          controller.abort();
+          abortControllersRef.current.delete(polygonId);
+        }
+        
+        // Remove flight lines for this polygon
+        removeFlightLinesForPolygon(mapRef.current!, polygonId);
+        
+        // Remove from results
+        setPolygonResults((prev) => {
+          const newResults = new Map(prev);
+          newResults.delete(polygonId);
+          
+          // Notify callback with updated results
+          onAnalysisComplete?.(Array.from(newResults.values()));
+          
+          return newResults;
+        });
+      }
+    }
+  };
 
   /* init map once ---------------------------------------------------- */
   useEffect(() => {
-    if (!mapContainer.current) return;
+    // Ensure the container exists and is properly mounted
+    if (!mapContainer.current) {
+      console.warn('Map container not ready yet');
+      return;
+    }
     
     if (!mapboxToken) {
       console.error('Mapbox token is missing');
+      onError?.('Mapbox token is missing');
       return;
     }
 
-    mapboxgl.accessToken = mapboxToken;
-
-    const map = new mapboxgl.Map({
-      container: mapContainer.current,
-      style: 'mapbox://styles/mapbox/satellite-streets-v12',
-      center,
-      zoom,
-      pitch: 45, // Enable 3D perspective
-      bearing: 0,
-      attributionControl: true,
-    });
-    mapRef.current = map;
-
-    const draw = new MapboxDraw({
-      displayControlsDefault: true,
-      controls: { 
-        polygon: true, 
-        trash: true,
-        line_string: false,
-        point: false,
-        combine_features: false,
-        uncombine_features: false
+    // Small delay to ensure DOM is fully ready
+    const timeoutId = setTimeout(() => {
+      // Double-check container is still available
+      if (!mapContainer.current) {
+        console.error('Map container became unavailable');
+        onError?.('Map container is not available');
+        return;
       }
-    });
-    drawRef.current = draw;
-    
-    map.on('load', () => {
-      // Add terrain source for 3D elevation
-      map.addSource('mapbox-dem', {
-        type: 'raster-dem',
-        url: 'mapbox://mapbox.mapbox-terrain-dem-v1',
-        tileSize: 512,
-        maxzoom: 14
-      });
 
-      // Add terrain layer for 3D visualization
-      map.setTerrain({ source: 'mapbox-dem', exaggeration: 1.5 });
+      try {
+        mapboxgl.accessToken = mapboxToken;
 
-      // Add 3D navigation controls
-      map.addControl(new mapboxgl.NavigationControl({
-        visualizePitch: true
-      }), 'top-right');
+        const map = new mapboxgl.Map({
+          container: mapContainer.current,
+          style: 'mapbox://styles/mapbox/satellite-streets-v12',
+          center,
+          zoom,
+          pitch: 45, // Enable 3D perspective
+          bearing: 0,
+          attributionControl: true,
+        });
+        mapRef.current = map;
 
-      // Add drawing controls
-      map.addControl(draw, 'top-left');
-      
-      /* When user finishes (or updates) a polygon --------------------- */
-      map.on('draw.create', handleDraw);
-      map.on('draw.update', handleDraw);
-      map.on('draw.delete', () => {
-        removeFlightLine(map);
-        onAnalysisComplete?.(null);
-      });
-    });
-    
-    map.on('error', (e) => {
-      console.error('Map error:', e);
-      onError?.(`Map loading error: ${e.error?.message || 'Unknown error'}`);
-    });
+        const draw = new MapboxDraw({
+          displayControlsDefault: true,
+          controls: { 
+            polygon: true, 
+            trash: true,
+            line_string: false,
+            point: false,
+            combine_features: false,
+            uncombine_features: false
+          }
+        });
+        drawRef.current = draw;
+        
+        map.on('load', () => {
+          // Add terrain source for 3D elevation
+          map.addSource('mapbox-dem', {
+            type: 'raster-dem',
+            url: 'mapbox://mapbox.mapbox-terrain-dem-v1',
+            tileSize: 512,
+            maxzoom: 14
+          });
+
+          // Add terrain layer for 3D visualization
+          map.setTerrain({ source: 'mapbox-dem', exaggeration: 1.5 });
+
+          // Add 3D navigation controls
+          map.addControl(new mapboxgl.NavigationControl({
+            visualizePitch: true
+          }), 'top-right');
+
+          // Add drawing controls
+          map.addControl(draw, 'top-left');
+          
+          // Handle multiple polygon events
+          map.on('draw.create', handleDrawCreate);
+          map.on('draw.update', handleDrawUpdate);
+          map.on('draw.delete', handleDrawDelete);
+        });
+        
+        map.on('error', (e) => {
+          console.error('Map error:', e);
+          onError?.(`Map loading error: ${e.error?.message || 'Unknown error'}`);
+        });
+      } catch (error) {
+        console.error('Failed to initialize map:', error);
+        onError?.(`Failed to initialize map: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      }
+    }, 100); // Small delay to ensure DOM is ready
 
     return () => {
-      // Cancel any ongoing requests
-      if (abortControllerRef.current) {
-        abortControllerRef.current.abort();
+      clearTimeout(timeoutId);
+      // Cancel all ongoing requests
+      abortControllersRef.current.forEach((controller: AbortController) => controller.abort());
+      abortControllersRef.current.clear();
+      if (mapRef.current) {
+        mapRef.current.remove();
       }
-      map.remove();
     };
-  }, [mapboxToken, center, zoom]);
+  }, [mapboxToken, center, zoom, onError]);
 
-  /* -------------- handle polygon draw / update --------------------- */
-  const handleDraw = async () => {
+  /* Analyze a specific polygon */
+  const analyzePolygon = async (polygonId: string, feature: any) => {
     const map = mapRef.current!;
-    const draw = drawRef.current!;
-    const f = draw.getAll();
-
-    /* Cancel any ongoing analysis */
-    if (abortControllerRef.current) {
-      abortControllerRef.current.abort();
+    
+    // Cancel any existing analysis for this polygon
+    const existingController = abortControllersRef.current.get(polygonId);
+    if (existingController) {
+      existingController.abort();
     }
 
-    /* Expect exactly one polygon */
-    if (!f.features.length || f.features[0].geometry.type !== 'Polygon') {
-      removeFlightLine(map);
-      onAnalysisComplete?.(null);
-      return;
-    }
-
-    const ring = (f.features[0].geometry.coordinates as number[][][])[0];
+    const ring = feature.geometry.coordinates[0];
     const polygon: AspectPolygon = { coordinates: ring as [number, number][] };
 
     try {
-      onAnalysisStart?.();
+      onAnalysisStart?.(polygonId);
 
-      /* Create new abort controller for this analysis */
-      abortControllerRef.current = new AbortController();
-      const signal = abortControllerRef.current.signal;
+      // Create new abort controller for this polygon
+      const controller = new AbortController();
+      abortControllersRef.current.set(polygonId, controller);
+      const signal = controller.signal;
 
-      /* Fetch terrain tiles at desired zoom --------------------------- */
+      // Fetch terrain tiles
       const tiles = await fetchTilesForPolygon(polygon, terrainZoom, mapboxToken, signal);
       
       if (signal.aborted) return;
       
       if (!tiles.length) {
-        const errorMsg = 'Terrain tiles not found – polygon outside coverage?';
-        onError?.(errorMsg);
+        onError?.('Terrain tiles not found – polygon outside coverage?', polygonId);
         return;
       }
 
-      /* Compute dominant aspect / flight direction using PLANE FITTING */
-      const res = dominantContourDirectionPlaneFit(polygon, tiles, {
+      // Compute aspect analysis
+      const result = dominantContourDirectionPlaneFit(polygon, tiles, {
         sampleStep,
       });
 
       if (signal.aborted) return;
 
-      if (!Number.isFinite(res.contourDirDeg)) {
-        const errorMsg = res.fitQuality === 'poor' 
+      if (!Number.isFinite(result.contourDirDeg)) {
+        const errorMsg = result.fitQuality === 'poor' 
           ? 'Could not determine reliable direction (insufficient data or flat terrain)'
           : 'Could not determine aspect (flat terrain?)';
-        onError?.(errorMsg);
+        onError?.(errorMsg, polygonId);
         return;
       }
 
-      // Enhanced quality feedback
-      if (res.fitQuality === 'poor') {
-        console.warn(`Low quality fit: ${res.fitQuality} (R²: ${res.rSquared?.toFixed(3) || 'N/A'}, samples: ${res.samples})`);
+      // Log quality info
+      if (result.fitQuality === 'poor') {
+        console.warn(`Polygon ${polygonId} - Low quality fit: ${result.fitQuality} (R²: ${result.rSquared?.toFixed(3) || 'N/A'}, samples: ${result.samples})`);
       } else {
-        console.log(`Plane fit quality: ${res.fitQuality} (R²: ${res.rSquared?.toFixed(3) || 'N/A'}, RMSE: ${res.rmse?.toFixed(1) || 'N/A'}m, samples: ${res.samples})`);
+        console.log(`Polygon ${polygonId} - Plane fit quality: ${result.fitQuality} (R²: ${result.rSquared?.toFixed(3) || 'N/A'}, RMSE: ${result.rmse?.toFixed(1) || 'N/A'}m, samples: ${result.samples})`);
       }
 
-      /* Draw the direction lines --------------------------------------- */
-      addFlightLine(map, ring, res.contourDirDeg, res.fitQuality, lineSpacingM);
-      onAnalysisComplete?.(res);
+      // Draw flight lines for this polygon
+      addFlightLinesForPolygon(map, polygonId, ring, result.contourDirDeg, result.fitQuality, lineSpacingM);
+      
+      // Update results
+      const polygonResult: PolygonAnalysisResult = {
+        polygonId,
+        result,
+        polygon,
+      };
+
+      setPolygonResults((prev) => {
+        const newResults = new Map(prev);
+        newResults.set(polygonId, polygonResult);
+        
+        // Notify callback with all current results
+        onAnalysisComplete?.(Array.from(newResults.values()));
+        
+        return newResults;
+      });
+
     } catch (error) {
       if (error instanceof Error && (error.message.includes('cancelled') || error.message.includes('aborted'))) {
-        // Silently ignore cancelled requests
-        return;
+        return; // Silently ignore cancelled requests
       }
       const errorMsg = error instanceof Error ? error.message : 'Analysis failed';
-      onError?.(errorMsg);
+      onError?.(errorMsg, polygonId);
     } finally {
-      abortControllerRef.current = null;
+      abortControllersRef.current.delete(polygonId);
     }
   };
 
-  /* Public method to clear drawings */
-  const clearDrawings = () => {
+  /* Public methods */
+  const clearAllDrawings = () => {
     const draw = drawRef.current;
     if (draw) {
       draw.deleteAll();
-      removeFlightLine(mapRef.current!);
-      onAnalysisComplete?.(null);
+      // This will trigger handleDrawDelete for all polygons
     }
   };
 
-  /* Public method to activate polygon drawing */
+  const clearPolygon = (polygonId: string) => {
+    const draw = drawRef.current;
+    if (draw) {
+      try {
+        draw.delete(polygonId);
+        // This will trigger handleDrawDelete for this specific polygon
+      } catch (error) {
+        console.warn(`Failed to delete polygon ${polygonId}:`, error);
+      }
+    }
+  };
+
   const startPolygonDrawing = () => {
     const draw = drawRef.current;
     if (draw) {
       (draw as any).changeMode('draw_polygon');
-      console.log('Activated polygon drawing mode');
     }
   };
 
-  /* Expose methods via ref */
-  React.useImperativeHandle(undefined, () => ({
-    clearDrawings,
+  const getPolygonResults = (): PolygonAnalysisResult[] => {
+    return Array.from(polygonResults.values());
+  };
+
+  // Expose methods via ref
+  React.useImperativeHandle(ref, () => ({
+    clearAllDrawings,
+    clearPolygon,
     startPolygonDrawing,
-  }), []);
+    getPolygonResults,
+  }), [polygonResults]);
 
   /* ------------------------ render div ----------------------------- */
   return (
@@ -248,17 +358,23 @@ export const MapFlightDirection: React.FC<Props> = ({
       style={{ position: 'relative', width: '100%', height: '100%' }}
     />
   );
-};
+});
 
 /* ==================================================================== */
 /* ------------------------- helper utils ----------------------------- */
 /* ==================================================================== */
 
-/* Remove previous flight‑lines and related layers */
-function removeFlightLine(map: Map) {
-  // Remove all flight line related layers and sources
-  const layersToRemove = ['flight-lines', 'flight-lines-glow', 'flight-arrows'];
-  const sourcesToRemove = ['flight-lines', 'flight-arrows'];
+/* Remove flight lines for a specific polygon */
+function removeFlightLinesForPolygon(map: MapboxMap, polygonId: string) {
+  const layersToRemove = [
+    `flight-lines-${polygonId}`,
+    `flight-lines-glow-${polygonId}`,
+    `flight-arrows-${polygonId}`
+  ];
+  const sourcesToRemove = [
+    `flight-lines-${polygonId}`,
+    `flight-arrows-${polygonId}`
+  ];
   
   layersToRemove.forEach(layerId => {
     if (map.getLayer(layerId)) map.removeLayer(layerId);
@@ -267,22 +383,19 @@ function removeFlightLine(map: Map) {
   sourcesToRemove.forEach(sourceId => {
     if (map.getSource(sourceId)) map.removeSource(sourceId);
   });
-
-  // Also remove old single-line layers for backward compatibility
-  if (map.getLayer('flight-line')) map.removeLayer('flight-line');
-  if (map.getLayer('flight-line-glow')) map.removeLayer('flight-line-glow');
-  if (map.getSource('flight-line')) map.removeSource('flight-line');
 }
 
-/* Add multiple parallel flight lines covering the polygon */
-function addFlightLine(
-  map: Map,
+/* Add multiple parallel flight lines for a specific polygon */
+function addFlightLinesForPolygon(
+  map: MapboxMap,
+  polygonId: string,
   ring: number[][],
   bearingDeg: number,
   fitQuality?: string,
-  lineSpacingM = 150, // Distance between parallel lines
+  lineSpacingM = 150,
 ) {
-  removeFlightLine(map);
+  // Remove existing flight lines for this polygon
+  removeFlightLinesForPolygon(map, polygonId);
 
   // Calculate polygon bounds and dimensions
   const bounds = getPolygonBounds(ring);
@@ -301,6 +414,102 @@ function addFlightLine(
   const totalSpan = (numLines - 1) * lineSpacingM;
   
   // Color and styling based on fit quality
+  const { lineColor, lineWidth, lineOpacity } = getStyleForQuality(fitQuality);
+
+  // Generate multiple parallel lines
+  const lines: number[][][] = [];
+  
+  for (let i = 0; i < numLines; i++) {
+    // Calculate offset from center line
+    const offsetM = (i - (numLines - 1) / 2) * lineSpacingM;
+    
+    // Find the center point of this line (offset perpendicular to flight direction)
+    const lineCenter = destination(centroid, perpBearing, offsetM);
+    
+    // Create a line extending in both directions along flight direction
+    const lineLength = maxExtentM * 1.2; // Make lines longer than polygon
+    const p1 = destination(lineCenter, bearingDeg, lineLength / 2);
+    const p2 = destination(lineCenter, (bearingDeg + 180) % 360, lineLength / 2);
+    
+    // Clip line to polygon bounds (simplified - using bounding box)
+    const clippedLine = clipLineToPolygon([p1, p2], ring);
+    if (clippedLine && clippedLine.length >= 2) {
+      lines.push(clippedLine);
+    }
+  }
+
+  if (lines.length === 0) return;
+
+  // Create GeoJSON with all lines for this polygon
+  const flightLines = {
+    type: 'FeatureCollection' as const,
+    features: lines.map((lineCoords, index) => ({
+      type: 'Feature' as const,
+      geometry: {
+        type: 'LineString' as const,
+        coordinates: lineCoords,
+      },
+      properties: {
+        polygonId,
+        quality: fitQuality || 'unknown',
+        lineIndex: index,
+        isMainLine: index === Math.floor(lines.length / 2), // Middle line is main
+      },
+    })),
+  };
+
+  // Add source with unique polygon ID
+  map.addSource(`flight-lines-${polygonId}`, {
+    type: 'geojson',
+    data: flightLines,
+  });
+
+  // Add glow effect for high-quality fits
+  if (fitQuality === 'excellent' || fitQuality === 'good') {
+    map.addLayer({
+      id: `flight-lines-glow-${polygonId}`,
+      type: 'line',
+      source: `flight-lines-${polygonId}`,
+      paint: {
+        'line-color': lineColor,
+        'line-width': lineWidth + 3,
+        'line-opacity': 0.2,
+        'line-blur': 3,
+      },
+    });
+  }
+
+  // Add main flight lines
+  map.addLayer({
+    id: `flight-lines-${polygonId}`,
+    type: 'line',
+    source: `flight-lines-${polygonId}`,
+    paint: {
+      'line-color': lineColor,
+      'line-width': [
+        'case',
+        ['get', 'isMainLine'],
+        lineWidth + 1, // Main line slightly thicker
+        lineWidth
+      ],
+      'line-opacity': [
+        'case',
+        ['get', 'isMainLine'],
+        Math.min(lineOpacity + 0.2, 1), // Main line more opaque
+        lineOpacity
+      ],
+    },
+  });
+
+  // Add direction arrows on the main line
+  const mainLineIndex = Math.floor(lines.length / 2);
+  if (lines[mainLineIndex]) {
+    addDirectionArrowsForPolygon(map, polygonId, lines[mainLineIndex], bearingDeg, lineColor);
+  }
+}
+
+/* Get styling based on fit quality */
+function getStyleForQuality(fitQuality?: string) {
   let lineColor = '#FF4081'; // Default pink
   let lineWidth = 2;
   let lineOpacity = 0.8;
@@ -328,91 +537,76 @@ function addFlightLine(
       break;
   }
 
-  // Generate multiple parallel lines
-  const lines: number[][][] = [];
-  
-  for (let i = 0; i < numLines; i++) {
-    // Calculate offset from center line
-    const offsetM = (i - (numLines - 1) / 2) * lineSpacingM;
-    
-    // Find the center point of this line (offset perpendicular to flight direction)
-    const lineCenter = destination(centroid, perpBearing, offsetM);
-    
-    // Create a line extending in both directions along flight direction
-    const lineLength = maxExtentM * 1.2; // Make lines longer than polygon
-    const p1 = destination(lineCenter, bearingDeg, lineLength / 2);
-    const p2 = destination(lineCenter, (bearingDeg + 180) % 360, lineLength / 2);
-    
-    // Clip line to polygon bounds (simplified - using bounding box)
-    const clippedLine = clipLineToPolygon([p1, p2], ring);
-    if (clippedLine && clippedLine.length >= 2) {
-      lines.push(clippedLine);
-    }
-  }
+  return { lineColor, lineWidth, lineOpacity };
+}
 
-  // Create GeoJSON with all lines
-  const flightLines = {
-    type: 'FeatureCollection' as const,
-    features: lines.map((lineCoords, index) => ({
-      type: 'Feature' as const,
+/* Add direction arrows for a specific polygon */
+function addDirectionArrowsForPolygon(
+  map: MapboxMap,
+  polygonId: string,
+  lineCoords: number[][],
+  bearingDeg: number,
+  color: string
+) {
+  if (lineCoords.length < 2) return;
+  
+  // Create arrow symbols at intervals along the main line
+  const arrows: any[] = [];
+  const numArrows = Math.min(3, Math.floor(lineCoords.length / 10)); // 3 arrows max
+  
+  for (let i = 0; i < numArrows; i++) {
+    const t = (i + 1) / (numArrows + 1); // Position along line
+    const pointIndex = Math.floor(t * (lineCoords.length - 1));
+    const point = lineCoords[pointIndex];
+    
+    arrows.push({
+      type: 'Feature',
       geometry: {
-        type: 'LineString' as const,
-        coordinates: lineCoords,
+        type: 'Point',
+        coordinates: point,
       },
       properties: {
-        quality: fitQuality || 'unknown',
-        lineIndex: index,
-        isMainLine: index === Math.floor(lines.length / 2), // Middle line is main
-      },
-    })),
-  };
-
-  map.addSource('flight-lines', {
-    type: 'geojson',
-    data: flightLines,
-  });
-
-  // Add glow effect for high-quality fits
-  if (fitQuality === 'excellent' || fitQuality === 'good') {
-    map.addLayer({
-      id: 'flight-lines-glow',
-      type: 'line',
-      source: 'flight-lines',
-      paint: {
-        'line-color': lineColor,
-        'line-width': lineWidth + 3,
-        'line-opacity': 0.2,
-        'line-blur': 3,
+        polygonId,
+        bearing: bearingDeg,
+        color: color,
       },
     });
   }
+  
+  if (arrows.length > 0) {
+    map.addSource(`flight-arrows-${polygonId}`, {
+      type: 'geojson',
+      data: {
+        type: 'FeatureCollection',
+        features: arrows,
+      },
+    });
 
-  // Add main flight lines
-  map.addLayer({
-    id: 'flight-lines',
-    type: 'line',
-    source: 'flight-lines',
-    paint: {
-      'line-color': lineColor,
-      'line-width': [
-        'case',
-        ['get', 'isMainLine'],
-        lineWidth + 1, // Main line slightly thicker
-        lineWidth
-      ],
-      'line-opacity': [
-        'case',
-        ['get', 'isMainLine'],
-        Math.min(lineOpacity + 0.2, 1), // Main line more opaque
-        lineOpacity
-      ],
-    },
-  });
-
-  // Add direction arrows on the main line
-  const mainLineIndex = Math.floor(lines.length / 2);
-  if (lines[mainLineIndex]) {
-    addDirectionArrows(map, lines[mainLineIndex], bearingDeg, lineColor);
+    map.addLayer({
+      id: `flight-arrows-${polygonId}`,
+      type: 'symbol',
+      source: `flight-arrows-${polygonId}`,
+      layout: {
+        'icon-image': 'arrow', // Will fall back gracefully if not available
+        'icon-size': 0.5,
+        'icon-rotate': ['get', 'bearing'],
+        'icon-rotation-alignment': 'map',
+        'icon-allow-overlap': true,
+        'icon-ignore-placement': true,
+        // Fallback to text arrow if icon not available
+        'text-field': '→',
+        'text-size': 16,
+        'text-rotate': ['get', 'bearing'],
+        'text-rotation-alignment': 'map',
+        'text-allow-overlap': true,
+        'text-ignore-placement': true,
+      },
+      paint: {
+        'text-color': ['get', 'color'],
+        'text-halo-color': 'white',
+        'text-halo-width': 1,
+      },
+    });
   }
 }
 
@@ -439,8 +633,6 @@ function destination(
     );
   return [(λ2 * 180) / Math.PI, (φ2 * 180) / Math.PI];
 }
-
-/* ------------------- helper functions for multiple flight lines ---------------------- */
 
 /* Calculate polygon bounds and centroid */
 function getPolygonBounds(ring: number[][]) {
@@ -535,69 +727,6 @@ function isPointInPolygon(lng: number, lat: number, ring: [number, number][]): b
     if (intersect) inside = !inside;
   }
   return inside;
-}
-
-/* Add direction arrows to show flight direction */
-function addDirectionArrows(map: Map, lineCoords: number[][], bearingDeg: number, color: string) {
-  if (lineCoords.length < 2) return;
-  
-  // Create arrow symbols at intervals along the main line
-  const arrows: any[] = [];
-  const numArrows = Math.min(3, Math.floor(lineCoords.length / 10)); // 3 arrows max
-  
-  for (let i = 0; i < numArrows; i++) {
-    const t = (i + 1) / (numArrows + 1); // Position along line
-    const pointIndex = Math.floor(t * (lineCoords.length - 1));
-    const point = lineCoords[pointIndex];
-    
-    arrows.push({
-      type: 'Feature',
-      geometry: {
-        type: 'Point',
-        coordinates: point,
-      },
-      properties: {
-        bearing: bearingDeg,
-        color: color,
-      },
-    });
-  }
-  
-  if (arrows.length > 0) {
-    map.addSource('flight-arrows', {
-      type: 'geojson',
-      data: {
-        type: 'FeatureCollection',
-        features: arrows,
-      },
-    });
-
-    map.addLayer({
-      id: 'flight-arrows',
-      type: 'symbol',
-      source: 'flight-arrows',
-      layout: {
-        'icon-image': 'arrow', // Will fall back gracefully if not available
-        'icon-size': 0.5,
-        'icon-rotate': ['get', 'bearing'],
-        'icon-rotation-alignment': 'map',
-        'icon-allow-overlap': true,
-        'icon-ignore-placement': true,
-        // Fallback to text arrow if icon not available
-        'text-field': '→',
-        'text-size': 16,
-        'text-rotate': ['get', 'bearing'],
-        'text-rotation-alignment': 'map',
-        'text-allow-overlap': true,
-        'text-ignore-placement': true,
-      },
-      paint: {
-        'text-color': ['get', 'color'],
-        'text-halo-color': 'white',
-        'text-halo-width': 1,
-      },
-    });
-  }
 }
 
 /* Convert lng/lat → slippy tile (x,y) at zoom z */
