@@ -27,6 +27,8 @@ import {
   AspectResult,
   queryElevationAtPoint,
   queryMaxElevationAlongLine,
+  destination as geoDestination,
+  calculateBearing as geoBearing,
 } from '../utils/terrainAspectHybrid';
 
 /* Enhanced result interface for multiple polygons */
@@ -304,11 +306,11 @@ export const MapFlightDirection = React.forwardRef<
       }
 
       // Draw flight lines for this polygon (spacing calculated dynamically)
-      const flightLines = addFlightLinesForPolygon(map, polygonId, ring, result.contourDirDeg, result.fitQuality);
+      const { flightLines, lineSpacing } = addFlightLinesForPolygon(map, polygonId, ring, result.contourDirDeg, result.fitQuality);
       
       // Create 3D flight path if we have elevation data and flight lines
       if (result.maxElevation !== undefined && flightLines.length > 0 && deckOverlayRef.current) {
-        const path3d = build3DFlightPath(flightLines, tiles, 100); // 100m above highest point along each line
+        const path3d = build3DFlightPath(flightLines, tiles, lineSpacing, 100); // 100m above highest point along each line
         update3DPathLayer(deckOverlayRef.current, polygonId, path3d, setDeckLayers);
         
         console.log(`Polygon ${polygonId} - 3D flight path created with per-line altitude calculation (100m above terrain)`);
@@ -480,10 +482,95 @@ function calculateBearing([lng1, lat1]: [number, number], [lng2, lat2]: [number,
   return ((bearing * 180) / Math.PI + 360) % 360;
 }
 
+/** Create a smooth Bézier curve between two consecutive path legs.
+ *  Uses cubic Bézier interpolation for the smoothest possible curves.
+ */
+function buildFillet(
+  P0: [number, number, number],
+  P2: [number, number, number],
+  dir0: number,
+  dir2: number,
+  r: number,
+  stepDeg: number = 2  // Control parameter (not used directly in Bézier)
+): [number, number, number][] {
+  console.log(`Building Bézier fillet: P0=[${P0[0].toFixed(6)}, ${P0[1].toFixed(6)}, ${P0[2].toFixed(1)}m], P2=[${P2[0].toFixed(6)}, ${P2[1].toFixed(6)}, ${P2[2].toFixed(1)}m], r=${r}m`);
+  
+  // Calculate the direct distance and bearing between the two points
+  const directDistance = haversineDistance([P0[0], P0[1]], [P2[0], P2[1]]);
+  const directBearing = geoBearing([P0[0], P0[1]], [P2[0], P2[1]]);
+  
+  console.log(`Direct distance: ${directDistance.toFixed(1)}m, bearing: ${directBearing.toFixed(1)}°, altitude difference: ${(P2[2] - P0[2]).toFixed(1)}m`);
+  
+  // If the points are very close, just return a straight line
+  if (directDistance < r * 0.1) {
+    console.log('Points too close, using straight line');
+    return [P0, P2];
+  }
+  
+  // Calculate turn angle to determine curve direction and amount
+  let turnAngle = ((dir2 - dir0 + 540) % 360) - 180;
+  const absTurnAngle = Math.abs(turnAngle);
+  
+  // For small turn angles, use a straight line
+  if (absTurnAngle < 5) {
+    console.log('Turn angle too small, using straight line');
+    return [P0, P2];
+  }
+  
+  // Create control points for cubic Bézier curve
+  const controlDistance = Math.min(r, directDistance * 0.3);
+  const curveDirection = turnAngle < 0 ? -90 : 90;
+  const curveBearing = (directBearing + curveDirection + 360) % 360;
+  
+  // Control points: start point, two middle control points, end point
+  const P1_control = geoDestination([P0[0], P0[1]], dir0, controlDistance * 0.6);
+  const P2_control = geoDestination([P2[0], P2[1]], (dir2 + 180) % 360, controlDistance * 0.6);
+  
+  // Also offset the control points perpendicular to create the curve
+  const offsetAmount = controlDistance * 0.8;
+  const P1_curved = geoDestination(P1_control, curveBearing, offsetAmount);
+  const P2_curved = geoDestination(P2_control, curveBearing, offsetAmount);
+  
+  // Generate points along the cubic Bézier curve
+  const numPoints = Math.max(16, Math.ceil(directDistance / 15)); // High resolution: point every ~15m
+  const points: [number, number, number][] = [];
+  
+  for (let i = 0; i <= numPoints; i++) {
+    const t = i / numPoints;
+    
+    // Cubic Bézier interpolation: B(t) = (1-t)³P₀ + 3(1-t)²tP₁ + 3(1-t)t²P₂ + t³P₃
+    const t2 = t * t;
+    const t3 = t2 * t;
+    const mt = 1 - t;
+    const mt2 = mt * mt;
+    const mt3 = mt2 * mt;
+    
+    const lng = mt3 * P0[0] + 
+                3 * mt2 * t * P1_curved[0] + 
+                3 * mt * t2 * P2_curved[0] + 
+                t3 * P2[0];
+                
+    const lat = mt3 * P0[1] + 
+                3 * mt2 * t * P1_curved[1] + 
+                3 * mt * t2 * P2_curved[1] + 
+                t3 * P2[1];
+    
+    // FIXED: Smoothly interpolate altitude between the two endpoints
+    // Use the same Bézier parameter t to blend altitudes
+    const alt = P0[2] + t * (P2[2] - P0[2]); // Linear interpolation for altitude
+    
+    points.push([lng, lat, alt]);
+  }
+  
+  console.log(`Generated ${points.length} Bézier curve points, altitude range: ${points[0][2].toFixed(1)}m → ${points[points.length-1][2].toFixed(1)}m`);
+  return points;
+}
+
 /* Build alternating lawn-mower 3D flight path from 2D lines with per-line altitude calculation */
 function build3DFlightPath(
   lines: number[][][],                 // lines[i] = [[lng,lat], …]
   tiles: any[],                        // Terrain tiles for elevation queries
+  lineSpacing: number,                 // Line spacing for fillet radius calculation
   baseAltitude: number = 100           // Altitude offset above terrain (meters)
 ): [number, number, number][][] {
   const path: [number, number, number][][] = [];
@@ -527,17 +614,33 @@ function build3DFlightPath(
       .map(([lng, lat]) => [lng, lat, flightAltitude] as [number, number, number]);
     
     if (i > 0 && path.length > 0) {
-      // Add connector from previous line end to current line start
-      const lastSegment = path[path.length - 1];
-      const lastPoint = lastSegment[lastSegment.length - 1];
-      const currentStart = coords[0];
+      // Tangential fillet instead of sharp corner
+      const lastSeg = path[path.length - 1];
+      const P0 = lastSeg[lastSeg.length - 1];  // previous end
+      const P2 = coords[0];                    // next start
       
-      // For connector, use the higher of the two altitudes for safety
-      const connectorAltitude = Math.max(lastPoint[2], currentStart[2]);
-      path.push([
-        [lastPoint[0], lastPoint[1], connectorAltitude],
-        [currentStart[0], currentStart[1], connectorAltitude]
-      ]);
+      // Calculate bearings for the fillet
+      const dirPrev = lastSeg.length >= 2 
+        ? geoBearing([lastSeg[lastSeg.length - 2][0], lastSeg[lastSeg.length - 2][1]], [P0[0], P0[1]])
+        : geoBearing([P0[0], P0[1]], [P2[0], P2[1]]); // fallback if single point
+      const dirNext = coords.length >= 2
+        ? geoBearing([P2[0], P2[1]], [coords[1][0], coords[1][1]])
+        : geoBearing([P0[0], P0[1]], [P2[0], P2[1]]); // fallback if single point
+      
+      // Use fillet radius based on line spacing (minimum 30m for safety)
+      const filletRadius = Math.max(30, lineSpacing / 2);
+      const fillet = buildFillet(P0, P2, dirPrev, dirNext, filletRadius);
+      
+      if (fillet.length > 2) { // Only add if we got a proper arc
+        path.push(fillet);
+      } else {
+        // Fallback to straight connector if fillet failed
+        const connectorAltitude = Math.max(P0[2], P2[2]);
+        path.push([
+          [P0[0], P0[1], connectorAltitude],
+          [P2[0], P2[1], connectorAltitude]
+        ]);
+      }
     }
     
     path.push(coords);
@@ -555,16 +658,26 @@ function update3DPathLayer(
 ) {
   const layer = new PathLayer({
     id: `drone-path-${polygonId}`,
-    data: path3d,
+    data: [path3d.flat()], // Single continuous polyline
     getPath: d => d,
     getColor: [30, 144, 255, 255], // Blue color (dodger blue) with full opacity
     getWidth: 15, // Much thicker - increased from 8 to 15 meters
     widthUnits: 'meters',
     coordinateSystem: COORDINATE_SYSTEM.LNGLAT, // [lng, lat, alt(m)]
     billboard: false, // Let the path tilt with the map, not face camera
+    rounded: true,      // Smooth path rendering
+    capRounded: true,   // Rounded end caps
+    jointRounded: true, // Rounded joints between segments
+    miterLimit: 2,      // Smoother joins
+    autoHighlight: false, // Disable highlighting for performance
+    updateTriggers: {
+      getPath: path3d,
+    },
     parameters: {
       depthTest: true,
-      depthWrite: true
+      depthWrite: true,
+      blend: true,
+      blendFunc: [WebGL2RenderingContext.SRC_ALPHA, WebGL2RenderingContext.ONE_MINUS_SRC_ALPHA]
     }
   });
 
@@ -670,7 +783,7 @@ function addFlightLinesForPolygon(
   bearingDeg: number,
   fitQuality?: string,
   fallbackLineSpacingM = 150, // Now used as fallback only
-): number[][][] {
+): { flightLines: number[][][], lineSpacing: number } {
   // Remove existing flight lines for this polygon
   removeFlightLinesForPolygon(map, polygonId);
 
@@ -717,7 +830,7 @@ function addFlightLinesForPolygon(
     }
   }
 
-  if (lines.length === 0) return [];
+  if (lines.length === 0) return { flightLines: [], lineSpacing: dynamicLineSpacingM };
 
   // Create GeoJSON with all lines for this polygon
   const flightLines = {
@@ -786,8 +899,8 @@ function addFlightLinesForPolygon(
     addDirectionArrowsForPolygon(map, polygonId, lines[mainLineIndex], bearingDeg, lineColor);
   }
   
-  // Return the lines array for 3D path generation
-  return lines;
+  // Return the lines array and spacing for 3D path generation
+  return { flightLines: lines, lineSpacing: dynamicLineSpacingM };
 }
 
 /* Get styling based on fit quality */
