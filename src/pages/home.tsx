@@ -166,7 +166,7 @@ export default function Home() {
               </ol>
               <div className="mt-2 pt-2 border-t">
                 <p className="text-xs text-gray-500">
-                  <strong>Features:</strong> Multi-polygon support • Dynamic terrain resolution (15→12 zoom) • Adaptive line spacing • 3D plane fitting
+                  <strong>Features:</strong> Multi-polygon support • Dynamic terrain resolution (15→12 zoom) • Adaptive line spacing • 3D flight paths (100m AGL) • 3D plane fitting
                 </p>
               </div>
             </CardContent>
@@ -272,6 +272,23 @@ export default function Home() {
                               {polygonResult.terrainZoom === 12 && <span className="text-orange-600 ml-1">🏃</span>}
                             </span>
                           </div>
+
+                          {/* Flight Altitude Information */}
+                          {result.maxElevation !== undefined && (
+                            <>
+                              <div className="flex justify-between items-center">
+                                <span className="text-gray-600">Max Terrain:</span>
+                                <span className="font-mono font-medium">{result.maxElevation.toFixed(1)}m</span>
+                              </div>
+                              <div className="flex justify-between items-center">
+                                <span className="text-gray-600">Flight Altitude:</span>
+                                <span className="font-mono font-medium text-blue-600">
+                                  {(result.maxElevation + 100).toFixed(1)}m
+                                  <span className="text-blue-600 ml-1">✈️</span>
+                                </span>
+                              </div>
+                            </>
+                          )}
 
                           {/* Advanced Metrics */}
                           {result.rSquared !== undefined && (

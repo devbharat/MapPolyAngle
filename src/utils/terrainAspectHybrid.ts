@@ -39,6 +39,7 @@ export interface AspectResult {
   rmse?: number;
   slopeMagnitude?: number;
   fitQuality?: 'excellent' | 'good' | 'fair' | 'poor';
+  maxElevation?: number; // Maximum elevation found in the terrain data (meters)
 }
 
 // ---------------------------------------------------------------------
@@ -54,6 +55,7 @@ export function dominantContourDirectionPlaneFit(
 
   // --- 1. Gather samples inside the polygon --------------------------
   const samples: { x: number; y: number; z: number }[] = [];
+  let maxZ = -Infinity; // Track maximum elevation
 
   for (const tile of tiles) {
     const proj = new WebMercatorProjector(tile.z);
@@ -70,6 +72,9 @@ export function dominantContourDirectionPlaneFit(
         const z = getElevation(tile, px, py);
         if (!Number.isFinite(z)) continue;
 
+        // Track maximum elevation
+        maxZ = Math.max(maxZ, z);
+
         // Convert to EPSG:3857 (Spherical Mercator) metres
         const [x, y] = lngLatToMercatorMeters(lng, lat);
         samples.push({ x, y, z });
@@ -82,7 +87,8 @@ export function dominantContourDirectionPlaneFit(
       aspectDeg: NaN, 
       contourDirDeg: NaN, 
       samples: samples.length,
-      fitQuality: 'poor'
+      fitQuality: 'poor',
+      maxElevation: maxZ === -Infinity ? undefined : maxZ
     };
   }
 
@@ -93,7 +99,8 @@ export function dominantContourDirectionPlaneFit(
       aspectDeg: NaN, 
       contourDirDeg: NaN, 
       samples: samples.length,
-      fitQuality: 'poor'
+      fitQuality: 'poor',
+      maxElevation: maxZ === -Infinity ? undefined : maxZ
     };
   }
 
@@ -109,7 +116,8 @@ export function dominantContourDirectionPlaneFit(
       rSquared,
       rmse,
       slopeMagnitude,
-      fitQuality: 'poor'
+      fitQuality: 'poor',
+      maxElevation: maxZ === -Infinity ? undefined : maxZ
     };
   }
 
@@ -128,6 +136,7 @@ export function dominantContourDirectionPlaneFit(
     rmse,
     slopeMagnitude,
     fitQuality,
+    maxElevation: maxZ === -Infinity ? undefined : maxZ
   };
 }
 
@@ -277,6 +286,32 @@ class WebMercatorProjector {
     const lat = (180 / Math.PI) * Math.atan(0.5 * (Math.exp(n) - Math.exp(-n)));
     return [lng, lat];
   }
+
+  lngLatToPixel(lng: number, lat: number, tileX: number, tileY: number, width: number): [number, number] | null {
+    // Convert lng/lat to normalized tile coordinates (0-1)
+    const normX = (lng + 180) / 360;
+    const normY = (1 - Math.log(Math.tan(Math.PI / 4 + (lat * Math.PI / 180) / 2)) / Math.PI) / 2;
+    
+    // Convert to pixel coordinates within the specific tile
+    const totalPixelsX = this.z2 * width;
+    const totalPixelsY = this.z2 * width;
+    
+    const globalPixelX = normX * totalPixelsX;
+    const globalPixelY = normY * totalPixelsY;
+    
+    // Check if this coordinate falls within the given tile
+    const tileStartX = tileX * width;
+    const tileStartY = tileY * width;
+    const tileEndX = tileStartX + width;
+    const tileEndY = tileStartY + width;
+    
+    if (globalPixelX >= tileStartX && globalPixelX < tileEndX && 
+        globalPixelY >= tileStartY && globalPixelY < tileEndY) {
+      return [globalPixelX - tileStartX, globalPixelY - tileStartY];
+    }
+    
+    return null; // Point not in this tile
+  }
 }
 
 function getElevation(tile: TerrainTile, px: number, py: number): number {
@@ -308,6 +343,49 @@ function pointInPolygon(lng: number, lat: number, ring: LngLat[]): boolean {
     if (intersect) inside = !inside;
   }
   return inside;
+}
+
+// Query elevation at a specific lng/lat coordinate using available tiles
+export function queryElevationAtPoint(lng: number, lat: number, tiles: TerrainTile[]): number {
+  for (const tile of tiles) {
+    const proj = new WebMercatorProjector(tile.z);
+    const pixelCoords = proj.lngLatToPixel(lng, lat, tile.x, tile.y, tile.width);
+    
+    if (pixelCoords) {
+      const [px, py] = pixelCoords;
+      const elevation = getElevation(tile, Math.floor(px), Math.floor(py));
+      if (Number.isFinite(elevation)) {
+        return elevation;
+      }
+    }
+  }
+  
+  return NaN; // No elevation data found for this point
+}
+
+// Query maximum elevation along a line segment with sampling
+export function queryMaxElevationAlongLine(
+  startLng: number, 
+  startLat: number, 
+  endLng: number, 
+  endLat: number, 
+  tiles: TerrainTile[], 
+  sampleCount: number = 10
+): number {
+  let maxElevation = -Infinity;
+  
+  for (let i = 0; i <= sampleCount; i++) {
+    const t = i / sampleCount;
+    const lng = startLng + t * (endLng - startLng);
+    const lat = startLat + t * (endLat - startLat);
+    
+    const elevation = queryElevationAtPoint(lng, lat, tiles);
+    if (Number.isFinite(elevation)) {
+      maxElevation = Math.max(maxElevation, elevation);
+    }
+  }
+  
+  return maxElevation === -Infinity ? NaN : maxElevation;
 }
 
 const degToRad = (d: number) => d * Math.PI / 180;

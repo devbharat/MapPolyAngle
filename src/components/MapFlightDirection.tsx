@@ -13,6 +13,9 @@
 import React, { useRef, useEffect, useState } from 'react';
 import mapboxgl, { Map as MapboxMap, LngLatLike, GeoJSONSource } from 'mapbox-gl';
 import MapboxDraw from '@mapbox/mapbox-gl-draw';
+import { MapboxOverlay } from '@deck.gl/mapbox';
+import { PathLayer } from '@deck.gl/layers';
+import { COORDINATE_SYSTEM } from '@deck.gl/core';
 
 import 'mapbox-gl/dist/mapbox-gl.css';
 import '@mapbox/mapbox-gl-draw/dist/mapbox-gl-draw.css';
@@ -22,6 +25,8 @@ import {
   Polygon as AspectPolygon,
   TerrainTile,
   AspectResult,
+  queryElevationAtPoint,
+  queryMaxElevationAlongLine,
 } from '../utils/terrainAspectHybrid';
 
 /* Enhanced result interface for multiple polygons */
@@ -72,10 +77,14 @@ export const MapFlightDirection = React.forwardRef<
   const mapContainer = useRef<HTMLDivElement>(null);
   const mapRef = useRef<MapboxMap>();
   const drawRef = useRef<MapboxDraw>();
+  const deckOverlayRef = useRef<MapboxOverlay>();
   const abortControllersRef = useRef<Map<string, AbortController>>(new Map());
   
   // Store analysis results for each polygon
   const [polygonResults, setPolygonResults] = useState<Map<string, PolygonAnalysisResult>>(new Map());
+  
+  // Store 3D layers for Deck.gl
+  const [deckLayers, setDeckLayers] = useState<any[]>([]);
 
   /* Handle new polygon creation */
   const handleDrawCreate = async (e: any) => {
@@ -113,6 +122,11 @@ export const MapFlightDirection = React.forwardRef<
         
         // Remove flight lines for this polygon
         removeFlightLinesForPolygon(mapRef.current!, polygonId);
+        
+        // Remove 3D flight path for this polygon
+        if (deckOverlayRef.current) {
+          remove3DPathLayer(deckOverlayRef.current, polygonId, setDeckLayers);
+        }
         
         // Remove from results
         setPolygonResults((prev) => {
@@ -188,7 +202,7 @@ export const MapFlightDirection = React.forwardRef<
           });
 
           // Add terrain layer for 3D visualization
-          map.setTerrain({ source: 'mapbox-dem', exaggeration: 2.5 });
+          map.setTerrain({ source: 'mapbox-dem', exaggeration: 1 });
 
           // Add 3D navigation controls
           map.addControl(new mapboxgl.NavigationControl({
@@ -197,6 +211,13 @@ export const MapFlightDirection = React.forwardRef<
 
           // Add drawing controls
           map.addControl(draw, 'top-left');
+          
+          // Initialize Deck.gl overlay for 3D flight paths
+          deckOverlayRef.current = new MapboxOverlay({
+            interleaved: true,      // Share Mapbox's GL context for proper 3D positioning
+            layers: []
+          });
+          map.addControl(deckOverlayRef.current);
           
           // Handle multiple polygon events
           map.on('draw.create', handleDrawCreate);
@@ -283,7 +304,15 @@ export const MapFlightDirection = React.forwardRef<
       }
 
       // Draw flight lines for this polygon (spacing calculated dynamically)
-      addFlightLinesForPolygon(map, polygonId, ring, result.contourDirDeg, result.fitQuality);
+      const flightLines = addFlightLinesForPolygon(map, polygonId, ring, result.contourDirDeg, result.fitQuality);
+      
+      // Create 3D flight path if we have elevation data and flight lines
+      if (result.maxElevation !== undefined && flightLines.length > 0 && deckOverlayRef.current) {
+        const path3d = build3DFlightPath(flightLines, tiles, 100); // 100m above highest point along each line
+        update3DPathLayer(deckOverlayRef.current, polygonId, path3d, setDeckLayers);
+        
+        console.log(`Polygon ${polygonId} - 3D flight path created with per-line altitude calculation (100m above terrain)`);
+      }
       
       // Update results
       const polygonResult: PolygonAnalysisResult = {
@@ -320,6 +349,12 @@ export const MapFlightDirection = React.forwardRef<
     if (draw) {
       draw.deleteAll();
       // This will trigger handleDrawDelete for all polygons
+    }
+    
+    // Also clear all 3D layers
+    if (deckOverlayRef.current) {
+      setDeckLayers([]);
+      deckOverlayRef.current.setProps({ layers: [] });
     }
   };
 
@@ -445,6 +480,124 @@ function calculateBearing([lng1, lat1]: [number, number], [lng2, lat2]: [number,
   return ((bearing * 180) / Math.PI + 360) % 360;
 }
 
+/* Build alternating lawn-mower 3D flight path from 2D lines with per-line altitude calculation */
+function build3DFlightPath(
+  lines: number[][][],                 // lines[i] = [[lng,lat], …]
+  tiles: any[],                        // Terrain tiles for elevation queries
+  baseAltitude: number = 100           // Altitude offset above terrain (meters)
+): [number, number, number][][] {
+  const path: [number, number, number][][] = [];
+  
+  lines.forEach((line, i) => {
+    // Find the maximum elevation along this specific line
+    let lineMaxElevation = -Infinity;
+    
+    // Sample elevation along the entire line to find the highest point
+    for (let j = 0; j < line.length - 1; j++) {
+      const [startLng, startLat] = line[j];
+      const [endLng, endLat] = line[j + 1];
+      
+      // Sample elevation along this line segment
+      const segmentMaxElevation = queryMaxElevationAlongLine(
+        startLng, startLat, endLng, endLat, tiles, 20
+      );
+      
+      if (Number.isFinite(segmentMaxElevation)) {
+        lineMaxElevation = Math.max(lineMaxElevation, segmentMaxElevation);
+      }
+    }
+    
+    // Also check the line endpoints
+    for (const [lng, lat] of line) {
+      const pointElevation = queryElevationAtPoint(lng, lat, tiles);
+      if (Number.isFinite(pointElevation)) {
+        lineMaxElevation = Math.max(lineMaxElevation, pointElevation);
+      }
+    }
+    
+    // Calculate flight altitude for this line (fallback to base altitude if no terrain data)
+    const flightAltitude = Number.isFinite(lineMaxElevation) 
+      ? lineMaxElevation + baseAltitude
+      : baseAltitude;
+    
+    console.log(`Line ${i}: max elevation ${lineMaxElevation.toFixed(1)}m, flight altitude ${flightAltitude.toFixed(1)}m`);
+    
+    // Alternate direction for lawn-mower pattern
+    const coords = (i % 2 === 0 ? line : [...line].reverse())
+      .map(([lng, lat]) => [lng, lat, flightAltitude] as [number, number, number]);
+    
+    if (i > 0 && path.length > 0) {
+      // Add connector from previous line end to current line start
+      const lastSegment = path[path.length - 1];
+      const lastPoint = lastSegment[lastSegment.length - 1];
+      const currentStart = coords[0];
+      
+      // For connector, use the higher of the two altitudes for safety
+      const connectorAltitude = Math.max(lastPoint[2], currentStart[2]);
+      path.push([
+        [lastPoint[0], lastPoint[1], connectorAltitude],
+        [currentStart[0], currentStart[1], connectorAltitude]
+      ]);
+    }
+    
+    path.push(coords);
+  });
+  
+  return path;
+}
+
+/* Update 3D path layer in Deck.gl overlay */
+function update3DPathLayer(
+  overlay: MapboxOverlay, 
+  polygonId: string, 
+  path3d: [number, number, number][][],
+  setLayers: React.Dispatch<React.SetStateAction<any[]>>
+) {
+  const layer = new PathLayer({
+    id: `drone-path-${polygonId}`,
+    data: path3d,
+    getPath: d => d,
+    getColor: [30, 144, 255, 255], // Blue color (dodger blue) with full opacity
+    getWidth: 15, // Much thicker - increased from 8 to 15 meters
+    widthUnits: 'meters',
+    coordinateSystem: COORDINATE_SYSTEM.LNGLAT, // [lng, lat, alt(m)]
+    billboard: false, // Let the path tilt with the map, not face camera
+    parameters: {
+      depthTest: true,
+      depthWrite: true
+    }
+  });
+
+  // Update layers state
+  setLayers(currentLayers => {
+    const filteredLayers = currentLayers.filter(l => l.id !== layer.id);
+    const newLayers = [...filteredLayers, layer];
+    
+    // Update overlay
+    overlay.setProps({ layers: newLayers });
+    
+    return newLayers;
+  });
+}
+
+/* Remove 3D path layer for a specific polygon */
+function remove3DPathLayer(
+  overlay: MapboxOverlay, 
+  polygonId: string,
+  setLayers: React.Dispatch<React.SetStateAction<any[]>>
+) {
+  const layerId = `drone-path-${polygonId}`;
+  
+  setLayers(currentLayers => {
+    const filteredLayers = currentLayers.filter(l => l.id !== layerId);
+    
+    // Update overlay
+    overlay.setProps({ layers: filteredLayers });
+    
+    return filteredLayers;
+  });
+}
+
 /* Calculate optimal terrain zoom based on polygon area */
 function calculateOptimalTerrainZoom(polygon: AspectPolygon): number {
   // Calculate polygon area in square meters using shoelace formula
@@ -517,7 +670,7 @@ function addFlightLinesForPolygon(
   bearingDeg: number,
   fitQuality?: string,
   fallbackLineSpacingM = 150, // Now used as fallback only
-) {
+): number[][][] {
   // Remove existing flight lines for this polygon
   removeFlightLinesForPolygon(map, polygonId);
 
@@ -564,7 +717,7 @@ function addFlightLinesForPolygon(
     }
   }
 
-  if (lines.length === 0) return;
+  if (lines.length === 0) return [];
 
   // Create GeoJSON with all lines for this polygon
   const flightLines = {
@@ -632,6 +785,9 @@ function addFlightLinesForPolygon(
   if (lines[mainLineIndex]) {
     addDirectionArrowsForPolygon(map, polygonId, lines[mainLineIndex], bearingDeg, lineColor);
   }
+  
+  // Return the lines array for 3D path generation
+  return lines;
 }
 
 /* Get styling based on fit quality */
