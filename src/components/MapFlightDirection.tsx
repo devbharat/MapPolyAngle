@@ -29,6 +29,7 @@ interface PolygonAnalysisResult {
   polygonId: string;
   result: AspectResult;
   polygon: AspectPolygon;
+  terrainZoom: number; // Track which zoom level was used
 }
 
 /* ----------------------------- props -------------------------------- */
@@ -37,12 +38,10 @@ interface Props {
   /** Initial map centre. */
   center?: LngLatLike;
   zoom?: number;
-  /** Terrain tile zoom level to sample (10‑14 reasonable). */
+  /** Fallback terrain tile zoom level (12-15). Actual zoom is calculated dynamically based on polygon area. */
   terrainZoom?: number;
   /** Sample step for terrain analysis */
   sampleStep?: number;
-  /** Spacing between parallel flight lines (meters) */
-  lineSpacingM?: number;
   /** Callback when any polygon analysis completes - receives all results */
   onAnalysisComplete?: (results: PolygonAnalysisResult[]) => void;
   /** Callback when analysis starts for a specific polygon */
@@ -66,7 +65,6 @@ export const MapFlightDirection = React.forwardRef<
   zoom = 13,
   terrainZoom = 12,
   sampleStep = 2,
-  lineSpacingM = 150,
   onAnalysisComplete,
   onAnalysisStart,
   onError,
@@ -248,8 +246,12 @@ export const MapFlightDirection = React.forwardRef<
       abortControllersRef.current.set(polygonId, controller);
       const signal = controller.signal;
 
-      // Fetch terrain tiles
-      const tiles = await fetchTilesForPolygon(polygon, terrainZoom, mapboxToken, signal);
+      // Calculate optimal terrain zoom based on polygon area
+      const optimalTerrainZoom = calculateOptimalTerrainZoom(polygon);
+      console.log(`Polygon ${polygonId} - Using terrain zoom ${optimalTerrainZoom} based on area`);
+
+      // Fetch terrain tiles with dynamic zoom
+      const tiles = await fetchTilesForPolygon(polygon, optimalTerrainZoom, mapboxToken, signal);
       
       if (signal.aborted) return;
       
@@ -280,14 +282,15 @@ export const MapFlightDirection = React.forwardRef<
         console.log(`Polygon ${polygonId} - Plane fit quality: ${result.fitQuality} (R²: ${result.rSquared?.toFixed(3) || 'N/A'}, RMSE: ${result.rmse?.toFixed(1) || 'N/A'}m, samples: ${result.samples})`);
       }
 
-      // Draw flight lines for this polygon
-      addFlightLinesForPolygon(map, polygonId, ring, result.contourDirDeg, result.fitQuality, lineSpacingM);
+      // Draw flight lines for this polygon (spacing calculated dynamically)
+      addFlightLinesForPolygon(map, polygonId, ring, result.contourDirDeg, result.fitQuality);
       
       // Update results
       const polygonResult: PolygonAnalysisResult = {
         polygonId,
         result,
         polygon,
+        terrainZoom: optimalTerrainZoom,
       };
 
       setPolygonResults((prev) => {
@@ -364,6 +367,127 @@ export const MapFlightDirection = React.forwardRef<
 /* ------------------------- helper utils ----------------------------- */
 /* ==================================================================== */
 
+/* Calculate optimal line spacing based on polygon width perpendicular to flight direction */
+function calculateOptimalLineSpacing(ring: number[][], bearingDeg: number): number {
+  const bounds = getPolygonBounds(ring);
+  const { centroid } = bounds;
+  
+  // Calculate perpendicular bearing (90 degrees from flight direction)
+  const perpBearing = (bearingDeg + 90) % 360;
+  
+  // Project polygon points onto the perpendicular axis to find the width
+  // This gives us the actual width that flight lines need to cover
+  let minProjection = Infinity;
+  let maxProjection = -Infinity;
+  
+  for (const point of ring) {
+    if (point.length < 2) continue;
+    
+    // Calculate distance from centroid to this point
+    const distanceM = haversineDistance(centroid, [point[0], point[1]]);
+    
+    // Calculate the bearing from centroid to this point
+    const pointBearing = calculateBearing(centroid, [point[0], point[1]]);
+    
+    // Project this distance onto the perpendicular axis
+    const angleDiff = ((pointBearing - perpBearing + 540) % 360) - 180; // Normalize to [-180, 180]
+    const projection = distanceM * Math.cos((angleDiff * Math.PI) / 180);
+    
+    minProjection = Math.min(minProjection, projection);
+    maxProjection = Math.max(maxProjection, projection);
+  }
+  
+  const perpendicularWidthM = maxProjection - minProjection;
+  
+  // Dynamic line spacing based on perpendicular width:
+  // - Very small areas (< 200m width): 25m spacing (dense)
+  // - Small areas (200m - 500m width): 50m spacing  
+  // - Medium areas (500m - 1km width): 100m spacing
+  // - Large areas (1km - 2km width): 150m spacing
+  // - Very large areas (> 2km width): 200m spacing (sparse)
+  
+  let spacing: number;
+  if (perpendicularWidthM < 200) {
+    spacing = 25;
+  } else if (perpendicularWidthM < 500) {
+    spacing = 50;
+  } else if (perpendicularWidthM < 1000) {
+    spacing = 100;
+  } else if (perpendicularWidthM < 2000) {
+    spacing = 150;
+  } else {
+    spacing = 200;
+  }
+  
+  // Ensure we always have at least 3 lines and at most 20 lines
+  const estimatedLines = Math.ceil(perpendicularWidthM / spacing);
+  if (estimatedLines < 3) {
+    spacing = perpendicularWidthM / 3;
+  } else if (estimatedLines > 20) {
+    spacing = perpendicularWidthM / 20;
+  }
+  
+  console.log(`Polygon perpendicular width: ${perpendicularWidthM.toFixed(1)}m, line spacing: ${spacing.toFixed(1)}m, estimated lines: ${Math.ceil(perpendicularWidthM / spacing)}`);
+  
+  return spacing;
+}
+
+/* Calculate bearing between two points */
+function calculateBearing([lng1, lat1]: [number, number], [lng2, lat2]: [number, number]): number {
+  const φ1 = (lat1 * Math.PI) / 180;
+  const φ2 = (lat2 * Math.PI) / 180;
+  const Δλ = ((lng2 - lng1) * Math.PI) / 180;
+
+  const x = Math.sin(Δλ) * Math.cos(φ2);
+  const y = Math.cos(φ1) * Math.sin(φ2) - Math.sin(φ1) * Math.cos(φ2) * Math.cos(Δλ);
+
+  const bearing = Math.atan2(x, y);
+  return ((bearing * 180) / Math.PI + 360) % 360;
+}
+
+/* Calculate optimal terrain zoom based on polygon area */
+function calculateOptimalTerrainZoom(polygon: AspectPolygon): number {
+  // Calculate polygon area in square meters using shoelace formula
+  const coords = polygon.coordinates;
+  if (coords.length < 3) return 15; // Default for invalid polygons
+  
+  // Convert to approximate square meters using spherical excess
+  let area = 0;
+  const n = coords.length;
+  
+  for (let i = 0; i < n; i++) {
+    const j = (i + 1) % n;
+    const [lng1, lat1] = coords[i];
+    const [lng2, lat2] = coords[j];
+    
+    // Convert to radians
+    const φ1 = (lat1 * Math.PI) / 180;
+    const φ2 = (lat2 * Math.PI) / 180;
+    const Δλ = ((lng2 - lng1) * Math.PI) / 180;
+    
+    // Spherical excess calculation for area
+    area += Δλ * (2 + Math.sin(φ1) + Math.sin(φ2));
+  }
+  
+  area = Math.abs(area * 6371000 * 6371000) / 2; // Earth radius squared
+  
+  // Define area thresholds and corresponding zoom levels
+  // Small areas (< 0.1 km²) -> zoom 15 (highest resolution)
+  // Medium areas (0.1 - 1 km²) -> zoom 14
+  // Large areas (1 - 10 km²) -> zoom 13  
+  // Very large areas (> 10 km²) -> zoom 12 (lowest allowed)
+  
+  if (area < 100000) { // < 0.1 km²
+    return 15;
+  } else if (area < 1000000) { // 0.1 - 1 km²
+    return 14;
+  } else if (area < 10000000) { // 1 - 10 km²
+    return 13;
+  } else {
+    return 12; // > 10 km²
+  }
+}
+
 /* Remove flight lines for a specific polygon */
 function removeFlightLinesForPolygon(map: MapboxMap, polygonId: string) {
   const layersToRemove = [
@@ -392,10 +516,13 @@ function addFlightLinesForPolygon(
   ring: number[][],
   bearingDeg: number,
   fitQuality?: string,
-  lineSpacingM = 150,
+  fallbackLineSpacingM = 150, // Now used as fallback only
 ) {
   // Remove existing flight lines for this polygon
   removeFlightLinesForPolygon(map, polygonId);
+
+  // Calculate dynamic line spacing based on polygon geometry
+  const dynamicLineSpacingM = calculateOptimalLineSpacing(ring, bearingDeg);
 
   // Calculate polygon bounds and dimensions
   const bounds = getPolygonBounds(ring);
@@ -409,9 +536,8 @@ function addFlightLinesForPolygon(
   const perpBearing = (bearingDeg + 90) % 360;
   const maxExtentM = Math.max(widthM, heightM);
   
-  // Calculate how many lines we need
-  const numLines = Math.ceil(maxExtentM / lineSpacingM);
-  const totalSpan = (numLines - 1) * lineSpacingM;
+  // Calculate how many lines we need using dynamic spacing
+  const numLines = Math.ceil(maxExtentM / dynamicLineSpacingM);
   
   // Color and styling based on fit quality
   const { lineColor, lineWidth, lineOpacity } = getStyleForQuality(fitQuality);
@@ -420,8 +546,8 @@ function addFlightLinesForPolygon(
   const lines: number[][][] = [];
   
   for (let i = 0; i < numLines; i++) {
-    // Calculate offset from center line
-    const offsetM = (i - (numLines - 1) / 2) * lineSpacingM;
+    // Calculate offset from center line using dynamic spacing
+    const offsetM = (i - (numLines - 1) / 2) * dynamicLineSpacingM;
     
     // Find the center point of this line (offset perpendicular to flight direction)
     const lineCenter = destination(centroid, perpBearing, offsetM);
