@@ -112,17 +112,14 @@ function buildFillet(
     return [P0, P2];
   }
 
-  const controlDistance = Math.min(r, directDistance * 0.3);
-  const curveDirection = turnAngle < 0 ? -90 : 90;
-  const directBearing = geoBearing([P0[0], P0[1]], [P2[0], P2[1]]);
-  const curveBearing = (directBearing + curveDirection + 360) % 360;
-
-  const P1_control = geoDestination([P0[0], P0[1]], dir0, controlDistance * 0.6);
-  const P2_control = geoDestination([P2[0], P2[1]], (dir2 + 180) % 360, controlDistance * 0.6);
-
-  const offsetAmount = controlDistance * 0.8;
-  const P1_curved = geoDestination(P1_control, curveBearing, offsetAmount);
-  const P2_curved = geoDestination(P2_control, curveBearing, offsetAmount);
+  // Control distance should be proportional to the turn radius and geometry
+  const controlDistance = Math.min(r, directDistance * 0.4);
+  
+  // FIX: For tangential connections, control points must be along the line directions
+  // P1_control: move from P0 in the direction of the incoming line (dir0)
+  // P2_control: move from P2 in the REVERSE direction of the outgoing line (dir2)
+  const P1_control = geoDestination([P0[0], P0[1]], dir0, controlDistance);
+  const P2_control = geoDestination([P2[0], P2[1]], (dir2 + 180) % 360, controlDistance);
 
   const numPoints = Math.max(16, Math.ceil(directDistance / 15));
   const points: [number, number, number][] = [];
@@ -135,8 +132,8 @@ function buildFillet(
     const mt2 = mt * mt;
     const mt3 = mt2 * mt;
 
-    const lng = mt3 * P0[0] + 3 * mt2 * t * P1_curved[0] + 3 * mt * t2 * P2_curved[0] + t3 * P2[0];
-    const lat = mt3 * P0[1] + 3 * mt2 * t * P1_curved[1] + 3 * mt * t2 * P2_curved[1] + t3 * P2[1];
+    const lng = mt3 * P0[0] + 3 * mt2 * t * P1_control[0] + 3 * mt * t2 * P2_control[0] + t3 * P2[0];
+    const lat = mt3 * P0[1] + 3 * mt2 * t * P1_control[1] + 3 * mt * t2 * P2_control[1] + t3 * P2[1];
     const alt = P0[2] + t * (P2[2] - P0[2]);
 
     points.push([lng, lat, alt]);
