@@ -1,19 +1,12 @@
 import React, { useState, useRef, useCallback, useMemo } from 'react';
 import { MapFlightDirection } from '@/components/MapFlightDirection';
+import { PolygonAnalysisResult } from '@/components/MapFlightDirection/types';
 import { AspectResult } from '@/utils/terrainAspectHybrid';
 import { Card, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { LoadingSpinner } from '@/components/ui/loading-spinner';
 import { useIsMobile } from '@/hooks/use-mobile';
 import { Map, Trash2, CheckCircle, AlertCircle, TrendingUp, Target, X } from 'lucide-react';
-
-// Updated interface to match the new multi-polygon component
-interface PolygonAnalysisResult {
-  polygonId: string;
-  result: AspectResult;
-  polygon: { coordinates: [number, number][] };
-  terrainZoom: number; // Track which zoom level was used
-}
 
 export default function Home() {
   const isMobile = useIsMobile();
