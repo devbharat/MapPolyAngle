@@ -1,4 +1,4 @@
-/*******************************************************************************************
+/********************************************************************************************************
  * polygon_facet_segmenter.ts                                                    v1.1 (2025‑08‑07)
  * -------------------------------------------------------------------------------------------
  * Clip DEM tiles to a user‑drawn polygon, feed the masked raster into the planar‑segmentation
@@ -8,12 +8,21 @@
  * Fixes over v0.1
  *   • Correct Web‑Mercator <‑> pixel maths (π/4 formula) and consistent local equirect frame
  *   • meta.origin = SW corner; per‑pixel dLon/dLat via forward diff
- *   • Inverse projection of facet vertices matches worker’s X,Y encoding (uses cosφ)
+ *   • Inverse projection of facet vertices matches worker's X,Y encoding (uses cosφ)
  *   • Down‑slope aspect = isoBearing + 90° (not +270°)
  *   • Pixel‑accurate samples + maxElevation via worker‑returned labels
  *   • NaN outside polygon, sentinel −9999 avoided
  *   • 30‑s timeout & worker error bubbles
+ *   • Polygon clipping with Turf.js for exact intersection geometry
  *******************************************************************************************/
+
+// Safe ESM/CJS import for @turf/intersect
+import intersectCjs from '@turf/intersect';
+const intersect = (intersectCjs as any).default ?? intersectCjs;
+
+import { polygon as turfPolygon, point as turfPoint } from '@turf/helpers';
+import booleanPointInPolygon from '@turf/boolean-point-in-polygon';
+
 
 // --------------------------------  Types  --------------------------------------------------
 export type LngLat = [number, number];
@@ -33,7 +42,7 @@ export interface FacetResult {
   aspectDeg: number;          // downhill direction
   slopeDeg: number;
   samples: number;
-  maxElevation: number;
+  maxElevation: number;       // NaN if no samples found
 }
 
 // --------------------------------  Constants & helpers  ------------------------------------
@@ -61,8 +70,8 @@ function pixelToLngLat(px:number, py:number, z:number, tileSize:number):LngLat{
   return [lon,lat];
 }
 
-// --------------------------------  Mask‑DEM builder  ---------------------------------------
-function buildMaskedDEM(poly:Polygon, tiles:TerrainTile[]){
+// --------------------------------  Full‑DEM builder  ---------------------------------------
+function buildFullDEM(poly:Polygon, tiles:TerrainTile[]){
   if(!tiles.length) throw Error('no tiles');
   const {z,width:ts}=tiles[0];
   tiles.forEach(t=>{ if(t.z!==z||t.width!==ts||t.height!==ts) throw Error('mixed zoom/size'); });
@@ -80,35 +89,75 @@ function buildMaskedDEM(poly:Polygon, tiles:TerrainTile[]){
   const maxPy=Math.ceil (yOf(minLat));   // southernmost → larger y
 
   const width=maxPx-minPx, height=maxPy-minPy;
-  const dem=new Float32Array(width*height).fill(NaN);
+  const dem=new Float32Array(width*height);
 
-  const write=(gx:number,gy:number,e:number)=>{
-    const ix=gx-minPx, iy=gy-minPy;
-    if(ix<0||ix>=width||iy<0||iy>=height) return;
-    const [lon,lat]=pixelToLngLat(gx+0.5,gy+0.5,z,ts);
-    if(!pointInPolygon(lon,lat,poly.coordinates)) return;
-    dem[iy*width+ix]=e;
-  };
-
+  // Fill with complete tile data, computing mean only for polygon-interior pixels
+  let elevationSum = 0;
+  let elevationCount = 0;
+  
+  // Pre-calculate meta for efficiency
+  const [lon0,lat0]=pixelToLngLat(minPx,maxPy,z,ts);
+  const [lon1]     =pixelToLngLat(minPx+1,maxPy ,z,ts);
+  const [,lat1]    =pixelToLngLat(minPx   ,maxPy-1,z,ts);
+  const meta:TileMeta={lon0,lat0,dLon:lon1-lon0,dLat:lat1-lat0};
+  
+  // First pass: collect finite values inside polygon to compute mean fill value
   for(const t of tiles){
     const gpx0=t.x*ts, gpy0=t.y*ts;
     const data=t.data;
     for(let py=0;py<ts;++py){ const gy=gpy0+py; if(gy<minPy||gy>=maxPy) continue;
       for(let px=0;px<ts;++px){ const gx=gpx0+px; if(gx<minPx||gx>=maxPx) continue;
+        const ix=gx-minPx, iy=gy-minPy;
+        if(ix<0||ix>=width||iy<0||iy>=height) continue;
+        
+        // Check if pixel is inside polygon
+        const lon = meta.lon0 + ix * meta.dLon;
+        const lat = meta.lat0 + iy * meta.dLat;
+        const inPoly = pointInPolygon(lon, lat, poly.coordinates);
+        
+        if (!inPoly) continue; // Only compute mean for interior pixels
+        
         let elev:number;
         if(t.format==='dem') elev=(data as Float32Array)[py*ts+px];
         else { const b=(py*ts+px)*4; elev=decodeRGB(data[b],data[b+1],data[b+2]); }
-        if(Number.isFinite(elev)) write(gx,gy,elev);
+        
+        if(Number.isFinite(elev)) {
+          elevationSum += elev;
+          elevationCount++;
+        }
+      }
+    }
+  }
+  
+  const meanElevation = elevationCount > 0 ? elevationSum / elevationCount : 0;
+  console.log(`buildFullDEM: using fill value ${meanElevation.toFixed(1)}m for invalid pixels`);
+
+  // Second pass: fill DEM array
+  for(const t of tiles){
+    const gpx0=t.x*ts, gpy0=t.y*ts;
+    const data=t.data;
+    for(let py=0;py<ts;++py){ const gy=gpy0+py; if(gy<minPy||gy>=maxPy) continue;
+      for(let px=0;px<ts;++px){ const gx=gpx0+px; if(gx<minPx||gx>=maxPx) continue;
+        const ix=gx-minPx, iy=gy-minPy;
+        if(ix<0||ix>=width||iy<0||iy>=height) continue;
+        
+        let elev:number;
+        if(t.format==='dem') elev=(data as Float32Array)[py*ts+px];
+        else { const b=(py*ts+px)*4; elev=decodeRGB(data[b],data[b+1],data[b+2]); }
+        
+        // Use finite elevation or mean fill value, but only inside the polygon
+        const lon = meta.lon0 + ix * meta.dLon;
+        const lat = meta.lat0 + iy * meta.dLat;
+        const inPoly = pointInPolygon(lon, lat, poly.coordinates);
+        
+        dem[iy*width+ix] = inPoly
+          ? (Number.isFinite(elev) ? elev : meanElevation)
+          : NaN;
       }
     }
   }
 
-  // SW corner origin and per‑pixel delta via forward diff
-  const [lon0,lat0]=pixelToLngLat(minPx,maxPy,z,ts);
-  const [lon1]     =pixelToLngLat(minPx+1,maxPy ,z,ts);
-  const [,lat1]    =pixelToLngLat(minPx   ,maxPy-1,z,ts);
-  const meta:TileMeta={lon0,lat0,dLon:lon1-lon0,dLat:lat1-lat0};
-  return {dem,width,height,meta};
+  return {dem,width,height,meta,polygon:poly};
 }
 
 // --------------------------------  Main async API  -----------------------------------------
@@ -119,7 +168,7 @@ export async function segmentPolygonTerrain(
   λ:'auto'|number|number[]='auto'
 ):Promise<FacetResult[]>{
 
-  const {dem,width,height,meta}=buildMaskedDEM(polygon,tiles);
+  const {dem,width,height,meta,polygon:poly}=buildFullDEM(polygon,tiles);
 
   return new Promise((resolve,reject)=>{
     const worker=new Worker(workerPath,{type:'module'});
@@ -129,6 +178,8 @@ export async function segmentPolygonTerrain(
 
     worker.onmessage=({data})=>{
       clearTimeout(timeout);
+      console.log(`Worker returned ${data.polygons.length} facet polygons`, data);
+
       const { planes, polygons, labels } = data;
       const lblArr = labels ? new Uint32Array(labels) : null;
 
@@ -138,39 +189,86 @@ export async function segmentPolygonTerrain(
       const meanLat = meta.lat0 + height*meta.dLat*0.5;
       const cosφ    = Math.cos(meanLat*DEG);
 
+      // Create GeoJSON version of the user polygon for clipping
+      const userGeo = turfPolygon([poly.coordinates]);
+
       planes.forEach((pl:any)=>{
         const polyObj=polyMap.get(pl.id); if(!polyObj) return;
-        const ring:LngLat[]=polyObj.vertices.map(([x,y]:number[])=>{
+        
+        // Convert seam vertices back to lon/lat
+        const ringLL:LngLat[]=(polyObj as any).vertices.map(([x,y]:number[])=>{
           const lon=meta.lon0 + x / (EARTH_RADIUS*DEG*cosφ);
           const lat=meta.lat0 + y / (EARTH_RADIUS*DEG);
           return [lon,lat];
         });
 
-        // keep facet if centroid inside user polygon
-        const cx=ring.reduce((s,p)=>s+p[0],0)/ring.length;
-        const cy=ring.reduce((s,p)=>s+p[1],0)/ring.length;
-        if(!pointInPolygon(cx,cy,polygon.coordinates)) return;
-
-        let samples=0,maxElev=-Infinity;
-        if(lblArr){
-          for(let i=0;i<dem.length;i++){
-            if(lblArr[i]===pl.id && Number.isFinite(dem[i])){
-              samples++; maxElev=Math.max(maxElev,dem[i]);
-            }
-          }
+        // Ensure closed ring
+        if (ringLL.length < 4 || 
+            ringLL[0][0] !== ringLL[ringLL.length - 1][0] ||
+            ringLL[0][1] !== ringLL[ringLL.length - 1][1]) {
+          ringLL.push(ringLL[0]);
         }
 
-        const slopeDeg=Math.atan(Math.hypot(pl.a,pl.b))*180/Math.PI;
-        const aspectDeg=(pl.isoBearing+90)%360; // downhill
+        // Create GeoJSON polygon for the seam
+        const seamGeo = turfPolygon([ringLL]);
 
-        facets.push({planeId:pl.id,polygon:ring,
-          contourDirDeg:pl.isoBearing,aspectDeg,slopeDeg,
-          samples,maxElevation: samples?maxElev:NaN});
+        // Clip against user polygon (Turf v6-v8 canonical API)
+        const clipped = intersect(seamGeo as any, userGeo as any);
+        if (!clipped) return; // facet fully outside
+
+        // Collect all polygon rings (handle both Polygon and MultiPolygon)
+        const clipRings: LngLat[][] = [];
+        if (clipped.geometry.type === 'Polygon') {
+          clipRings.push(clipped.geometry.coordinates[0] as LngLat[]);
+        } else if (clipped.geometry.type === 'MultiPolygon') {
+          for (const polygonCoords of clipped.geometry.coordinates) {
+            clipRings.push(polygonCoords[0] as LngLat[]);
+          }
+        } else {
+          return; // LineString / Point touch – ignore
+        }
+
+        // Process each clipped polygon piece
+        for (const ring of clipRings) {
+          const turfPoly = turfPolygon([ring]);
+
+          // Count samples only within the clipped polygon bounds using robust point-in-polygon
+          let samples=0,maxElev=-Infinity;
+          if(lblArr){
+            for(let iy=0;iy<height;iy++){
+              for(let ix=0;ix<width;ix++){
+                const i=iy*width+ix;
+                if(lblArr[i]===pl.id && Number.isFinite(dem[i])){
+                  // Check if this pixel is within the clipped polygon using robust Turf method
+                  const lon=meta.lon0+ix*meta.dLon;
+                  const lat=meta.lat0+iy*meta.dLat;
+                  if(booleanPointInPolygon(turfPoint([lon, lat]), turfPoly)){
+                    samples++; 
+                    maxElev=Math.max(maxElev,dem[i]);
+                  }
+                }
+              }
+            }
+          }
+
+          const slopeDeg=Math.atan(Math.hypot(pl.a,pl.b))*180/Math.PI;
+          const aspectDeg=(pl.isoBearing+90)%360; // downhill
+
+          facets.push({planeId:pl.id,polygon:ring,
+            contourDirDeg:pl.isoBearing,aspectDeg,slopeDeg,
+            samples,maxElevation: samples?maxElev:NaN});
+        }
       });
 
       worker.terminate();
       resolve(facets);
     };
+
+    // Debug: Log DEM statistics before sending to worker
+    const finiteDem = Array.from(dem).filter(Number.isFinite);
+    const minDem = finiteDem.length ? Math.min(...finiteDem) : NaN;
+    const maxDem = finiteDem.length ? Math.max(...finiteDem) : NaN;
+    console.log(`DEM stats before worker: finite=${finiteDem.length}/${dem.length}, range=[${minDem}, ${maxDem}]`);
 
     worker.postMessage({
       buffer: dem.buffer,
@@ -179,4 +277,15 @@ export async function segmentPolygonTerrain(
       returnLabels: true
     }, [dem.buffer]);
   });
+}
+
+// --------------------------------  Convenience wrapper  ------------------------------------
+import { planarSegmenterWorkerUrl } from './planarSegmenterUrl';
+
+export function segmentPolygonTerrainAuto(
+  polygon: Polygon, 
+  tiles: TerrainTile[], 
+  λ: 'auto' | number | number[] = 'auto'
+) {
+  return segmentPolygonTerrain(polygon, tiles, planarSegmenterWorkerUrl, λ);
 }

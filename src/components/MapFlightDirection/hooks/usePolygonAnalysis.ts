@@ -8,10 +8,11 @@
 
 import { useRef, useCallback } from 'react';
 import {
-  dominantContourDirectionPlaneFit,
+  segmentPolygonTerrainAuto,
+  FacetResult,
   Polygon as AspectPolygon,
   TerrainTile,
-} from '../../../utils/terrainAspectHybrid';
+} from '@/utils/polygon_facet_segmenter';
 import { fetchTilesForPolygon } from '../utils/terrain';
 import { calculateOptimalTerrainZoom } from '../utils/geometry';
 import { PolygonAnalysisResult } from '../types';
@@ -22,6 +23,28 @@ interface UsePolygonAnalysisProps {
   onAnalysisStart?: (polygonId: string) => void;
   onAnalysisComplete?: (result: PolygonAnalysisResult, tiles: TerrainTile[]) => void;
   onError?: (error: string, polygonId?: string) => void;
+}
+
+const DEG = Math.PI / 180;
+function weightedMeanBearing(facets: FacetResult[]) {
+  let sx = 0, sy = 0, totalSamples = 0;
+  for (const { samples, contourDirDeg } of facets) {
+    if (samples <= 0) continue; // Skip facets with no samples
+    const rad = contourDirDeg * DEG;
+    sx += samples * Math.sin(rad);
+    sy += samples * Math.cos(rad);
+    totalSamples += samples;
+  }
+  
+  // Guard against no valid samples
+  if (totalSamples === 0) return NaN;
+  
+  return (Math.atan2(sx, sy) * 180 / Math.PI + 360) % 360;
+}
+function classifyDominantFit(f: FacetResult[]) {
+  const best = f.reduce((m, c) => c.samples > m.samples ? c : m, f[0]);
+  // crude proxy – fine‑tune later
+  return best.samples > 500 ? 'excellent' : best.samples > 200 ? 'good' : best.samples > 50 ? 'fair' : 'poor';
 }
 
 export function usePolygonAnalysis({
@@ -66,25 +89,54 @@ export function usePolygonAnalysis({
         }
 
         console.log(`Running terrain analysis for polygon ${polygonId}...`);
-        const result = dominantContourDirectionPlaneFit(polygon, tiles, {
-          sampleStep,
-        });
-        console.log(`Analysis result for polygon ${polygonId}:`, result);
+        let facets: FacetResult[];
+        try {
+          facets = await segmentPolygonTerrainAuto(polygon, tiles, 100);
+        } catch (e) {
+          console.warn('New segmentation failed, falling back to legacy method:', e);
+          
+          // Check if the error indicates a complete NaN result from the solver
+          const errorMsg = e instanceof Error ? e.message : String(e);
+          if (errorMsg.includes('all-NaN result') || errorMsg.includes('no valid gradients')) {
+            onError?.('Terrain analysis failed - polygon may be too small or outside valid terrain data', polygonId);
+            return;
+          }
+          
+          // Import legacy function only when needed
+          const { dominantContourDirectionPlaneFit } = await import('../../../utils/terrainAspectHybrid');
+          const legacy = dominantContourDirectionPlaneFit(polygon, tiles, { sampleStep });
+          facets = [{
+            planeId: 0,
+            polygon: polygon.coordinates,
+            contourDirDeg: legacy.contourDirDeg,
+            aspectDeg: legacy.aspectDeg ?? NaN,
+            slopeDeg: legacy.slopeMagnitude ? Math.atan(legacy.slopeMagnitude) * 180 / Math.PI : NaN,
+            samples: legacy.samples,
+            maxElevation: legacy.maxElevation ?? NaN,
+          }];
+        }
+        
+        if (signal.aborted) return;
+        if (facets.length === 0) {
+          onError?.('Unable to segment terrain – flat or insufficient DEM', polygonId);
+          return;
+        }
+        // pick a weighted dominant direction for legacy code
+        const dom = weightedMeanBearing(facets);
+        console.log(`Analysis result for polygon ${polygonId}:`, facets);
 
         if (signal.aborted) return;
 
-        if (!Number.isFinite(result.contourDirDeg)) {
-          const errorMsg =
-            result.fitQuality === 'poor'
-              ? 'Could not determine reliable direction (insufficient data or flat terrain)'
-              : 'Could not determine aspect (flat terrain?)';
-          onError?.(errorMsg, polygonId);
+        if (!Number.isFinite(dom)) {
+          onError?.('Could not determine reliable direction (insufficient data or flat terrain)', polygonId);
           return;
         }
 
         const polygonResult: PolygonAnalysisResult = {
           polygonId,
-          result,
+          facets,
+          contourDirDeg: dom,
+          fitQuality: classifyDominantFit(facets),
           polygon,
           terrainZoom: optimalTerrainZoom,
         };

@@ -87,12 +87,12 @@ export const MapFlightDirection = React.forwardRef<
             mapRef.current,
             result.polygonId,
             result.polygon.coordinates,
-            result.result.contourDirDeg,
-            result.result.fitQuality
+            result.contourDirDeg,
+            result.fitQuality
           );
           console.log(`Added ${flightLines.length} flight lines with ${lineSpacing}m spacing`);
 
-          if (result.result.maxElevation !== undefined && flightLines.length > 0 && deckOverlayRef.current) {
+          if (result.facets.length > 0 && flightLines.length > 0 && deckOverlayRef.current) {
             console.log('Building 3D flight path...');
             const path3d = build3DFlightPath(flightLines, tiles, lineSpacing, 100);
             console.log('3D path built, updating layer...');

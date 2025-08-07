@@ -6,12 +6,15 @@
  * © 2025 <your-name>. MIT License.
  ***********************************************************************/
 
-import { Polygon as AspectPolygon, AspectResult } from '../../utils/terrainAspectHybrid';
+import { FacetResult } from '@/utils/polygon_facet_segmenter';
 
 /** Enhanced result interface for multiple polygons */
 export interface PolygonAnalysisResult {
   polygonId: string;
-  result: AspectResult;
-  polygon: AspectPolygon;
-  terrainZoom: number; // Track which zoom level was used
+  facets: FacetResult[];          // NEW
+  /** dominant bearing (fallback for old consumers) */
+  contourDirDeg: number;
+  fitQuality?: 'excellent' | 'good' | 'fair' | 'poor';
+  polygon: { coordinates: number[][] };
+  terrainZoom: number;
 }

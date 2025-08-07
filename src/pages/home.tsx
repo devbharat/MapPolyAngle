@@ -198,7 +198,7 @@ export default function Home() {
               {hasResults && (
                 <div className="space-y-4 max-h-96 overflow-y-auto">
                   {polygonResults.map((polygonResult, index) => {
-                    const { polygonId, result } = polygonResult;
+                    const { polygonId } = polygonResult;
                     const shortId = polygonId.slice(0, 8);
                     
                     return (
@@ -215,10 +215,10 @@ export default function Home() {
                           </div>
                           <div className="flex items-center space-x-2">
                             {/* Quality Indicator */}
-                            {result.fitQuality && (
-                              <div className={`flex items-center space-x-1 px-2 py-0.5 rounded-full text-xs font-medium ${getQualityIndicator(result.fitQuality).bgColor} ${getQualityIndicator(result.fitQuality).color}`}>
-                                <span>{getQualityIndicator(result.fitQuality).icon}</span>
-                                <span>{getQualityIndicator(result.fitQuality).label}</span>
+                            {polygonResult.fitQuality && (
+                              <div className={`flex items-center space-x-1 px-2 py-0.5 rounded-full text-xs font-medium ${getQualityIndicator(polygonResult.fitQuality).bgColor} ${getQualityIndicator(polygonResult.fitQuality).color}`}>
+                                <span>{getQualityIndicator(polygonResult.fitQuality).icon}</span>
+                                <span>{getQualityIndicator(polygonResult.fitQuality).label}</span>
                               </div>
                             )}
                             <Button 
@@ -240,22 +240,26 @@ export default function Home() {
                               <span className="text-sm font-medium text-blue-900">Flight Direction:</span>
                             </div>
                             <span className="font-mono text-lg font-bold text-blue-700">
-                              {result.contourDirDeg.toFixed(1)}°
+                              {polygonResult.contourDirDeg.toFixed(1)}°
                             </span>
                           </div>
                         </div>
                         
                         {/* Secondary Metrics */}
                         <div className="space-y-1 text-xs">
-                          <div className="flex justify-between items-center">
-                            <span className="text-gray-600">Terrain Aspect:</span>
-                            <span className="font-mono font-medium">{result.aspectDeg.toFixed(1)}°</span>
-                          </div>
-                          
-                          <div className="flex justify-between items-center">
-                            <span className="text-gray-600">Sample Points:</span>
-                            <span className="font-mono font-medium">{result.samples.toLocaleString()}</span>
-                          </div>
+                          {polygonResult.facets.length > 0 && (
+                            <>
+                              <div className="flex justify-between items-center">
+                                <span className="text-gray-600">Terrain Aspect:</span>
+                                <span className="font-mono font-medium">{polygonResult.facets[0].aspectDeg.toFixed(1)}°</span>
+                              </div>
+                              
+                              <div className="flex justify-between items-center">
+                                <span className="text-gray-600">Sample Points:</span>
+                                <span className="font-mono font-medium">{polygonResult.facets.reduce((sum, f) => sum + f.samples, 0).toLocaleString()}</span>
+                              </div>
+                            </>
+                          )}
 
                           <div className="flex justify-between items-center">
                             <span className="text-gray-600">Terrain Zoom:</span>
@@ -267,43 +271,27 @@ export default function Home() {
                           </div>
 
                           {/* Flight Altitude Information */}
-                          {result.maxElevation !== undefined && (
+                          {polygonResult.facets.length > 0 && polygonResult.facets[0].maxElevation !== undefined && (
                             <>
                               <div className="flex justify-between items-center">
                                 <span className="text-gray-600">Max Terrain:</span>
-                                <span className="font-mono font-medium">{result.maxElevation.toFixed(1)}m</span>
+                                <span className="font-mono font-medium">{Math.max(...polygonResult.facets.map(f => f.maxElevation)).toFixed(1)}m</span>
                               </div>
                               <div className="flex justify-between items-center">
                                 <span className="text-gray-600">Flight Altitude:</span>
                                 <span className="font-mono font-medium text-blue-600">
-                                  {(result.maxElevation + 100).toFixed(1)}m
+                                  {(Math.max(...polygonResult.facets.map(f => f.maxElevation)) + 100).toFixed(1)}m
                                   <span className="text-blue-600 ml-1">✈️</span>
                                 </span>
                               </div>
                             </>
                           )}
 
-                          {/* Advanced Metrics */}
-                          {result.rSquared !== undefined && (
-                            <div className="flex justify-between items-center">
-                              <span className="text-gray-600">R² (fit accuracy):</span>
-                              <span className="font-mono font-medium">{result.rSquared.toFixed(3)}</span>
-                            </div>
-                          )}
-
-                          {result.rmse !== undefined && (
-                            <div className="flex justify-between items-center">
-                              <span className="text-gray-600">RMSE:</span>
-                              <span className="font-mono font-medium">{result.rmse.toFixed(1)}m</span>
-                            </div>
-                          )}
-
-                          {result.slopeMagnitude !== undefined && (
-                            <div className="flex justify-between items-center">
-                              <span className="text-gray-600">Terrain Slope:</span>
-                              <span className="font-mono font-medium">{(result.slopeMagnitude * 100).toFixed(1)}%</span>
-                            </div>
-                          )}
+                          {/* Facet Information */}
+                          <div className="flex justify-between items-center">
+                            <span className="text-gray-600">Terrain Facets:</span>
+                            <span className="font-mono font-medium">{polygonResult.facets.length}</span>
+                          </div>
                         </div>
                       </div>
                     );
