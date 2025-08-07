@@ -16,6 +16,9 @@
 
 /** @typedef {{lon0:number, lat0:number, dLon:number, dLat:number}} TileMeta */
 
+// ───────────────── Constants ─────────────────────────────────────────────────
+const DEG = Math.PI / 180;
+
 // ───────────────── WebGPU initialisation ─────────────────────────────────────
 /** @type {GPUDevice|null}  */ let device = null;
 /** @type {GPUQueue|null}   */ let queue  = null;
@@ -240,20 +243,24 @@ function qselect(a,k,l=0,r=a.length-1){
 function percentile(arr,p){const k=Math.floor(p/100*arr.length);return qselect(Float32Array.from(arr),k);}
 
 // ───────────────── Gradient-threshold helper ─────────────────────────────────
+/**
+ * Robust, scale-aware ε: three times the **median** gradient, floored to 5 cm.
+ * This keeps ε ≈ 8-20 m at z≈13, instead of the hundreds you observed.
+ */
 function gradThreshold(U,W,H){
   const grads = [];
   for(let y=0;y<H-1;++y)for(let x=0;x<W-1;++x){
     const i=y*W+x;
-    const a = U[i], b = U[i+1], c = U[i+W];
-    if(!Number.isFinite(a) || !Number.isFinite(b) || !Number.isFinite(c)) continue;
-    grads.push(Math.hypot(b-a, c-a));
+    const a=U[i], b=U[i+1], c=U[i+W];
+    if(!Number.isFinite(a)||!Number.isFinite(b)||!Number.isFinite(c)) continue;
+    grads.push(Math.hypot(b-a,c-a));
   }
   console.log(`gradThreshold: computed ${grads.length} valid gradients from ${W}x${H} grid`);
-  if(!grads.length) return 0.05;                 // guard against no valid gradients
-  const g95 = percentile(Float32Array.from(grads), 95);
-  const result = Math.max(g95, 0.05);             // never below 5 cm
-  console.log(`gradThreshold: 95th percentile = ${g95}, floored result = ${result}`);
-  return result;
+  if(!grads.length) return 0.05;
+  const med = percentile(Float32Array.from(grads),50);
+  const eps = Math.max(med*3,0.05);
+  console.log(`gradThreshold: median = ${med}, eps = ${eps}`);
+  return eps;
 }
 
 // ───────────────── Union-find labelling ──────────────────────────────────────
@@ -426,12 +433,13 @@ function estimateNoise(Z) {
   console.log(`estimateNoise: median=${med}, MAD=${mad}, noise estimate=${result}`);
   return result;
 }
-const defaultLambdas=Z=>{
-  const σ=estimateNoise(Z);
-  const λ0=σ*σ*Math.log(Z.length);
-  console.log(`defaultLambdas: σ=${σ}, λ0=${λ0}`);
-  return[λ0*0.5,λ0,λ0*2];
-};
+// λ₀ = σ² · (metres/pixel)² · log N  (cf. Donoho–Johnstone universal threshold)
+function defaultLambdas(Z,px){
+  const σ = estimateNoise(Z);
+  const λ0 = σ*σ * px*px * Math.log(Z.length);
+  console.log(`defaultLambdas: σ=${σ}, px=${px}, λ0=${λ0}`);
+  return [λ0*0.25, λ0*0.5, λ0, λ0*2];
+}
 
 // ───────────────── Worker entry ───────────────────────────────────────────────
 self.onmessage = async ({ data }) => {
@@ -451,7 +459,12 @@ self.onmessage = async ({ data }) => {
   const maxElev = finiteValues.length ? Math.max(...finiteValues) : NaN;
   console.log(`Worker: DEM stats - finite: ${finiteCount}, NaN: ${nanCount}, range: [${minElev}, ${maxElev}]`);
   
-  const λs = lambdas.length ? lambdas : defaultLambdas(Z);
+  /* ── metres / pixel at DEM centre ── */
+  const meanLat = meta.lat0 + height*meta.dLat*0.5;
+  const cosφ    = Math.cos(meanLat*DEG);
+  const pxM     = 6378137 * cosφ * DEG * meta.dLon;    // Web-Mercator east-west scale
+
+  const λs = lambdas.length ? lambdas : defaultLambdas(Z, pxM);
   console.log(`Worker: Lambda values:`, λs);
 
   await initGPU();

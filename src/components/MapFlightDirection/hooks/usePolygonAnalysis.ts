@@ -91,7 +91,8 @@ export function usePolygonAnalysis({
         console.log(`Running terrain analysis for polygon ${polygonId}...`);
         let facets: FacetResult[];
         try {
-          facets = await segmentPolygonTerrainAuto(polygon, tiles, 100);
+          // let the worker choose λ automatically
+          facets = await segmentPolygonTerrainAuto(polygon, tiles, 'auto');
         } catch (e) {
           console.warn('New segmentation failed, falling back to legacy method:', e);
           

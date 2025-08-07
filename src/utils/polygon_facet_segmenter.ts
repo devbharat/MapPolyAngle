@@ -152,7 +152,7 @@ function buildFullDEM(poly:Polygon, tiles:TerrainTile[]){
         
         dem[iy*width+ix] = inPoly
           ? (Number.isFinite(elev) ? elev : meanElevation)
-          : NaN;
+          : (Number.isFinite(elev) ? elev : meanElevation);      // ← outside gets constant fill
       }
     }
   }
@@ -195,44 +195,77 @@ export async function segmentPolygonTerrain(
       planes.forEach((pl:any)=>{
         const polyObj=polyMap.get(pl.id); if(!polyObj) return;
         
-        // Convert seam vertices back to lon/lat
+        // ─── Convert seam vertices back to lon/lat ─────────────────────────
         const ringLL:LngLat[]=(polyObj as any).vertices.map(([x,y]:number[])=>{
           const lon=meta.lon0 + x / (EARTH_RADIUS*DEG*cosφ);
           const lat=meta.lat0 + y / (EARTH_RADIUS*DEG);
           return [lon,lat];
         });
 
-        // Ensure closed ring
-        if (ringLL.length < 4 || 
-            ringLL[0][0] !== ringLL[ringLL.length - 1][0] ||
-            ringLL[0][1] !== ringLL[ringLL.length - 1][1]) {
+        // Ensure closed ring & remove duplicated trailing vertices
+        if (ringLL.length === 0) return;
+        if (ringLL[ringLL.length - 1][0] !== ringLL[0][0] ||
+            ringLL[ringLL.length - 1][1] !== ringLL[0][1]) {
           ringLL.push(ringLL[0]);
         }
 
-        // Create GeoJSON polygon for the seam
-        const seamGeo = turfPolygon([ringLL]);
+        // ─── Quick geometry sanity-check ────────────────────────────────────
+        const uniq = new Set(ringLL.map(p => p.join(',')));
+        if (uniq.size < 3) return;                 // < 3 distinct points
 
-        // Clip against user polygon (Turf v6-v8 canonical API)
-        const clipped = intersect(seamGeo as any, userGeo as any);
-        if (!clipped) return; // facet fully outside
+        const areaDeg2 = Math.abs(ringLL.slice(0, -1).reduce((s, [x1, y1], i) => {
+          const [x2, y2] = ringLL[i + 1];
+          return s + (x1 * y2 - x2 * y1);
+        }, 0)) * 0.5;
+        if (areaDeg2 < 5e-9) return;               // ≈ 50 m² at mid-lat
 
-        // Collect all polygon rings (handle both Polygon and MultiPolygon)
+        // ─── Clip safe seam polygon against user polygon ────────────────────
+        let seamIntersect: any;
+        try {
+          seamIntersect = intersect(turfPolygon([ringLL]) as any, userGeo as any);
+        } catch (err) {
+          console.warn(`turf.intersect failed for seam of plane ${pl.id}:`, err);
+          return;                                  // skip invalid seam
+        }
+        if (!seamIntersect) return;
+
+        // Collect rings from seamIntersect …
         const clipRings: LngLat[][] = [];
-        if (clipped.geometry.type === 'Polygon') {
-          clipRings.push(clipped.geometry.coordinates[0] as LngLat[]);
-        } else if (clipped.geometry.type === 'MultiPolygon') {
-          for (const polygonCoords of clipped.geometry.coordinates) {
-            clipRings.push(polygonCoords[0] as LngLat[]);
-          }
+        if (seamIntersect.geometry.type === 'Polygon') {
+          clipRings.push(seamIntersect.geometry.coordinates[0] as LngLat[]);
+        } else if (seamIntersect.geometry.type === 'MultiPolygon') {
+          seamIntersect.geometry.coordinates.forEach(
+            (polyCoords: any) => clipRings.push(polyCoords[0] as LngLat[]));
         } else {
-          return; // LineString / Point touch – ignore
+          return;        // nothing to work with
         }
 
         // Process each clipped polygon piece
         for (const ring of clipRings) {
+          // 1. drop rings with < 3 distinct points
+          const uniq = new Set(ring.map(p => p.join(',')));
+          if (uniq.size < 3) continue;
+
+          // 2. skip rings whose signed area is ~0  (deg²)
+          const area2D = Math.abs(ring.slice(0,-1)
+            .reduce((s,[x1,y1],i) => {
+              const [x2,y2] = ring[i+1];
+              return s + (x1*y2 - x2*y1);
+            }, 0)) * 0.5;
+          if (area2D < 1e-10) continue;   // ≈ (1 cm)² at mid-lat
+
           const turfPoly = turfPolygon([ring]);
 
-          // Count samples only within the clipped polygon bounds using robust point-in-polygon
+          let clipped: any;
+          try {
+            clipped = intersect(turfPoly as any, userGeo as any);
+          } catch (err) {
+            console.warn(`turf.intersect failed for facet ${pl.id}:`, err);
+            continue;                     // ignore this tiny / invalid facet
+          }
+          if (!clipped) continue;         // no overlap
+
+          // Count samples only within the *clipped* polygon bounds
           let samples=0,maxElev=-Infinity;
           if(lblArr){
             for(let iy=0;iy<height;iy++){
@@ -242,7 +275,7 @@ export async function segmentPolygonTerrain(
                   // Check if this pixel is within the clipped polygon using robust Turf method
                   const lon=meta.lon0+ix*meta.dLon;
                   const lat=meta.lat0+iy*meta.dLat;
-                  if(booleanPointInPolygon(turfPoint([lon, lat]), turfPoly)){
+                  if(booleanPointInPolygon(turfPoint([lon, lat]), clipped)){
                     samples++; 
                     maxElev=Math.max(maxElev,dem[i]);
                   }
@@ -254,7 +287,12 @@ export async function segmentPolygonTerrain(
           const slopeDeg=Math.atan(Math.hypot(pl.a,pl.b))*180/Math.PI;
           const aspectDeg=(pl.isoBearing+90)%360; // downhill
 
-          facets.push({planeId:pl.id,polygon:ring,
+          // Use the first ring of the clipped geometry as the facet polygon
+          const clippedRing = clipped.geometry.type === 'Polygon' 
+            ? clipped.geometry.coordinates[0] as LngLat[]
+            : clipped.geometry.coordinates[0][0] as LngLat[];
+
+          facets.push({planeId:pl.id,polygon:clippedRing,
             contourDirDeg:pl.isoBearing,aspectDeg,slopeDeg,
             samples,maxElevation: samples?maxElev:NaN});
         }
