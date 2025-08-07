@@ -250,18 +250,36 @@ const estimateNoise=Z=>{const med=percentile(Z,50),
 const defaultLambdas=Z=>{const σ=estimateNoise(Z);const λ0=σ*σ*Math.log(Z.length);return[λ0*0.5,λ0,λ0*2];};
 
 // ───────────────── Worker entry ───────────────────────────────────────────────
-self.onmessage=async({data})=>{
-  const {buffer,width,height,meta,lambdas=[]}=data;
-  const Z=new Float32Array(buffer), λs=lambdas.length?lambdas:defaultLambdas(Z);
-  await initGPU(); const bufs=createBuffers(Z);
-  try{
-    for(const λ of λs){
-      const U=await runSolver(bufs,width,height,λ),
-            eps=gradThreshold(U,width,height),
-            {labels}=labelFacets(U,width,height,eps),
-            planes=fitPlanes(labels,U,width,height,meta),
-            polygons=extractSeams(labels,planes,width,height,meta);
-      self.postMessage({λ,planes,polygons});
+self.onmessage = async ({ data }) => {
+  const { buffer, width, height, meta,
+          lambdas = [],
+          returnLabels = false        /* NEW */ } = data;
+
+  const Z   = new Float32Array(buffer);
+  const λs  = lambdas.length ? lambdas : defaultLambdas(Z);
+
+  await initGPU();
+  const bufs = createBuffers(Z);
+
+  try {
+    for (const λ of λs) {
+      const U        = await runSolver(bufs, width, height, λ);
+      const eps      = gradThreshold(U, width, height);
+      const { labels } = labelFacets(U, width, height, eps);     // labels is Uint32Array
+      const planes   = fitPlanes(labels, U, width, height, meta);
+      const polygons = extractSeams(labels, planes, width, height, meta);
+
+      const payload = { λ, planes, polygons };
+      if (returnLabels) payload.labels = labels.buffer;          /* NEW */
+
+      /* transfer labels if present */
+      const transfers = [ ];
+      if (returnLabels) transfers.push(labels.buffer);
+      /* U and other big buffers stay inside worker */
+
+      self.postMessage(payload, transfers);
     }
-  }finally{ destroyBuffers(bufs); }
+  } finally {
+    destroyBuffers(bufs);
+  }
 };
