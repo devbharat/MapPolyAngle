@@ -8,7 +8,7 @@
 
 import { Map as MapboxMap } from 'mapbox-gl';
 import { getPolygonBounds, haversineDistance } from './geometry';
-import { destination as geoDestination } from '@/utils/terrainAspectHybrid';
+import { destination as geoDestination } from '@/utils/geo';
 
 function getLineColor(quality?: string) {
   switch (quality) {

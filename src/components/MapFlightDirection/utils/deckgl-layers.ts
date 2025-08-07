@@ -9,7 +9,7 @@
 import { MapboxOverlay } from '@deck.gl/mapbox';
 import { PathLayer, SolidPolygonLayer } from '@deck.gl/layers';
 import { COORDINATE_SYSTEM } from '@deck.gl/core';
-import { destination as geoDestination, calculateBearing as geoBearing } from '@/utils/terrainAspectHybrid';
+import { destination as geoDestination, calculateBearing as geoBearing } from '@/utils/geo';
 
 export function update3DPathLayer(
   overlay: MapboxOverlay,
