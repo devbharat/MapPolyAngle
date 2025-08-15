@@ -33,6 +33,7 @@ interface Props {
   onAnalysisComplete?: (results: PolygonAnalysisResult[]) => void;
   onAnalysisStart?: (polygonId: string) => void;
   onError?: (error: string, polygonId?: string) => void;
+  onFlightLinesUpdated?: () => void; // NEW: Called when flight lines are regenerated
 }
 
 export const MapFlightDirection = React.forwardRef<
@@ -63,6 +64,7 @@ export const MapFlightDirection = React.forwardRef<
       onAnalysisComplete,
       onAnalysisStart,
       onError,
+      onFlightLinesUpdated,
     },
     ref
   ) => {
@@ -113,6 +115,9 @@ export const MapFlightDirection = React.forwardRef<
             return newFlightLines;
           });
 
+          // Notify that flight lines have been created/updated
+          onFlightLinesUpdated?.();
+
           if (result.result.maxElevation !== undefined && flightLinesResult.flightLines.length > 0 && deckOverlayRef.current) {
             console.log('Building 3D flight path...');
             const path3d = build3DFlightPath(
@@ -127,7 +132,7 @@ export const MapFlightDirection = React.forwardRef<
           }
         }
       },
-      [onAnalysisComplete]
+      [onAnalysisComplete, lineSpacing, baseAltitudeAGL, onFlightLinesUpdated]
     );
 
     const memoizedOnAnalysisStart = useCallback((polygonId: string) => {
@@ -278,6 +283,7 @@ export const MapFlightDirection = React.forwardRef<
       const map = mapRef.current;
       const overlay = deckOverlayRef.current;
       if (!map || !overlay) return;
+      if (!map.isStyleLoaded()) return; // Wait for map to be fully ready
       if (polygonResults.size === 0) return;
 
       const newFlightLines = new Map<string, { flightLines: number[][][]; lineSpacing: number }>();
@@ -311,7 +317,12 @@ export const MapFlightDirection = React.forwardRef<
       });
 
       setPolygonFlightLines(newFlightLines);
-    }, [lineSpacing, photoSpacing, baseAltitudeAGL, polygonResults, polygonTiles]);
+      
+      // Trigger callback to notify that flight lines have been updated
+      if (newFlightLines.size > 0) {
+        onFlightLinesUpdated?.();
+      }
+    }, [lineSpacing, photoSpacing, baseAltitudeAGL, polygonResults, polygonTiles, onFlightLinesUpdated]);
 
     return <div ref={mapContainer} style={{ position: 'relative', width: '100%', height: '100%' }} />;
   }

@@ -141,14 +141,25 @@ export function addFlightLinesForPolygon(
 }
 
 export function removeFlightLinesForPolygon(map: MapboxMap, polygonId: string) {
+  if (!map || !map.isStyleLoaded()) return; // Safety check for map readiness
+  
   const layerId = `flight-lines-layer-${polygonId}`;
   const sourceId = `flight-lines-source-${polygonId}`;
   
-  if (map.getLayer(layerId)) {
-    map.removeLayer(layerId);
+  try {
+    if (map.getLayer(layerId)) {
+      map.removeLayer(layerId);
+    }
+  } catch (e) {
+    console.warn(`Failed to remove layer ${layerId}:`, e);
   }
-  if (map.getSource(sourceId)) {
-    map.removeSource(sourceId);
+  
+  try {
+    if (map.getSource(sourceId)) {
+      map.removeSource(sourceId);
+    }
+  } catch (e) {
+    console.warn(`Failed to remove source ${sourceId}:`, e);
   }
 }
 
@@ -243,10 +254,27 @@ export function addTriggerPointsForPolygon(
 }
 
 export function removeTriggerPointsForPolygon(map: MapboxMap, polygonId: string) {
+  if (!map || !map.isStyleLoaded()) return; // Safety check for map readiness
+  
   const sourceId = `flight-triggers-source-${polygonId}`;
   const circleLayerId = `flight-triggers-layer-${polygonId}`;
   const labelLayerId = `flight-triggers-label-${polygonId}`;
-  if (map.getLayer(circleLayerId)) map.removeLayer(circleLayerId);
-  if (map.getLayer(labelLayerId)) map.removeLayer(labelLayerId);
-  if (map.getSource(sourceId)) map.removeSource(sourceId);
+  
+  try {
+    if (map.getLayer(circleLayerId)) map.removeLayer(circleLayerId);
+  } catch (e) {
+    console.warn(`Failed to remove circle layer ${circleLayerId}:`, e);
+  }
+  
+  try {
+    if (map.getLayer(labelLayerId)) map.removeLayer(labelLayerId);
+  } catch (e) {
+    console.warn(`Failed to remove label layer ${labelLayerId}:`, e);
+  }
+  
+  try {
+    if (map.getSource(sourceId)) map.removeSource(sourceId);
+  } catch (e) {
+    console.warn(`Failed to remove source ${sourceId}:`, e);
+  }
 }

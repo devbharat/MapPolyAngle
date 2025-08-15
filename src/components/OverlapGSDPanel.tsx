@@ -13,6 +13,7 @@ type Props = {
   onLineSpacingChange?: (lineSpacing: number) => void;
   onPhotoSpacingChange?: (photoSpacing: number) => void;
   onAltitudeChange?: (altitudeAGL: number) => void;
+  onAutoRun?: (autoRunFn: () => void) => void; // NEW: Callback to provide auto-run function
 };
 
 // Sony RX1R II camera specifications
@@ -24,14 +25,14 @@ const sonyRX1R2Camera: CameraModel = {
   h_px: 5304,
 };
 
-export function OverlapGSDPanel({ mapRef, mapboxToken, onLineSpacingChange, onPhotoSpacingChange, onAltitudeChange }: Props) {
+export function OverlapGSDPanel({ mapRef, mapboxToken, onLineSpacingChange, onPhotoSpacingChange, onAltitudeChange, onAutoRun }: Props) {
   const [cameraText, setCameraText] = useState(JSON.stringify(sonyRX1R2Camera, null, 2));
   const [altitude, setAltitude] = useState(100); // AGL in meters
   const [frontOverlap, setFrontOverlap] = useState(80); // percentage
   const [sideOverlap, setSideOverlap] = useState(70); // percentage
   const [zoom, setZoom] = useState(15);
   const [opacity, setOpacity] = useState(0.85);
-  const [showOverlap, setShowOverlap] = useState(true);
+  const [showOverlap, setShowOverlap] = useState(false); // Changed default to false
   const [showGsd, setShowGsd] = useState(true);
   const [running, setRunning] = useState(false);
   const [autoGenerate, setAutoGenerate] = useState(true);
@@ -200,6 +201,33 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, onLineSpacingChange, onPh
     }
   }, [mapRef, mapboxToken, parseCamera, parsePosesMeters, getPolygons, zoom, opacity, showOverlap, showGsd, showCameraPoints]);
 
+  // Auto-run function that can be called externally
+  const autoRun = useCallback(async () => {
+    if (!autoGenerate || running) return;
+    
+    // Wait for flight lines to be fully updated and map to be ready
+    setTimeout(() => {
+      const map = mapRef.current?.getMap?.();
+      if (!map || !map.isStyleLoaded()) {
+        console.warn('Map not ready for auto GSD analysis, skipping');
+        return;
+      }
+      
+      const polygons = getPolygons();
+      if (polygons.length === 0) {
+        console.warn('No polygons available for auto GSD analysis, skipping');
+        return;
+      }
+      
+      compute();
+    }, 750); // Increased delay for better reliability
+  }, [autoGenerate, running, compute, getPolygons, mapRef]);
+
+  // Provide autoRun function to parent component
+  React.useEffect(() => {
+    onAutoRun?.(autoRun);
+  }, [autoRun, onAutoRun]);
+
   const clear = useCallback(() => {
     const map: any = mapRef.current?.getMap?.();
     if (map && runIdRef.current) {
@@ -233,12 +261,12 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, onLineSpacingChange, onPh
                  value={opacity} onChange={e => setOpacity(parseFloat(e.target.value))} />
         </label>
         <label className="text-xs col-span-1">
-          <input type="checkbox" checked={showOverlap} onChange={e=>setShowOverlap(e.target.checked)} className="mr-2" />
-          Show overlap
+          <input type="checkbox" checked={showGsd} onChange={e=>setShowGsd(e.target.checked)} className="mr-2" />
+          <span className="font-medium">Show GSD (Primary)</span>
         </label>
         <label className="text-xs col-span-1">
-          <input type="checkbox" checked={showGsd} onChange={e=>setShowGsd(e.target.checked)} className="mr-2" />
-          Show min‑GSD
+          <input type="checkbox" checked={showOverlap} onChange={e=>setShowOverlap(e.target.checked)} className="mr-2" />
+          Show overlap count
         </label>
         <label className="text-xs col-span-2">
           <input type="checkbox" checked={showCameraPoints} onChange={e=>setShowCameraPoints(e.target.checked)} className="mr-2" />
@@ -294,7 +322,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, onLineSpacingChange, onPh
       <div className="flex gap-2 items-center">
         <button onClick={compute} disabled={running}
                 className="px-3 py-1.5 rounded bg-blue-600 text-white text-sm disabled:opacity-50">
-          {running ? "Computing…" : "Compute overlap & GSD"}
+          {running ? "Computing…" : "Manual Compute"}
         </button>
         <button onClick={clear}
                 className="px-3 py-1.5 rounded border text-sm">
@@ -303,9 +331,9 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, onLineSpacingChange, onPh
       </div>
 
       <p className="text-[11px] text-gray-500">
-        Uses Sony RX1R II specs (35mm, 42MP) with automatic pose generation along polygons. 
-        Computes <em>overlap count</em> and <em>min‑GSD</em> per terrain pixel using nadir photography.
-        Adjust altitude and spacing for desired coverage.
+        <strong>Auto-mode:</strong> GSD analysis runs automatically when polygons are created or flight parameters change.
+        Uses Sony RX1R II specs (35mm, 42MP) with automatic pose generation. Computes <em>Ground Sample Distance</em> 
+        and optional <em>overlap count</em> per terrain pixel using nadir photography.
       </p>
     </div>
   );

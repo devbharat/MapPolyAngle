@@ -29,14 +29,6 @@ function heatmapColor(t: number): [number, number, number] {
   }
 }
 
-// Log some test colors to verify the function works
-console.log('Heatmap color test:');
-console.log('t=0.0 (blue):', heatmapColor(0.0));
-console.log('t=0.25 (cyan):', heatmapColor(0.25));
-console.log('t=0.5 (green):', heatmapColor(0.5));
-console.log('t=0.75 (yellow):', heatmapColor(0.75));
-console.log('t=1.0 (red):', heatmapColor(1.0));
-
 /**
  * Convert overlap values to a heatmap visualization
  * Higher overlap = warmer colors (red), lower overlap = cooler colors (blue)

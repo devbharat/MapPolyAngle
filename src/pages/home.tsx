@@ -22,6 +22,9 @@ export default function Home() {
   const [photoSpacing, setPhotoSpacing] = useState(60); // derived from camera, altitude, front overlap
   const [altitudeAGL, setAltitudeAGL] = useState(100);
   
+  // Auto-run GSD analysis when flight lines are updated
+  const autoRunGSDRef = useRef<(() => void) | null>(null);
+  
   const terrainZoom = 15; // This is now a fallback - actual zoom is calculated dynamically
   const sampleStep = 1;
   const mapboxToken = useMemo(() => 
@@ -56,6 +59,18 @@ export default function Home() {
 
   const handleLineSpacingChange = useCallback((newLineSpacing: number) => {
     setLineSpacing(newLineSpacing);
+  }, []);
+
+  // Handler for when flight lines are updated - automatically trigger GSD analysis
+  const handleFlightLinesUpdated = useCallback(() => {
+    if (autoRunGSDRef.current) {
+      autoRunGSDRef.current();
+    }
+  }, []); // No dependencies needed since we use ref
+
+  // Handler to receive the auto-run function from OverlapGSDPanel
+  const handleAutoRunReceived = useCallback((autoRunFn: () => void) => {
+    autoRunGSDRef.current = autoRunFn;
   }, []);
 
   const clearAllDrawings = useCallback(() => {
@@ -425,6 +440,7 @@ export default function Home() {
                     onLineSpacingChange={handleLineSpacingChange}
                     onPhotoSpacingChange={setPhotoSpacing}
                     onAltitudeChange={setAltitudeAGL}
+                    onAutoRun={handleAutoRunReceived}
                   />
                 </CardContent>
               </Card>
@@ -447,6 +463,7 @@ export default function Home() {
           onAnalysisStart={handleAnalysisStart}
           onAnalysisComplete={handleAnalysisComplete}
           onError={handleError}
+          onFlightLinesUpdated={handleFlightLinesUpdated}
         />
       </div>
     </div>
