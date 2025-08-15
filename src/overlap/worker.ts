@@ -7,13 +7,25 @@ import { rasterizeRingsToMask } from "./rasterize";
 type Msg = WorkerIn;
 type Ret = WorkerOut;
 
-function preparePoses(poses: PoseMeters[]) {
-  return poses.map(p => {
+type PreparedPose = PoseMeters & {
+  RT: Float64Array;
+  /** conservative ground-footprint radius (meters) using half-diagonal FOV */
+  radius: number;
+  radiusSq: number;
+};
+
+function preparePoses(poses: PoseMeters[], zMin: number, diagTan: number): PreparedPose[] {
+  const out: PreparedPose[] = new Array(poses.length);
+  for (let i = 0; i < poses.length; i++) {
+    const p = poses[i];
     const R = rotMat(p.omega_deg, p.phi_deg, p.kappa_deg);
     // R^T for world->camera
     const RT = new Float64Array([R[0],R[3],R[6], R[1],R[4],R[7], R[2],R[5],R[8]]);
-    return {...p, RT};
-  });
+    const H = Math.max(1.0, p.z - zMin);
+    const radius = H * diagTan * 1.25; // keep safety margin
+    out[i] = { ...p, RT, radius, radiusSq: radius * radius };
+  }
+  return out;
 }
 
 function buildPolygonMask(polygons: {ring:[number,number][]}[], z:number, x:number, y:number, size:number): Uint8Array {
@@ -39,96 +51,161 @@ function buildPolygonMask(polygons: {ring:[number,number][]}[], z:number, x:numb
 
 self.onmessage = (ev: MessageEvent<Msg>) => {
   const { tile, polygons, poses, camera, options } = ev.data;
-  const { z,x,y,size,data } = tile;
+  const { z, x, y, size, data } = tile;
   const elev = decodeTerrainRGBToElev(data, size);
-  const tx = tileMetersBounds(z,x,y);
+  const tx = tileMetersBounds(z, x, y);
   tx.pixelSize = (tx.maxX - tx.minX) / size;
 
-  // Precompute per-pose matrices
-  const P = preparePoses(poses);
-
-  // Build polygon mask (now using correct per-tile pixel size internally)
-  const polyMask = buildPolygonMask(polygons, z, x, y, size);
-
-  // Tile outputs
-  const overlap = new Uint16Array(size*size);
-  const gsdMin = new Float32Array(size*size);
-  gsdMin.fill(Number.POSITIVE_INFINITY);
-
-  // Quick z range for culling and sensible normal step
+  // --- Quick z range (used both for footprint and normals)
   let zMin = +Infinity, zMax = -Infinity;
-  for (let i=0;i<elev.length;i++){ const z = elev[i]; if (z<zMin) zMin=z; if (z>zMax) zMax=z; }
+  for (let i = 0; i < elev.length; i++) {
+    const ez = elev[i];
+    if (ez < zMin) zMin = ez;
+    if (ez > zMax) zMax = ez;
+  }
 
-  // --- Robust pre-culling: AABB (tile rectangle) vs camera footprint circle ---
-  // Use diagonal FOV for a conservative circular footprint on ground.
+  // Build polygon mask (uses correct per-tile pixel size internally)
+  const polyMask = buildPolygonMask(polygons, z, x, y, size);
+  // Count active (inside) pixels once and build index list
+  let polyPixelCount = 0;
+  for (let i = 0; i < polyMask.length; i++) polyPixelCount += polyMask[i];
+  if (polyPixelCount === 0) {
+    const ret: Ret = { z, x, y, size, overlap: new Uint16Array(size*size), gsdMin: new Float32Array(size*size).fill(Number.POSITIVE_INFINITY), maxOverlap: 0, minGsd: Number.POSITIVE_INFINITY };
+    (self as any).postMessage(ret, [ret.overlap.buffer, ret.gsdMin.buffer]);
+    return;
+  }
+
+  // --- Precompute per-column/row world coords (cheaper than pixelToWorld per pixel)
+  const xwCol = new Float64Array(size);
+  const ywRow = new Float64Array(size);
+  for (let c = 0; c < size; c++) xwCol[c] = tx.minX + (c + 0.5) * tx.pixelSize;
+  for (let r = 0; r < size; r++) ywRow[r] = tx.maxY - (r + 0.5) * tx.pixelSize;
+
+  // --- Precompute normals just once per active pixel
+  const normals = new Float32Array(size * size * 3);
+  const activeIdxs = new Uint32Array(polyPixelCount);
+  {
+    let w = 0;
+    for (let idx = 0; idx < elev.length; idx++) {
+      if (polyMask[idx] === 0) continue;
+      const row = (idx / size) | 0;
+      const col = idx - row * size;
+      const n = normalFromDEM(elev, size, row, col, tx.pixelSize);
+      const base = idx * 3;
+      normals[base] = n[0];
+      normals[base + 1] = n[1];
+      normals[base + 2] = n[2];
+      activeIdxs[w++] = idx;
+    }
+  }
+
+  // --- Camera optics constants
   const sensorW = camera.w_px * camera.sx_m;
   const sensorH = camera.h_px * camera.sy_m;
-  const diagFov = Math.atan(0.5 * Math.hypot(sensorW, sensorH) / camera.f_m); // half-diagonal FoV
+  const diagFovHalf = Math.atan(0.5 * Math.hypot(sensorW, sensorH) / camera.f_m);
+  const diagTan = Math.tan(diagFovHalf);
+  const s_over_f = camera.sx_m / camera.f_m;
+  const cosIncMin = 1e-3;
 
+  // --- Precompute per-pose matrices + conservative footprint radius
+  const P = preparePoses(poses, zMin, diagTan);
+
+  // --- Stage-1 pose culling: AABB distance to tile vs footprint radius
   const rect = { minX: tx.minX, minY: tx.minY, maxX: tx.maxX, maxY: tx.maxY };
   const distPointToAABB = (px: number, py: number) => {
     const dx = Math.max(rect.minX - px, 0, px - rect.maxX);
     const dy = Math.max(rect.minY - py, 0, py - rect.maxY);
     return Math.hypot(dx, dy);
   };
+  let candidatePoses = P.filter(p => distPointToAABB(p.x, p.y) <= p.radius);
+  // Fail-safe: if polygon has pixels but no candidates survived, keep all
+  if (polyPixelCount > 0 && candidatePoses.length === 0) candidatePoses = P;
 
-  let candidatePoses = P.filter(p => {
-    // Altitude above tile's lowest ground (conservative; includes more poses)
-    const H = Math.max(1.0, p.z - zMin);
-    // Ground radius from FoV; add 25% safety.
-    const radius = H * Math.tan(diagFov) * 1.25;
-    const d = distPointToAABB(p.x, p.y);
-    return d <= radius;
-  });
-
-  // Fail-safe: if polygon has pixels in this tile but no candidate cameras were kept,
-  // do not cull at all for this tile (avoid false negatives).
-  const polyPixels = polyMask.reduce((sum, v) => sum + (v ? 1 : 0), 0);
-  if (polyPixels > 0 && candidatePoses.length === 0) {
-    candidatePoses = P;
+  // --- Stage-2: Spatial grid index of candidate poses (per tile)
+  const gridSize = Math.max(2, Math.min(32, options?.gridSize ?? 8));
+  const cellW = (tx.maxX - tx.minX) / gridSize;
+  const cellH = (tx.maxY - tx.minY) / gridSize;
+  const grid: number[][] = Array.from({ length: gridSize * gridSize }, () => []);
+  // Map pose to every cell overlapped by its footprint bounding box
+  for (let i = 0; i < candidatePoses.length; i++) {
+    const p = candidatePoses[i];
+    const minX = Math.max(tx.minX, p.x - p.radius);
+    const maxX = Math.min(tx.maxX, p.x + p.radius);
+    const minY = Math.max(tx.minY, p.y - p.radius);
+    const maxY = Math.min(tx.maxY, p.y + p.radius);
+    if (minX > maxX || minY > maxY) continue;
+    const x0 = Math.max(0, Math.floor((minX - tx.minX) / cellW));
+    const x1 = Math.min(gridSize - 1, Math.floor((maxX - tx.minX) / cellW));
+    const y0 = Math.max(0, Math.floor((tx.maxY - maxY) / cellH)); // note inverted mercator Y
+    const y1 = Math.min(gridSize - 1, Math.floor((tx.maxY - minY) / cellH));
+    for (let gy = y0; gy <= y1; gy++) {
+      const rowBase = gy * gridSize;
+      for (let gx = x0; gx <= x1; gx++) {
+        grid[rowBase + gx].push(i); // store index into candidatePoses
+      }
+    }
   }
 
-  console.log(`=== TILE PROCESSING START ===`);
-  console.log(`Tile bounds: (${tx.minX.toFixed(1)}, ${tx.minY.toFixed(1)}) to (${tx.maxX.toFixed(1)}, ${tx.maxY.toFixed(1)}): ${size}x${size} pixels`);
-  console.log(`Terrain data: ${elev.length} values, elevation range: ${zMin.toFixed(1)}m to ${zMax.toFixed(1)}m`);
-  console.log(`Polygon rings: ${polygons.length}`);
-  console.log(`After rasterization: ${polyMask.reduce((sum,val) => sum + val, 0)} pixels inside polygon`);
-  console.log(`Input poses: ${P.length} total`);
-  console.log(`After spatial culling (AABB): ${candidatePoses.length} poses remaining for this tile`);
+  // Precompute pixel->cell lookups
+  const col2cellX = new Uint16Array(size);
+  const row2cellY = new Uint16Array(size);
+  for (let c = 0; c < size; c++) col2cellX[c] = Math.min(gridSize - 1, Math.floor((c * gridSize) / size));
+  for (let r = 0; r < size; r++) row2cellY[r] = Math.min(gridSize - 1, Math.floor((r * gridSize) / size));
 
-  // Main loop: per pixel within polygon mask; test pose coverage by projection
-  for (let idx=0; idx<elev.length; idx++) {
-    if (polyMask[idx] === 0) continue;
+  // Tile outputs
+  const overlap = new Uint16Array(size*size);
+  const gsdMin = new Float32Array(size*size);
+  gsdMin.fill(Number.POSITIVE_INFINITY);
+
+  // Optional early‑exit target (per pixel)
+  const maxOverlapNeeded = Number.isFinite(options?.maxOverlapNeeded!)
+    ? (options!.maxOverlapNeeded as number)
+    : Infinity;
+
+  // Main loop: only iterate pixels inside polygon
+  for (let t = 0; t < activeIdxs.length; t++) {
+    const idx = activeIdxs[t];
 
     const row = (idx / size) | 0;
     const col = idx - row*size;
-    const [xw,yw] = pixelToWorld(tx, col, row);
+    const xw = xwCol[col];
+    const yw = ywRow[row];
     const zw = elev[idx];
 
-    // normal (for oblique correction)
-    const n = normalFromDEM(elev, size, row, col, tx.pixelSize);
+    // normal (precomputed) for oblique correction
+    const nb = idx * 3;
+    const nx = normals[nb], ny = normals[nb + 1], nz = normals[nb + 2];
 
     let localOverlap = 0;
-    let localMinG = gsdMin[idx];
+    let localMinG = Number.POSITIVE_INFINITY;
 
-    for (let k=0; k<candidatePoses.length; k++) {
-      const p = candidatePoses[k];
+    // Fetch candidate poses for this pixel's grid cell
+    const cellIdx = row2cellY[row] * gridSize + col2cellX[col];
+    const cellList = grid[cellIdx];
+    if (cellList.length === 0) continue;
+
+    for (let u = 0; u < cellList.length; u++) {
+      const p = candidatePoses[cellList[u]];
+      // Cheap 2D footprint check before doing full projection
+      const dx2 = xw - p.x, dy2 = yw - p.y;
+      if (dx2*dx2 + dy2*dy2 > p.radiusSq) continue;
+
       const camHit = camRayToPixel(camera, p.RT, p.x, p.y, p.z, xw, yw, zw);
       if (!camHit) continue;
 
       // Incidence correction
-      const vx = (xw - p.x), vy = (yw - p.y), vz = (zw - p.z);
+      const vx = dx2, vy = dy2, vz = (zw - p.z);
       const L = Math.hypot(vx,vy,vz);
       const invL = 1 / L;
       const rx = vx*invL, ry = vy*invL, rz = vz*invL;
-      const cosInc = -(n[0]*rx + n[1]*ry + n[2]*rz);
-      if (cosInc <= 1e-3) continue;
+      const cosInc = -(nx*rx + ny*ry + nz*rz);
+      if (cosInc <= cosIncMin) continue;
 
-      const s = camera.sx_m; // if anisotropic: use Math.sqrt(sx*sy)
-      const gsd = (L * s / camera.f_m) * (1 / cosInc);
+      const gsd = (L * s_over_f) * (1 / cosInc);
 
       localOverlap++;
       if (gsd < localMinG) localMinG = gsd;
+      if (localOverlap >= maxOverlapNeeded) break; // early exit for this pixel
     }
 
     if (localOverlap > 0) {
@@ -139,20 +216,12 @@ self.onmessage = (ev: MessageEvent<Msg>) => {
 
   // Summaries
   let maxOverlap = 0, minGsd = Number.POSITIVE_INFINITY;
-  let pixelsWithCoverage = 0, pixelsWithValidGSD = 0;
-  for (let i=0;i<overlap.length;i++){
-    if (overlap[i] > maxOverlap) maxOverlap = overlap[i];
-    if (overlap[i] > 0) pixelsWithCoverage++;
+  for (let i=0; i<overlap.length; i++){
+    const ov = overlap[i];
+    if (ov > maxOverlap) maxOverlap = ov;
     const g = gsdMin[i];
-    if (g > 0 && isFinite(g)) {
-      pixelsWithValidGSD++;
-      if (g < minGsd) minGsd = g;
-    }
+    if (g > 0 && isFinite(g) && g < minGsd) minGsd = g;
   }
-
-  console.log(`Computing coverage for ${polyMask.reduce((sum,val) => sum + val, 0)} pixels with ${candidatePoses.length} poses...`);
-  console.log(`Results: ${pixelsWithCoverage} pixels with coverage, ${pixelsWithValidGSD} pixels with valid GSD`);
-  console.log(`Max overlap: ${maxOverlap}, Min GSD: ${minGsd.toFixed(4)}m`);
 
   const ret: Ret = { z, x, y, size, overlap, gsdMin, maxOverlap, minGsd };
   (self as any).postMessage(ret, [overlap.buffer, gsdMin.buffer]);

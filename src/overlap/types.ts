@@ -41,6 +41,10 @@ export type WorkerIn = {
   camera: CameraModel;
   options?: {
     gsdMaxForPalette?: number; // meters per pixel for visualization clamp
+    /** Optional: stop counting once overlap reaches this number (per pixel). Default: Infinity */
+    maxOverlapNeeded?: number;
+    /** Optional: spatial grid resolution for pose indexing per-tile. Default: 8 */
+    gridSize?: number;
   };
 };
 
