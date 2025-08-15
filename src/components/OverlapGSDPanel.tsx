@@ -345,24 +345,15 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, onLineSpacingChange, onPh
   return (
     <div className="backdrop-blur-md bg-white/95 rounded-md border p-3 space-y-3">
       <div className="flex items-center justify-between">
-        <h3 className="text-sm font-medium text-gray-900">Overlap & GSD (Client)</h3>
-        <div className="text-xs text-gray-500">WASM‑free prototype</div>
+        <h3 className="text-sm font-medium text-gray-900">GSD Analysis</h3>
       </div>
 
-      <div className="grid grid-cols-2 gap-2">
-        <label className="text-xs text-gray-600">Tile zoom
-          <input className="w-full border rounded px-2 py-1 text-xs"
-                 type="number" min={12} max={15} value={zoom}
-                 onChange={e => setZoom(parseInt(e.target.value||"15",10))} />
-        </label>
-        <label className="text-xs text-gray-600">Opacity
-          <input className="w-full" type="range" min={0.1} max={1} step={0.05}
-                 value={opacity} onChange={e => setOpacity(parseFloat(e.target.value))} />
-        </label>
+      <div className="grid grid-cols-1 gap-2">
         <label className="text-xs col-span-1">
           <input type="checkbox" checked={showGsd} onChange={e=>setShowGsd(e.target.checked)} className="mr-2" />
           <span className="font-medium">Show GSD (Primary)</span>
         </label>
+        {/* Commented out for simplified UI
         <label className="text-xs col-span-1">
           <input type="checkbox" checked={showOverlap} onChange={e=>setShowOverlap(e.target.checked)} className="mr-2" />
           Show overlap count
@@ -371,67 +362,12 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, onLineSpacingChange, onPh
           <input type="checkbox" checked={showCameraPoints} onChange={e=>setShowCameraPoints(e.target.checked)} className="mr-2" />
           Show camera positions
         </label>
-      </div>
-
-      <div className="grid grid-cols-2 gap-2">
-        <div>
-          <div className="text-xs font-medium mb-1">Sony RX1R II Camera</div>
-          <textarea className="w-full h-24 border rounded p-2 text-xs font-mono"
-                    value={cameraText} onChange={e=>setCameraText(e.target.value)} />
-        </div>
-        <div className="space-y-2">
-          <div className="text-xs font-medium mb-1">Flight Parameters</div>
-          <label className="text-xs text-gray-600 block">
-            Altitude AGL (m)
-            <input className="w-full border rounded px-2 py-1 text-xs" type="number" 
-                   value={altitude} onChange={e=>setAltitude(parseInt(e.target.value||"100"))} />
-          </label>
-          <label className="text-xs text-gray-600 block">
-            Front overlap (%)
-            <input className="w-full border rounded px-2 py-1 text-xs" type="number" 
-                   min="0" max="95" value={frontOverlap} onChange={e=>setFrontOverlap(parseInt(e.target.value||"80"))} />
-          </label>
-          <label className="text-xs text-gray-600 block">
-            Side overlap (%)
-            <input className="w-full border rounded px-2 py-1 text-xs" type="number" 
-                   min="0" max="95" value={sideOverlap} onChange={e=>setSideOverlap(parseInt(e.target.value||"70"))} />
-          </label>
-          <label className="text-xs text-gray-600 block">
-            Photo spacing (m) <span className="text-gray-400">(calculated)</span>
-            <input className="w-full border rounded px-2 py-1 text-xs bg-gray-100" type="number" 
-                   value={photoSpacing.toFixed(1)} readOnly />
-          </label>
-          <label className="text-xs text-gray-600 block">
-            Line spacing (m) <span className="text-gray-400">(calculated)</span>
-            <input className="w-full border rounded px-2 py-1 text-xs bg-gray-100" type="number" 
-                   value={lineSpacing.toFixed(1)} readOnly />
-          </label>
-          <label className="text-xs block">
-            <input type="checkbox" checked={autoGenerate} onChange={e=>setAutoGenerate(e.target.checked)} className="mr-2" />
-            Auto-generate from polygons
-          </label>
-          {autoGenerate && (
-            <div className="text-xs text-gray-500">
-              {parsePosesMeters()?.length || 0} poses generated
-            </div>
-          )}
-        </div>
-      </div>
-
-      <div className="flex gap-2 items-center">
-        <button onClick={compute} disabled={running}
-                className="px-3 py-1.5 rounded bg-blue-600 text-white text-sm disabled:opacity-50">
-          {running ? "Computing…" : "Manual Compute"}
-        </button>
-        <button onClick={clear}
-                className="px-3 py-1.5 rounded border text-sm">
-          Clear overlay
-        </button>
+        */}
       </div>
 
       {/* GSD Statistics and Histogram */}
       {gsdStats && gsdStats.count > 0 && (
-        <Card className="mt-4">
+        <Card className="mt-2">
           <CardHeader className="pb-3">
             <CardTitle className="text-sm">GSD Analysis Results</CardTitle>
             <CardDescription className="text-xs">
@@ -493,10 +429,68 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, onLineSpacingChange, onPh
         </Card>
       )}
 
+      <div className="grid grid-cols-1 gap-2">
+        {/* Commented out for simplified UI
+        <div>
+          <div className="text-xs font-medium mb-1">Sony RX1R II Camera</div>
+          <textarea className="w-full h-24 border rounded p-2 text-xs font-mono"
+                    value={cameraText} onChange={e=>setCameraText(e.target.value)} />
+        </div>
+        */}
+        <div className="space-y-2">
+          <div className="text-xs font-medium mb-1">Flight Parameters</div>
+          <label className="text-xs text-gray-600 block">
+            Altitude AGL (m)
+            <input className="w-full border rounded px-2 py-1 text-xs" type="number" 
+                   value={altitude} onChange={e=>setAltitude(parseInt(e.target.value||"100"))} />
+          </label>
+          <label className="text-xs text-gray-600 block">
+            Front overlap (%)
+            <input className="w-full border rounded px-2 py-1 text-xs" type="number" 
+                   min="0" max="95" value={frontOverlap} onChange={e=>setFrontOverlap(parseInt(e.target.value||"80"))} />
+          </label>
+          <label className="text-xs text-gray-600 block">
+            Side overlap (%)
+            <input className="w-full border rounded px-2 py-1 text-xs" type="number" 
+                   min="0" max="95" value={sideOverlap} onChange={e=>setSideOverlap(parseInt(e.target.value||"70"))} />
+          </label>
+          {/* Commented out for simplified UI
+          <label className="text-xs text-gray-600 block">
+            Photo spacing (m) <span className="text-gray-400">(calculated)</span>
+            <input className="w-full border rounded px-2 py-1 text-xs bg-gray-100" type="number" 
+                   value={photoSpacing.toFixed(1)} readOnly />
+          </label>
+          <label className="text-xs text-gray-600 block">
+            Line spacing (m) <span className="text-gray-400">(calculated)</span>
+            <input className="w-full border rounded px-2 py-1 text-xs bg-gray-100" type="number" 
+                   value={lineSpacing.toFixed(1)} readOnly />
+          </label>
+          */}
+          <label className="text-xs block">
+            <input type="checkbox" checked={autoGenerate} onChange={e=>setAutoGenerate(e.target.checked)} className="mr-2" />
+            Auto-generate from polygons
+          </label>
+          {autoGenerate && (
+            <div className="text-xs text-gray-500">
+              {parsePosesMeters()?.length || 0} poses generated
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div className="flex gap-2 items-center">
+        <button onClick={compute} disabled={running}
+                className="px-3 py-1.5 rounded bg-blue-600 text-white text-sm disabled:opacity-50">
+          {running ? "Computing…" : "Manual Compute"}
+        </button>
+        <button onClick={clear}
+                className="px-3 py-1.5 rounded border text-sm">
+          Clear overlay
+        </button>
+      </div>
+
       <p className="text-[11px] text-gray-500">
-        <strong>Auto-mode:</strong> GSD analysis runs automatically when polygons are created or flight parameters change.
-        Uses Sony RX1R II specs (35mm, 42MP) with automatic pose generation. Computes <em>Ground Sample Distance</em> 
-        and optional <em>overlap count</em> per terrain pixel using nadir photography.
+        Automatic GSD analysis runs when polygons are created or flight parameters change.
       </p>
     </div>
   );

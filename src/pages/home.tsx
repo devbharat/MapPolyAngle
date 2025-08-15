@@ -173,31 +173,6 @@ export default function Home() {
         {/* Right Side Panel - Combined Controls and Instructions - Hidden on mobile */}
         {!isMobile && (
           <div className="absolute top-2 right-2 z-40 w-80 max-h-[calc(100vh-120px)] overflow-y-auto">
-          {/* Instructions */}
-          <Card className="backdrop-blur-md bg-white/95 mb-4">
-            <CardContent className="p-1">
-              <h3 className="font-medium text-gray-900 mb-2">How to Use</h3>
-              <ol className="text-xs text-gray-600 space-y-1">
-                <li className="flex items-start space-x-2">
-                  <span className="flex-shrink-0 w-4 h-4 bg-blue-600 text-white rounded-full flex items-center justify-center text-xs font-medium">1</span>
-                  <span>Click the square tool (top-left) to draw polygons</span>
-                </li>
-                <li className="flex items-start space-x-2">
-                  <span className="flex-shrink-0 w-4 h-4 bg-blue-600 text-white rounded-full flex items-center justify-center text-xs font-medium">2</span>
-                  <span>Click points on terrain to create each polygon</span>
-                </li>
-                <li className="flex items-start space-x-2">
-                  <span className="flex-shrink-0 w-4 h-4 bg-blue-600 text-white rounded-full flex items-center justify-center text-xs font-medium">3</span>
-                  <span>Click again the first point to finish</span>
-                </li>
-              </ol>
-              <div className="mt-2 pt-2 border-t">
-                <p className="text-xs text-gray-500">
-                  <strong>Features:</strong> Multi-polygon support • 3D flight paths (100m AGL) • 3D plane fitting • Automatic GSD analysis
-                </p>
-              </div>
-            </CardContent>
-          </Card>
 
           {/* Analysis Results */}
           <Card className="backdrop-blur-md bg-white/95">
