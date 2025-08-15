@@ -27,6 +27,7 @@ interface Props {
   zoom?: number;
   terrainZoom?: number;
   sampleStep?: number;
+  lineSpacing?: number; // Flight line spacing in meters (default: 100)
   onAnalysisComplete?: (results: PolygonAnalysisResult[]) => void;
   onAnalysisStart?: (polygonId: string) => void;
   onError?: (error: string, polygonId?: string) => void;
@@ -54,6 +55,7 @@ export const MapFlightDirection = React.forwardRef<
       zoom = 13,
       terrainZoom = 12,
       sampleStep = 2,
+      lineSpacing = 100,
       onAnalysisComplete,
       onAnalysisStart,
       onError,
@@ -95,6 +97,7 @@ export const MapFlightDirection = React.forwardRef<
             result.polygonId,
             result.polygon.coordinates,
             result.result.contourDirDeg,
+            lineSpacing,
             result.result.fitQuality
           );
           console.log(`Added ${flightLinesResult.flightLines.length} flight lines with ${flightLinesResult.lineSpacing}m spacing`);

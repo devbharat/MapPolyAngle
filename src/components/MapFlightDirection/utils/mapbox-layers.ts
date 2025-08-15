@@ -30,12 +30,13 @@ export function addFlightLinesForPolygon(
   polygonId: string,
   ring: number[][],
   bearingDeg: number,
+  lineSpacingM: number,
   quality?: string
 ): { flightLines: number[][][]; lineSpacing: number } {
   removeFlightLinesForPolygon(map, polygonId);
 
   const bounds = getPolygonBounds(ring);
-  const lineSpacing = 100; // Simplified spacing
+  const lineSpacing = lineSpacingM;
   const flightLines: number[][][] = [];
 
   const centerLat = (bounds.minLat + bounds.maxLat) / 2;

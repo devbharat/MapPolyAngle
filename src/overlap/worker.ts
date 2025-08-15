@@ -57,28 +57,38 @@ self.onmessage = (ev: MessageEvent<Msg>) => {
 
   // Pre-cull poses by a coarse ground circle intersection
   const candidatePoses = P.filter(p => {
-    // Project along camera -Z to plane z=zMin
-    const R = rotMat(p.omega_deg,p.phi_deg,p.kappa_deg);
-    const dz = R[8]*(-1); // world z component of camera -Z direction is R*(0,0,-1) => column 2 neg
-    const dirx = R[2]; const diry = R[5]; const dirz = R[8]; // column 3 of R (world Z) ; but camera -Z is -R[:,2]
-    const vx = -R[2], vy = -R[5], vz = -R[8];
-    if (Math.abs(vz) < 1e-6) return true;
-    const t = (zMin - p.z)/vz;
-    const cx = p.x + t*vx;
-    const cy = p.y + t*vy;
-    // FOV radius on ground
+    // For nadir cameras, use simple distance-based culling
+    const tileCenterX = (tx.minX + tx.maxX) / 2;
+    const tileCenterY = (tx.minY + tx.maxY) / 2;
+    const dx = p.x - tileCenterX;
+    const dy = p.y - tileCenterY;
+    const distance = Math.sqrt(dx*dx + dy*dy);
+    
+    // Calculate conservative FOV radius at ground level
     const hfov = Math.atan((camera.w_px*camera.sx_m*0.5)/camera.f_m);
     const vfov = Math.atan((camera.h_px*camera.sy_m*0.5)/camera.f_m);
     const fov = Math.max(hfov, vfov);
     const H = Math.max(1.0, (p.z - zMin));
-    const radius = H * Math.tan(fov) * 1.5; // margin
-    // AABB circle-overlap test with tile bounds in meters
-    const {minX,maxX,minY,maxY} = tx;
-    const closestX = Math.max(minX, Math.min(cx, maxX));
-    const closestY = Math.max(minY, Math.min(cy, maxY));
-    const dx = cx - closestX, dy = cy - closestY;
-    return (dx*dx + dy*dy) <= radius*radius;
+    const radius = H * Math.tan(fov) * 4.0; // very conservative margin for edge coverage
+    
+    // Also include diagonal distance for tile coverage
+    const tileDiagonal = Math.sqrt(
+      (tx.maxX - tx.minX) * (tx.maxX - tx.minX) + 
+      (tx.maxY - tx.minY) * (tx.maxY - tx.minY)
+    );
+    const maxDistance = radius + tileDiagonal;
+    
+    const shouldInclude = distance <= maxDistance;
+    return shouldInclude;
   });
+
+  console.log(`=== TILE PROCESSING START ===`);
+  console.log(`Tile bounds: (${tx.minX.toFixed(1)}, ${tx.minY.toFixed(1)}) to (${tx.maxX.toFixed(1)}, ${tx.maxY.toFixed(1)}): ${size}x${size} pixels`);
+  console.log(`Terrain data: ${elev.length} values, elevation range: ${zMin.toFixed(1)}m to ${zMax.toFixed(1)}m`);
+  console.log(`Polygon rings: ${polygons.length}`);
+  console.log(`After rasterization: ${polyMask.reduce((sum,val) => sum + val, 0)} pixels inside polygon`);
+  console.log(`Input poses: ${P.length} total`);
+  console.log(`After spatial culling: ${candidatePoses.length} poses remaining for this tile`);
 
   // Main loop: per pixel within polygon mask; test pose coverage by projection
   for (let idx=0; idx<elev.length; idx++) {
@@ -123,11 +133,20 @@ self.onmessage = (ev: MessageEvent<Msg>) => {
 
   // Summaries
   let maxOverlap = 0, minGsd = Number.POSITIVE_INFINITY;
+  let pixelsWithCoverage = 0, pixelsWithValidGSD = 0;
   for (let i=0;i<overlap.length;i++){
     if (overlap[i] > maxOverlap) maxOverlap = overlap[i];
+    if (overlap[i] > 0) pixelsWithCoverage++;
     const g = gsdMin[i];
-    if (g > 0 && isFinite(g) && g < minGsd) minGsd = g;
+    if (g > 0 && isFinite(g)) {
+      pixelsWithValidGSD++;
+      if (g < minGsd) minGsd = g;
+    }
   }
+
+  console.log(`Computing coverage for ${polyMask.reduce((sum,val) => sum + val, 0)} pixels with ${candidatePoses.length} poses...`);
+  console.log(`Results: ${pixelsWithCoverage} pixels with coverage, ${pixelsWithValidGSD} pixels with valid GSD`);
+  console.log(`Max overlap: ${maxOverlap}, Min GSD: ${minGsd.toFixed(4)}m`);
 
   const ret: Ret = { z, x, y, size, overlap, gsdMin, maxOverlap, minGsd };
   (self as any).postMessage(ret, [overlap.buffer, gsdMin.buffer]);

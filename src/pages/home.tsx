@@ -17,6 +17,9 @@ export default function Home() {
   const [polygonResults, setPolygonResults] = useState<PolygonAnalysisResult[]>([]);
   const [analyzingPolygons, setAnalyzingPolygons] = useState<Set<string>>(new Set());
   
+  // Flight planning parameters
+  const [lineSpacing, setLineSpacing] = useState(100); // Default 100m spacing
+  
   const terrainZoom = 15; // This is now a fallback - actual zoom is calculated dynamically
   const sampleStep = 1;
   const mapboxToken = useMemo(() => 
@@ -47,6 +50,10 @@ export default function Home() {
         return newSet;
       });
     }
+  }, []);
+
+  const handleLineSpacingChange = useCallback((newLineSpacing: number) => {
+    setLineSpacing(newLineSpacing);
   }, []);
 
   const clearAllDrawings = useCallback(() => {
@@ -410,7 +417,11 @@ export default function Home() {
 
               <Card className="backdrop-blur-md bg-white/95 mt-4">
                 <CardContent className="p-3">
-                  <OverlapGSDPanel mapRef={mapRef} mapboxToken={mapboxToken} />
+                  <OverlapGSDPanel 
+                    mapRef={mapRef} 
+                    mapboxToken={mapboxToken} 
+                    onLineSpacingChange={handleLineSpacingChange}
+                  />
                 </CardContent>
               </Card>
             </>
@@ -426,6 +437,7 @@ export default function Home() {
           zoom={initialZoom}
           terrainZoom={terrainZoom}
           sampleStep={sampleStep}
+          lineSpacing={lineSpacing}
           onAnalysisStart={handleAnalysisStart}
           onAnalysisComplete={handleAnalysisComplete}
           onError={handleError}

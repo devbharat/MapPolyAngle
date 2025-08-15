@@ -10,6 +10,7 @@ type Props = {
   // Ref to MapFlightDirection (must expose getMap() and getPolygons())
   mapRef: React.RefObject<any>;
   mapboxToken: string;
+  onLineSpacingChange?: (lineSpacing: number) => void;
 };
 
 // Sony RX1R II camera specifications
@@ -21,10 +22,11 @@ const sonyRX1R2Camera: CameraModel = {
   h_px: 5304,
 };
 
-export function OverlapGSDPanel({ mapRef, mapboxToken }: Props) {
+export function OverlapGSDPanel({ mapRef, mapboxToken, onLineSpacingChange }: Props) {
   const [cameraText, setCameraText] = useState(JSON.stringify(sonyRX1R2Camera, null, 2));
   const [altitude, setAltitude] = useState(100); // AGL in meters
-  const [photoSpacing, setPhotoSpacing] = useState(60); // meters between photos
+  const [frontOverlap, setFrontOverlap] = useState(80); // percentage
+  const [sideOverlap, setSideOverlap] = useState(70); // percentage
   const [zoom, setZoom] = useState(15);
   const [opacity, setOpacity] = useState(0.85);
   const [showOverlap, setShowOverlap] = useState(true);
@@ -37,6 +39,29 @@ export function OverlapGSDPanel({ mapRef, mapboxToken }: Props) {
   const parseCamera = useCallback((): CameraModel | null => {
     try { return JSON.parse(cameraText); } catch { return null; }
   }, [cameraText]);
+
+  // Calculate flight parameters from overlap settings
+  const calculateFlightParameters = useCallback(() => {
+    const camera = parseCamera();
+    if (!camera) return { photoSpacing: 60, lineSpacing: 100 };
+
+    // Calculate ground footprint at specified altitude
+    const groundWidth = (camera.w_px * camera.sx_m * altitude) / camera.f_m;
+    const groundHeight = (camera.h_px * camera.sy_m * altitude) / camera.f_m;
+
+    // Calculate spacing based on overlap percentages
+    const photoSpacing = groundHeight * (1 - frontOverlap / 100); // Forward direction
+    const lineSpacing = groundWidth * (1 - sideOverlap / 100);    // Side direction
+
+    return { photoSpacing, lineSpacing };
+  }, [parseCamera, altitude, frontOverlap, sideOverlap]);
+
+  const { photoSpacing, lineSpacing } = calculateFlightParameters();
+
+  // Notify parent when line spacing changes
+  React.useEffect(() => {
+    onLineSpacingChange?.(lineSpacing);
+  }, [lineSpacing, onLineSpacingChange]);
 
   // Generate poses from existing flight lines using 3D paths
   const generatePosesFromFlightLines = useCallback((): PoseMeters[] => {
@@ -224,9 +249,24 @@ export function OverlapGSDPanel({ mapRef, mapboxToken }: Props) {
                    value={altitude} onChange={e=>setAltitude(parseInt(e.target.value||"100"))} />
           </label>
           <label className="text-xs text-gray-600 block">
-            Photo spacing (m)
+            Front overlap (%)
             <input className="w-full border rounded px-2 py-1 text-xs" type="number" 
-                   value={photoSpacing} onChange={e=>setPhotoSpacing(parseInt(e.target.value||"60"))} />
+                   min="0" max="95" value={frontOverlap} onChange={e=>setFrontOverlap(parseInt(e.target.value||"80"))} />
+          </label>
+          <label className="text-xs text-gray-600 block">
+            Side overlap (%)
+            <input className="w-full border rounded px-2 py-1 text-xs" type="number" 
+                   min="0" max="95" value={sideOverlap} onChange={e=>setSideOverlap(parseInt(e.target.value||"70"))} />
+          </label>
+          <label className="text-xs text-gray-600 block">
+            Photo spacing (m) <span className="text-gray-400">(calculated)</span>
+            <input className="w-full border rounded px-2 py-1 text-xs bg-gray-100" type="number" 
+                   value={photoSpacing.toFixed(1)} readOnly />
+          </label>
+          <label className="text-xs text-gray-600 block">
+            Line spacing (m) <span className="text-gray-400">(calculated)</span>
+            <input className="w-full border rounded px-2 py-1 text-xs bg-gray-100" type="number" 
+                   value={lineSpacing.toFixed(1)} readOnly />
           </label>
           <label className="text-xs block">
             <input type="checkbox" checked={autoGenerate} onChange={e=>setAutoGenerate(e.target.checked)} className="mr-2" />
