@@ -2,9 +2,11 @@ import React, { useCallback, useMemo, useRef, useState } from "react";
 import type mapboxgl from "mapbox-gl";
 import { OverlapWorker, fetchTerrainRGBA, tilesCoveringPolygon } from "@/overlap/controller";
 import { addOrUpdateTileOverlay, clearRunOverlays } from "@/overlap/overlay";
-import type { CameraModel, PoseMeters, PolygonLngLat } from "@/overlap/types";
+import type { CameraModel, PoseMeters, PolygonLngLat, GSDStats } from "@/overlap/types";
 import { lngLatToMeters } from "@/overlap/mercator";
 import { sampleCameraPositionsOnFlightPath, build3DFlightPath } from "@/components/MapFlightDirection/utils/geometry";
+import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 
 type Props = {
   // Ref to MapFlightDirection (must expose getMap() and getPolygons())
@@ -37,12 +39,76 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, onLineSpacingChange, onPh
   const [running, setRunning] = useState(false);
   const [autoGenerate, setAutoGenerate] = useState(true);
   const [showCameraPoints, setShowCameraPoints] = useState(false); // Changed default to false
+  const [gsdStats, setGsdStats] = useState<GSDStats | null>(null);
   const runIdRef = useRef<string>("");
   const autoTriesRef = useRef(0);
 
   const parseCamera = useCallback((): CameraModel | null => {
     try { return JSON.parse(cameraText); } catch { return null; }
   }, [cameraText]);
+
+  // Function to aggregate GSD statistics from multiple tiles
+  const aggregateGSDStats = useCallback((tileStats: GSDStats[]): GSDStats => {
+    if (tileStats.length === 0) {
+      return { min: 0, max: 0, mean: 0, count: 0, histogram: [] };
+    }
+
+    // Filter out empty stats
+    const validStats = tileStats.filter(stat => stat.count > 0);
+    if (validStats.length === 0) {
+      return { min: 0, max: 0, mean: 0, count: 0, histogram: [] };
+    }
+
+    // Calculate overall statistics
+    const allMins = validStats.map(s => s.min);
+    const allMaxs = validStats.map(s => s.max);
+    const totalMin = Math.min(...allMins);
+    const totalMax = Math.max(...allMaxs);
+    
+    // Calculate weighted mean
+    let totalSum = 0;
+    let totalCount = 0;
+    validStats.forEach(stat => {
+      totalSum += stat.mean * stat.count;
+      totalCount += stat.count;
+    });
+    const overallMean = totalCount > 0 ? totalSum / totalCount : 0;
+
+    // Aggregate histograms by creating new bins across the full range
+    const numBins = 20;
+    const binSize = (totalMax - totalMin) / numBins;
+    const histogram: { bin: number; count: number }[] = [];
+    
+    for (let i = 0; i < numBins; i++) {
+      const binStart = totalMin + i * binSize;
+      const binEnd = binStart + binSize;
+      const binCenter = binStart + binSize / 2;
+      
+      // Sum counts from all tiles for this bin range
+      let binCount = 0;
+      validStats.forEach(stat => {
+        stat.histogram.forEach(bin => {
+          const binBinStart = bin.bin - (stat.max - stat.min) / (stat.histogram.length * 2);
+          const binBinEnd = bin.bin + (stat.max - stat.min) / (stat.histogram.length * 2);
+          
+          // Check if this histogram bin overlaps with our aggregated bin
+          if (binBinEnd > binStart && binBinStart < binEnd) {
+            binCount += bin.count;
+          }
+        });
+      });
+      
+      histogram.push({ bin: binCenter, count: binCount });
+    }
+
+    return {
+      min: totalMin,
+      max: totalMax,
+      mean: overallMean,
+      count: totalCount,
+      histogram
+    };
+  }, []);
 
   // Calculate flight parameters from overlap settings
   const calculateFlightParameters = useCallback(() => {
@@ -169,14 +235,24 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, onLineSpacingChange, onPh
       }
 
       // Process sequentially for simplicity (can parallelize with multiple workers)
+      const allGsdStats: GSDStats[] = [];
       for (const t of tiles) {
         const imgData = await fetchTerrainRGBA(t.z, t.x, t.y, mapboxToken);
         const tile = { z:t.z, x:t.x, y:t.y, size: imgData.width, data: imgData.data };
         const res = await worker.runTile({ tile, polygons, poses, camera } as any);
 
+        // Collect GSD statistics from each tile
+        if (res.gsdStats) {
+          allGsdStats.push(res.gsdStats);
+        }
+
         if (showOverlap) addOrUpdateTileOverlay(map, res, { kind: "overlap", runId, opacity });
         if (showGsd) addOrUpdateTileOverlay(map, res, { kind: "gsd", runId, opacity, gsdMax: 0.1 });
       }
+
+      // Aggregate GSD statistics from all tiles
+      const aggregatedStats = aggregateGSDStats(allGsdStats);
+      setGsdStats(aggregatedStats);
 
       // Add camera position markers in 3D
       if (showCameraPoints && poses.length > 0) {
@@ -254,6 +330,9 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, onLineSpacingChange, onPh
       }
       
       runIdRef.current = "";
+      
+      // Clear GSD statistics
+      setGsdStats(null);
     }
   }, [mapRef]);
 
@@ -343,6 +422,70 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, onLineSpacingChange, onPh
           Clear overlay
         </button>
       </div>
+
+      {/* GSD Statistics and Histogram */}
+      {gsdStats && gsdStats.count > 0 && (
+        <Card className="mt-4">
+          <CardHeader className="pb-3">
+            <CardTitle className="text-sm">GSD Analysis Results</CardTitle>
+            <CardDescription className="text-xs">
+              Ground Sample Distance statistics for {gsdStats.count.toLocaleString()} pixels
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            {/* Summary Statistics */}
+            <div className="grid grid-cols-3 gap-4 text-xs">
+              <div className="text-center">
+                <div className="font-medium text-green-600">{(gsdStats.min * 100).toFixed(1)} cm</div>
+                <div className="text-gray-500">Min GSD</div>
+              </div>
+              <div className="text-center">
+                <div className="font-medium text-blue-600">{(gsdStats.mean * 100).toFixed(1)} cm</div>
+                <div className="text-gray-500">Mean GSD</div>
+              </div>
+              <div className="text-center">
+                <div className="font-medium text-red-600">{(gsdStats.max * 100).toFixed(1)} cm</div>
+                <div className="text-gray-500">Max GSD</div>
+              </div>
+            </div>
+
+            {/* Histogram */}
+            <div className="h-48">
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={gsdStats.histogram.map(bin => ({
+                  gsd: (bin.bin * 100).toFixed(1),
+                  count: bin.count,
+                  gsdValue: bin.bin
+                }))}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
+                  <XAxis 
+                    dataKey="gsd" 
+                    tick={{ fontSize: 10 }}
+                    label={{ value: 'GSD (cm)', position: 'insideBottom', offset: -5, style: { fontSize: '10px' } }}
+                  />
+                  <YAxis 
+                    tick={{ fontSize: 10 }}
+                    label={{ value: 'Pixel Count', angle: -90, position: 'insideLeft', style: { fontSize: '10px' } }}
+                  />
+                  <Tooltip 
+                    formatter={(value, name) => [value?.toLocaleString(), 'Pixels']}
+                    labelFormatter={(label) => `GSD: ${label} cm`}
+                    labelStyle={{ fontSize: '11px' }}
+                    contentStyle={{ fontSize: '11px' }}
+                  />
+                  <Bar 
+                    dataKey="count" 
+                    fill="#3b82f6" 
+                    stroke="#1e40af"
+                    strokeWidth={0.5}
+                    radius={[1, 1, 0, 0]}
+                  />
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+          </CardContent>
+        </Card>
+      )}
 
       <p className="text-[11px] text-gray-500">
         <strong>Auto-mode:</strong> GSD analysis runs automatically when polygons are created or flight parameters change.

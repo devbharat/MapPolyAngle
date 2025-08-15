@@ -24,12 +24,21 @@ export type TileRGBA = {
   data: Uint8ClampedArray;  // RGBA (Terrain-RGB)
 };
 
+export type GSDStats = {
+  min: number;
+  max: number;
+  mean: number;
+  count: number;
+  histogram: { bin: number; count: number }[];
+};
+
 export type TileResult = {
   z: number; x: number; y: number; size: number;
   maxOverlap: number;
   minGsd: number;   // finite min over tile or +Inf if none
   overlap: Uint16Array;
   gsdMin: Float32Array;
+  gsdStats?: GSDStats; // Per-tile GSD statistics
 };
 
 export type PolygonLngLat = { ring: [number, number][] }; // single-ring polygon

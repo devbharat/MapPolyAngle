@@ -1,4 +1,4 @@
-import type { WorkerIn, WorkerOut, CameraModel, PoseMeters } from "./types";
+import type { WorkerIn, WorkerOut, CameraModel, PoseMeters, GSDStats } from "./types";
 import { tileMetersBounds, pixelToWorld, worldToPixel } from "./mercator";
 import { decodeTerrainRGBToElev } from "./terrain";
 import { rotMat, camRayToPixel, normalFromDEM } from "./math3d";
@@ -47,6 +47,61 @@ function buildPolygonMask(polygons: {ring:[number,number][]}[], z:number, x:numb
   }
   if (ringsPx.length===0) return new Uint8Array(size*size);
   return rasterizeRingsToMask(ringsPx, size);
+}
+
+function calculateGSDStats(gsdMin: Float32Array, polyMask: Uint8Array): GSDStats {
+  // Collect valid GSD values for pixels inside polygons
+  const validGsds: number[] = [];
+  for (let i = 0; i < gsdMin.length; i++) {
+    if (polyMask[i] > 0) {
+      const gsd = gsdMin[i];
+      if (isFinite(gsd) && gsd > 0) {
+        validGsds.push(gsd);
+      }
+    }
+  }
+
+  if (validGsds.length === 0) {
+    return {
+      min: 0,
+      max: 0,
+      mean: 0,
+      count: 0,
+      histogram: []
+    };
+  }
+
+  // Sort for min/max calculation
+  validGsds.sort((a, b) => a - b);
+  const min = validGsds[0];
+  const max = validGsds[validGsds.length - 1];
+  const mean = validGsds.reduce((sum, gsd) => sum + gsd, 0) / validGsds.length;
+
+  // Create histogram with 20 bins
+  const numBins = 20;
+  const binSize = (max - min) / numBins;
+  const histogram: { bin: number; count: number }[] = [];
+  
+  for (let i = 0; i < numBins; i++) {
+    const binStart = min + i * binSize;
+    const binEnd = binStart + binSize;
+    const count = validGsds.filter(gsd => 
+      (i === numBins - 1) ? (gsd >= binStart && gsd <= binEnd) : (gsd >= binStart && gsd < binEnd)
+    ).length;
+    
+    histogram.push({
+      bin: binStart + binSize / 2, // Use bin center
+      count
+    });
+  }
+
+  return {
+    min,
+    max, 
+    mean,
+    count: validGsds.length,
+    histogram
+  };
 }
 
 self.onmessage = (ev: MessageEvent<Msg>) => {
@@ -223,6 +278,9 @@ self.onmessage = (ev: MessageEvent<Msg>) => {
     if (g > 0 && isFinite(g) && g < minGsd) minGsd = g;
   }
 
-  const ret: Ret = { z, x, y, size, overlap, gsdMin, maxOverlap, minGsd };
+  // Calculate GSD statistics for this tile
+  const gsdStats = calculateGSDStats(gsdMin, polyMask);
+
+  const ret: Ret = { z, x, y, size, overlap, gsdMin, maxOverlap, minGsd, gsdStats };
   (self as any).postMessage(ret, [overlap.buffer, gsdMin.buffer]);
 };
