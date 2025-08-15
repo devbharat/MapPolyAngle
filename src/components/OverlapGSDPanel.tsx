@@ -36,7 +36,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, onLineSpacingChange, onPh
   const [showGsd, setShowGsd] = useState(true);
   const [running, setRunning] = useState(false);
   const [autoGenerate, setAutoGenerate] = useState(true);
-  const [showCameraPoints, setShowCameraPoints] = useState(true);
+  const [showCameraPoints, setShowCameraPoints] = useState(false); // Changed default to false
   const runIdRef = useRef<string>("");
   const autoTriesRef = useRef(0);
 
