@@ -31,6 +31,13 @@ export function useMapInitialization({
   const mapRef = useRef<MapboxMap>();
   const drawRef = useRef<MapboxDraw>();
   const deckOverlayRef = useRef<MapboxOverlay>();
+  // Keep latest callbacks without retriggering map init
+  const onLoadRef = useRef(onLoad);
+  const onErrorRef = useRef(onError);
+
+  // Update refs when props change
+  useEffect(() => { onLoadRef.current = onLoad; }, [onLoad]);
+  useEffect(() => { onErrorRef.current = onError; }, [onError]);
 
   useEffect(() => {
     if (!mapContainer.current) {
@@ -40,14 +47,14 @@ export function useMapInitialization({
 
     if (!mapboxToken) {
       console.error('Mapbox token is missing');
-      onError('Mapbox token is missing');
+      onErrorRef.current('Mapbox token is missing');
       return;
     }
 
     const timeoutId = setTimeout(() => {
       if (!mapContainer.current) {
         console.error('Map container became unavailable');
-        onError('Map container is not available');
+        onErrorRef.current('Map container is not available');
         return;
       }
 
@@ -97,17 +104,18 @@ export function useMapInitialization({
           map.addControl(deckOverlay);
 
           if (drawRef.current && deckOverlayRef.current) {
-            onLoad(map, drawRef.current, deckOverlayRef.current);
+            // Use latest callback without reinitializing the map
+            onLoadRef.current(map, drawRef.current, deckOverlayRef.current);
           }
         });
 
         map.on('error', (e) => {
           console.error('Map error:', e);
-          onError(`Map loading error: ${e.error?.message || 'Unknown error'}`);
+          onErrorRef.current(`Map loading error: ${e.error?.message || 'Unknown error'}`);
         });
       } catch (error) {
         console.error('Failed to initialize map:', error);
-        onError(`Failed to initialize map: ${error instanceof Error ? error.message : 'Unknown error'}`);
+        onErrorRef.current(`Failed to initialize map: ${error instanceof Error ? error.message : 'Unknown error'}`);
       }
     }, 100);
 
@@ -116,9 +124,8 @@ export function useMapInitialization({
       if (mapRef.current) {
         try {
           // Check if map is still valid before removing
-          if (mapRef.current.getContainer() && mapRef.current.isStyleLoaded()) {
-            mapRef.current.remove();
-          }
+          // remove() is safe even if style isn't fully loaded
+          if (mapRef.current.getContainer()) mapRef.current.remove();
         } catch (error) {
           console.warn('Error during map cleanup:', error);
         } finally {
@@ -126,7 +133,8 @@ export function useMapInitialization({
         }
       }
     };
-  }, [mapboxToken, center, zoom, mapContainer, onLoad, onError]);
+    // ⚠️ Crucial: do not depend on onLoad/onError here
+  }, [mapboxToken, center, zoom, mapContainer]);
 
   return { map: mapRef.current, draw: drawRef.current };
 }

@@ -14,6 +14,31 @@ import {
   TerrainTile,
 } from '@/utils/terrainAspectHybrid';
 
+/**
+ * Calculate flight line spacing based on camera parameters and desired side overlap
+ * @param camera Camera model with focal length and pixel size
+ * @param altitudeAGL Flight altitude above ground level (meters)
+ * @param sideOverlapPercent Desired side overlap percentage (0-100)
+ * @returns Flight line spacing in meters
+ */
+export function calculateFlightLineSpacing(
+  camera: { f_m: number; sx_m: number; w_px: number },
+  altitudeAGL: number,
+  sideOverlapPercent: number
+): number {
+  // Calculate ground sample distance (GSD)
+  const gsd = (altitudeAGL * camera.sx_m) / camera.f_m;
+  
+  // Calculate sensor width on ground
+  const sensorWidthGround = gsd * camera.w_px;
+  
+  // Calculate spacing based on desired side overlap
+  const overlapFraction = sideOverlapPercent / 100;
+  const spacing = sensorWidthGround * (1 - overlapFraction);
+  
+  return spacing;
+}
+
 export function haversineDistance(coords1: [number, number], coords2: [number, number]): number {
   const R = 6371e3; // metres
   const φ1 = (coords1[1] * Math.PI) / 180;

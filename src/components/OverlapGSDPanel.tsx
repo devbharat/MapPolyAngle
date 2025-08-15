@@ -203,6 +203,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, onLineSpacingChange, onPh
 
   // Auto-run function that can be called externally
   const autoRun = useCallback(async () => {
+    console.log('autoRun called, autoGenerate:', autoGenerate, 'running:', running);
     if (!autoGenerate || running) return;
     
     // Wait for flight lines to be fully updated and map to be ready
@@ -213,18 +214,28 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, onLineSpacingChange, onPh
         return;
       }
       
-      const polygons = getPolygons();
-      if (polygons.length === 0) {
+      // Get polygons directly here instead of using the callback
+      const api = mapRef.current;
+      if (!api?.getPolygons) {
+        console.warn('No getPolygons API available for auto GSD analysis, skipping');
+        return;
+      }
+      
+      const rings: [number,number][][] = api.getPolygons();
+      if (rings.length === 0) {
         console.warn('No polygons available for auto GSD analysis, skipping');
         return;
       }
       
+      console.log('Starting auto GSD computation...');
+      // Call compute function directly
       compute();
     }, 750); // Increased delay for better reliability
-  }, [autoGenerate, running, compute, getPolygons, mapRef]);
+  }, [autoGenerate, running, compute, mapRef]); // Remove getPolygons dependency
 
-  // Provide autoRun function to parent component
+  // Provide autoRun function to parent component - register immediately and on changes
   React.useEffect(() => {
+    console.log('Registering autoRun function with parent');
     onAutoRun?.(autoRun);
   }, [autoRun, onAutoRun]);
 

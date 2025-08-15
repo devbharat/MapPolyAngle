@@ -63,13 +63,16 @@ export default function Home() {
 
   // Handler for when flight lines are updated - automatically trigger GSD analysis
   const handleFlightLinesUpdated = useCallback(() => {
+    console.log('Flight lines updated, checking for auto-run function:', !!autoRunGSDRef.current);
     if (autoRunGSDRef.current) {
+      console.log('Triggering auto GSD analysis...');
       autoRunGSDRef.current();
     }
   }, []); // No dependencies needed since we use ref
 
   // Handler to receive the auto-run function from OverlapGSDPanel
   const handleAutoRunReceived = useCallback((autoRunFn: () => void) => {
+    console.log('Received auto-run function from OverlapGSDPanel');
     autoRunGSDRef.current = autoRunFn;
   }, []);
 
