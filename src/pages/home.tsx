@@ -63,17 +63,16 @@ export default function Home() {
 
   // Handler for when flight lines are updated - automatically trigger GSD analysis
   const handleFlightLinesUpdated = useCallback(() => {
-    console.log('Flight lines updated, checking for auto-run function:', !!autoRunGSDRef.current);
     if (autoRunGSDRef.current) {
-      console.log('Triggering auto GSD analysis...');
       autoRunGSDRef.current();
     }
   }, []); // No dependencies needed since we use ref
 
   // Handler to receive the auto-run function from OverlapGSDPanel
   const handleAutoRunReceived = useCallback((autoRunFn: () => void) => {
-    console.log('Received auto-run function from OverlapGSDPanel');
     autoRunGSDRef.current = autoRunFn;
+    // Try once on registration in case the map already has lines
+    autoRunFn();
   }, []);
 
   const clearAllDrawings = useCallback(() => {
@@ -437,18 +436,26 @@ export default function Home() {
 
               <Card className="backdrop-blur-md bg-white/95 mt-4">
                 <CardContent className="p-3">
-                  <OverlapGSDPanel 
-                    mapRef={mapRef} 
-                    mapboxToken={mapboxToken} 
-                    onLineSpacingChange={handleLineSpacingChange}
-                    onPhotoSpacingChange={setPhotoSpacing}
-                    onAltitudeChange={setAltitudeAGL}
-                    onAutoRun={handleAutoRunReceived}
-                  />
                 </CardContent>
               </Card>
             </>
           )}
+
+          {/* Always mount the GSD Panel to ensure auto-run callback is registered */}
+          <Card className="backdrop-blur-md bg-white/95 mt-4">
+            <CardContent className="p-3">
+              <div className={hasResults ? '' : 'opacity-50 pointer-events-none'}>
+                <OverlapGSDPanel 
+                  mapRef={mapRef} 
+                  mapboxToken={mapboxToken} 
+                  onLineSpacingChange={handleLineSpacingChange}
+                  onPhotoSpacingChange={setPhotoSpacing}
+                  onAltitudeChange={setAltitudeAGL}
+                  onAutoRun={handleAutoRunReceived}
+                />
+              </div>
+            </CardContent>
+          </Card>
         </div>
         )}
 

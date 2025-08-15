@@ -38,6 +38,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, onLineSpacingChange, onPh
   const [autoGenerate, setAutoGenerate] = useState(true);
   const [showCameraPoints, setShowCameraPoints] = useState(true);
   const runIdRef = useRef<string>("");
+  const autoTriesRef = useRef(0);
 
   const parseCamera = useCallback((): CameraModel | null => {
     try { return JSON.parse(cameraText); } catch { return null; }
@@ -203,39 +204,35 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, onLineSpacingChange, onPh
 
   // Auto-run function that can be called externally
   const autoRun = useCallback(async () => {
-    console.log('autoRun called, autoGenerate:', autoGenerate, 'running:', running);
     if (!autoGenerate || running) return;
     
-    // Wait for flight lines to be fully updated and map to be ready
-    setTimeout(() => {
-      const map = mapRef.current?.getMap?.();
-      if (!map || !map.isStyleLoaded()) {
-        console.warn('Map not ready for auto GSD analysis, skipping');
-        return;
-      }
-      
-      // Get polygons directly here instead of using the callback
-      const api = mapRef.current;
-      if (!api?.getPolygons) {
-        console.warn('No getPolygons API available for auto GSD analysis, skipping');
-        return;
-      }
-      
-      const rings: [number,number][][] = api.getPolygons();
-      if (rings.length === 0) {
-        console.warn('No polygons available for auto GSD analysis, skipping');
-        return;
-      }
-      
-      console.log('Starting auto GSD computation...');
-      // Call compute function directly
-      compute();
-    }, 750); // Increased delay for better reliability
-  }, [autoGenerate, running, compute, mapRef]); // Remove getPolygons dependency
+    const api = mapRef.current;
+    const map = api?.getMap?.();
+    const ready = !!map?.isStyleLoaded?.();
+    const rings: [number, number][][] = api?.getPolygons?.() ?? [];
+    const fl = api?.getFlightLines?.();
+    const tiles = api?.getPolygonTiles?.();
+    const haveLines = !!fl && Array.from(fl.values()).some((v: any) => v.flightLines.length > 0);
+    const haveTiles = !!tiles && Array.from(tiles.values()).some((t: any) => (t?.length ?? 0) > 0);
+
+    if (ready && rings.length > 0 && haveLines && haveTiles) {
+      autoTriesRef.current = 0;
+      compute(); // all prerequisites present
+      return;
+    }
+    
+    // Not ready yet — retry a few times while state settles
+    if (autoTriesRef.current < 10) {
+      autoTriesRef.current += 1;
+      setTimeout(() => autoRun(), 200);
+    } else {
+      console.warn('Auto GSD: prerequisites not met after retries.');
+      autoTriesRef.current = 0;
+    }
+  }, [autoGenerate, running, compute, mapRef]);
 
   // Provide autoRun function to parent component - register immediately and on changes
   React.useEffect(() => {
-    console.log('Registering autoRun function with parent');
     onAutoRun?.(autoRun);
   }, [autoRun, onAutoRun]);
 
