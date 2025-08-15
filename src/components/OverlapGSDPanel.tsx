@@ -16,6 +16,7 @@ type Props = {
   onPhotoSpacingChange?: (photoSpacing: number) => void;
   onAltitudeChange?: (altitudeAGL: number) => void;
   onAutoRun?: (autoRunFn: () => void) => void; // NEW: Callback to provide auto-run function
+  onClearExposed?: (clearFn: () => void) => void; // NEW: Callback to provide clear function
 };
 
 // Sony RX1R II camera specifications
@@ -27,7 +28,7 @@ const sonyRX1R2Camera: CameraModel = {
   h_px: 5304,
 };
 
-export function OverlapGSDPanel({ mapRef, mapboxToken, onLineSpacingChange, onPhotoSpacingChange, onAltitudeChange, onAutoRun }: Props) {
+export function OverlapGSDPanel({ mapRef, mapboxToken, onLineSpacingChange, onPhotoSpacingChange, onAltitudeChange, onAutoRun, onClearExposed }: Props) {
   const [cameraText, setCameraText] = useState(JSON.stringify(sonyRX1R2Camera, null, 2));
   const [altitude, setAltitude] = useState(100); // AGL in meters
   const [frontOverlap, setFrontOverlap] = useState(80); // percentage
@@ -335,6 +336,11 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, onLineSpacingChange, onPh
       setGsdStats(null);
     }
   }, [mapRef]);
+
+  // Provide clear function to parent component
+  React.useEffect(() => {
+    onClearExposed?.(clear);
+  }, [clear, onClearExposed]);
 
   return (
     <div className="backdrop-blur-md bg-white/95 rounded-md border p-3 space-y-3">

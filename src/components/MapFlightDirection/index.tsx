@@ -34,6 +34,7 @@ interface Props {
   onAnalysisStart?: (polygonId: string) => void;
   onError?: (error: string, polygonId?: string) => void;
   onFlightLinesUpdated?: () => void; // NEW: Called when flight lines are regenerated
+  onClearGSD?: () => void; // NEW: Called to clear GSD overlays when polygons are deleted
 }
 
 export const MapFlightDirection = React.forwardRef<
@@ -65,6 +66,7 @@ export const MapFlightDirection = React.forwardRef<
       onAnalysisStart,
       onError,
       onFlightLinesUpdated,
+      onClearGSD,
     },
     ref
   ) => {
@@ -197,9 +199,12 @@ export const MapFlightDirection = React.forwardRef<
             newTiles.delete(polygonId);
             return newTiles;
           });
+          
+          // Clear GSD overlays and camera positions
+          onClearGSD?.();
         }
       });
-    }, [cancelAnalysis, onAnalysisComplete]);
+    }, [cancelAnalysis, onAnalysisComplete, onClearGSD]);
 
     const onMapLoad = useCallback(
       (map: MapboxMap, draw: MapboxDraw, overlay: MapboxOverlay) => {
