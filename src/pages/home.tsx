@@ -193,7 +193,7 @@ export default function Home() {
               </ol>
               <div className="mt-2 pt-2 border-t">
                 <p className="text-xs text-gray-500">
-                  <strong>Features:</strong> Multi-polygon support • Dynamic terrain resolution (15→12 zoom) • Adaptive line spacing • 3D flight paths (100m AGL) • 3D plane fitting
+                  <strong>Features:</strong> Multi-polygon support • 3D flight paths (100m AGL) • 3D plane fitting • Automatic GSD analysis
                 </p>
               </div>
             </CardContent>
@@ -362,91 +362,6 @@ export default function Home() {
               )}
             </CardContent>
           </Card>
-
-          {/* Quality Legend (only show when there are results) */}
-          {hasResults && (
-            <>
-              <Card className="backdrop-blur-md bg-white/95 mt-4">
-                <CardContent className="p-3">
-                  <h4 className="font-medium text-gray-900 mb-2 text-sm">Quality Guide</h4>
-                  <div className="space-y-1 text-xs">
-                    <div className="flex items-center space-x-2">
-                      <span className="text-green-600">● Excellent:</span>
-                      <span className="text-gray-600">R² &gt; 0.95, highly reliable</span>
-                    </div>
-                    <div className="flex items-center space-x-2">
-                      <span className="text-blue-600">● Good:</span>
-                      <span className="text-gray-600">R² &gt; 0.85, reliable</span>
-                    </div>
-                    <div className="flex items-center space-x-2">
-                      <span className="text-orange-600">● Fair:</span>
-                      <span className="text-gray-600">R² &gt; 0.7, use with caution</span>
-                    </div>
-                    <div className="flex items-center space-x-2">
-                      <span className="text-red-600">● Poor:</span>
-                      <span className="text-gray-600">Low confidence, check terrain</span>
-                    </div>
-                  </div>
-                </CardContent>
-              </Card>
-              
-              <Card className="backdrop-blur-md bg-white/95 mt-4">
-                <CardContent className="p-3">
-                  <h4 className="font-medium text-gray-900 mb-2 text-sm">Dynamic Terrain Resolution</h4>
-                  <div className="space-y-1 text-xs">
-                    <div className="flex items-center space-x-2">
-                      <span className="text-green-600">⚡ z15:</span>
-                      <span className="text-gray-600">Small areas (&lt;0.1km²), highest detail</span>
-                    </div>
-                    <div className="flex items-center space-x-2">
-                      <span className="text-blue-600">● z14:</span>
-                      <span className="text-gray-600">Medium areas (0.1-1km²), high detail</span>
-                    </div>
-                    <div className="flex items-center space-x-2">
-                      <span className="text-orange-600">● z13:</span>
-                      <span className="text-gray-600">Large areas (1-10km²), balanced</span>
-                    </div>
-                    <div className="flex items-center space-x-2">
-                      <span className="text-orange-600">🏃 z12:</span>
-                      <span className="text-gray-600">Very large areas (&gt;10km²), fast</span>
-                    </div>
-                  </div>
-                </CardContent>
-              </Card>
-              
-              <Card className="backdrop-blur-md bg-white/95 mt-4">
-                <CardContent className="p-3">
-                  <h4 className="font-medium text-gray-900 mb-2 text-sm">Adaptive Line Spacing</h4>
-                  <div className="space-y-1 text-xs">
-                    <div className="flex items-center space-x-2">
-                      <span className="text-green-600">⚡ 25m:</span>
-                      <span className="text-gray-600">Narrow areas (&lt;200m width), dense coverage</span>
-                    </div>
-                    <div className="flex items-center space-x-2">
-                      <span className="text-blue-600">● 50m:</span>
-                      <span className="text-gray-600">Small areas (200-500m width)</span>
-                    </div>
-                    <div className="flex items-center space-x-2">
-                      <span className="text-orange-600">● 100m:</span>
-                      <span className="text-gray-600">Medium areas (0.5-1km width)</span>
-                    </div>
-                    <div className="flex items-center space-x-2">
-                      <span className="text-red-600">● 150-200m:</span>
-                      <span className="text-gray-600">Large areas (&gt;1km width), efficient</span>
-                    </div>
-                    <div className="text-gray-500 text-xs mt-2 italic">
-                      * Spacing adapts to polygon width perpendicular to flight direction
-                    </div>
-                  </div>
-                </CardContent>
-              </Card>
-
-              <Card className="backdrop-blur-md bg-white/95 mt-4">
-                <CardContent className="p-3">
-                </CardContent>
-              </Card>
-            </>
-          )}
 
           {/* Always mount the GSD Panel to ensure auto-run callback is registered */}
           <Card className="backdrop-blur-md bg-white/95 mt-4">
