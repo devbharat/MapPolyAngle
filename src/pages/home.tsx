@@ -71,8 +71,7 @@ export default function Home() {
   // Handler to receive the auto-run function from OverlapGSDPanel
   const handleAutoRunReceived = useCallback((autoRunFn: () => void) => {
     autoRunGSDRef.current = autoRunFn;
-    // Try once on registration in case the map already has lines
-    autoRunFn();
+    // Don't call immediately - only call when flight lines are actually updated
   }, []);
 
   const clearAllDrawings = useCallback(() => {

@@ -154,6 +154,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, onLineSpacingChange, onPh
     const runId = `${Date.now()}`; runIdRef.current = runId;
 
     setRunning(true);
+    autoTriesRef.current = 0; // Reset retry counter when starting computation
 
     const worker = new OverlapWorker();
     try {
@@ -221,12 +222,17 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, onLineSpacingChange, onPh
       return;
     }
     
-    // Not ready yet — retry a few times while state settles
-    if (autoTriesRef.current < 10) {
+    // Not ready yet — retry a few times while state settles, but only if not already retrying
+    if (autoTriesRef.current < 5) { // Reduced retry count
       autoTriesRef.current += 1;
-      setTimeout(() => autoRun(), 200);
+      setTimeout(() => {
+        // Check again if we should still retry (component might have unmounted or conditions changed)
+        if (autoGenerate && !running && autoTriesRef.current > 0) {
+          autoRun();
+        }
+      }, 300); // Slightly longer delay
     } else {
-      console.warn('Auto GSD: prerequisites not met after retries.');
+      // Reset retry counter after giving up
       autoTriesRef.current = 0;
     }
   }, [autoGenerate, running, compute, mapRef]);
