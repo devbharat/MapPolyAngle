@@ -16,7 +16,7 @@ import '@mapbox/mapbox-gl-draw/dist/mapbox-gl-draw.css';
 
 import { useMapInitialization } from './hooks/useMapInitialization';
 import { usePolygonAnalysis } from './hooks/usePolygonAnalysis';
-import { addFlightLinesForPolygon, removeFlightLinesForPolygon } from './utils/mapbox-layers';
+import { addFlightLinesForPolygon, removeFlightLinesForPolygon, addTriggerPointsForPolygon, removeTriggerPointsForPolygon } from './utils/mapbox-layers';
 import { update3DPathLayer, remove3DPathLayer, update3DCameraPointsLayer, remove3DCameraPointsLayer } from './utils/deckgl-layers';
 import { build3DFlightPath } from './utils/geometry';
 import { PolygonAnalysisResult } from './types';
@@ -28,6 +28,8 @@ interface Props {
   terrainZoom?: number;
   sampleStep?: number;
   lineSpacing?: number; // Flight line spacing in meters (default: 100)
+  photoSpacing?: number; // Trigger distance in meters
+  baseAltitudeAGL?: number; // AGL used to lift path above terrain
   onAnalysisComplete?: (results: PolygonAnalysisResult[]) => void;
   onAnalysisStart?: (polygonId: string) => void;
   onError?: (error: string, polygonId?: string) => void;
@@ -56,6 +58,8 @@ export const MapFlightDirection = React.forwardRef<
       terrainZoom = 12,
       sampleStep = 2,
       lineSpacing = 100,
+      photoSpacing = 60,
+      baseAltitudeAGL = 100,
       onAnalysisComplete,
       onAnalysisStart,
       onError,
@@ -111,7 +115,12 @@ export const MapFlightDirection = React.forwardRef<
 
           if (result.result.maxElevation !== undefined && flightLinesResult.flightLines.length > 0 && deckOverlayRef.current) {
             console.log('Building 3D flight path...');
-            const path3d = build3DFlightPath(flightLinesResult.flightLines, tiles, flightLinesResult.lineSpacing, 100);
+            const path3d = build3DFlightPath(
+              flightLinesResult.flightLines,
+              tiles,
+              flightLinesResult.lineSpacing,
+              baseAltitudeAGL
+            );
             console.log('3D path built, updating layer...');
             update3DPathLayer(deckOverlayRef.current, result.polygonId, path3d, setDeckLayers);
             console.log('3D layer updated');
@@ -162,6 +171,7 @@ export const MapFlightDirection = React.forwardRef<
           cancelAnalysis(polygonId);
           if (mapRef.current) {
             removeFlightLinesForPolygon(mapRef.current, polygonId);
+            removeTriggerPointsForPolygon(mapRef.current, polygonId);
           }
           if (deckOverlayRef.current) {
             remove3DPathLayer(deckOverlayRef.current, polygonId, setDeckLayers);
@@ -216,6 +226,12 @@ export const MapFlightDirection = React.forwardRef<
           setDeckLayers([]);
           deckOverlayRef.current.setProps({ layers: [] });
         }
+        // Remove any existing trigger points
+        if (mapRef.current) {
+          polygonResults.forEach((_, polygonId) => {
+            removeTriggerPointsForPolygon(mapRef.current!, polygonId);
+          });
+        }
         cancelAllAnalyses();
       },
       clearPolygon: (polygonId: string) => {
@@ -256,6 +272,46 @@ export const MapFlightDirection = React.forwardRef<
         }
       },
     }), [polygonResults, polygonFlightLines, polygonTiles, cancelAllAnalyses]);
+
+    // 🔁 Re‑apply flight lines, trigger ticks and 3D path whenever spacing/altitude changes
+    React.useEffect(() => {
+      const map = mapRef.current;
+      const overlay = deckOverlayRef.current;
+      if (!map || !overlay) return;
+      if (polygonResults.size === 0) return;
+
+      const newFlightLines = new Map<string, { flightLines: number[][][]; lineSpacing: number }>();
+
+      polygonResults.forEach((res, polygonId) => {
+        // Rebuild lines with new spacing
+        removeFlightLinesForPolygon(map, polygonId);
+        const fl = addFlightLinesForPolygon(
+          map,
+          polygonId,
+          res.polygon.coordinates,
+          res.result.contourDirDeg,
+          lineSpacing,
+          res.result.fitQuality
+        );
+        newFlightLines.set(polygonId, fl);
+
+        // Rebuild 3D path with current altitude
+        const tiles = polygonTiles.get(polygonId) || [];
+        if (tiles.length > 0 && fl.flightLines.length > 0) {
+          const path3d = build3DFlightPath(fl.flightLines, tiles, fl.lineSpacing, baseAltitudeAGL);
+          update3DPathLayer(overlay, polygonId, path3d, setDeckLayers);
+        }
+
+        // Update trigger tick marks on 2D lines
+        removeTriggerPointsForPolygon(map, polygonId);
+        // Commented out: trigger points removed per user request
+        // if (fl.flightLines.length > 0 && photoSpacing > 0) {
+        //   addTriggerPointsForPolygon(map, polygonId, fl.flightLines, photoSpacing);
+        // }
+      });
+
+      setPolygonFlightLines(newFlightLines);
+    }, [lineSpacing, photoSpacing, baseAltitudeAGL, polygonResults, polygonTiles]);
 
     return <div ref={mapContainer} style={{ position: 'relative', width: '100%', height: '100%' }} />;
   }

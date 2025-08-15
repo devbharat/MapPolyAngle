@@ -55,32 +55,34 @@ self.onmessage = (ev: MessageEvent<Msg>) => {
   let zMin = +Infinity, zMax = -Infinity;
   for (let i=0;i<elev.length;i++){ const z = elev[i]; if (z<zMin) zMin=z; if (z>zMax) zMax=z; }
 
-  // Pre-cull poses by a coarse ground circle intersection
-  const candidatePoses = P.filter(p => {
-    // For nadir cameras, use simple distance-based culling
-    const tileCenterX = (tx.minX + tx.maxX) / 2;
-    const tileCenterY = (tx.minY + tx.maxY) / 2;
-    const dx = p.x - tileCenterX;
-    const dy = p.y - tileCenterY;
-    const distance = Math.sqrt(dx*dx + dy*dy);
-    
-    // Calculate conservative FOV radius at ground level
-    const hfov = Math.atan((camera.w_px*camera.sx_m*0.5)/camera.f_m);
-    const vfov = Math.atan((camera.h_px*camera.sy_m*0.5)/camera.f_m);
-    const fov = Math.max(hfov, vfov);
-    const H = Math.max(1.0, (p.z - zMin));
-    const radius = H * Math.tan(fov) * 4.0; // very conservative margin for edge coverage
-    
-    // Also include diagonal distance for tile coverage
-    const tileDiagonal = Math.sqrt(
-      (tx.maxX - tx.minX) * (tx.maxX - tx.minX) + 
-      (tx.maxY - tx.minY) * (tx.maxY - tx.minY)
-    );
-    const maxDistance = radius + tileDiagonal;
-    
-    const shouldInclude = distance <= maxDistance;
-    return shouldInclude;
+  // --- Robust pre-culling: AABB (tile rectangle) vs camera footprint circle ---
+  // Use diagonal FOV for a conservative circular footprint on ground.
+  const sensorW = camera.w_px * camera.sx_m;
+  const sensorH = camera.h_px * camera.sy_m;
+  const diagFov = Math.atan(0.5 * Math.hypot(sensorW, sensorH) / camera.f_m); // half-diagonal FoV
+
+  const rect = { minX: tx.minX, minY: tx.minY, maxX: tx.maxX, maxY: tx.maxY };
+  const distPointToAABB = (px: number, py: number) => {
+    const dx = Math.max(rect.minX - px, 0, px - rect.maxX);
+    const dy = Math.max(rect.minY - py, 0, py - rect.maxY);
+    return Math.hypot(dx, dy);
+  };
+
+  let candidatePoses = P.filter(p => {
+    // Altitude above tile's lowest ground (conservative; includes more poses)
+    const H = Math.max(1.0, p.z - zMin);
+    // Ground radius from FoV; add 25% safety.
+    const radius = H * Math.tan(diagFov) * 1.25;
+    const d = distPointToAABB(p.x, p.y);
+    return d <= radius;
   });
+
+  // Fail-safe: if polygon has pixels in this tile but no candidate cameras were kept,
+  // do not cull at all for this tile (avoid false negatives).
+  const polyPixels = polyMask.reduce((sum, v) => sum + (v ? 1 : 0), 0);
+  if (polyPixels > 0 && candidatePoses.length === 0) {
+    candidatePoses = P;
+  }
 
   console.log(`=== TILE PROCESSING START ===`);
   console.log(`Tile bounds: (${tx.minX.toFixed(1)}, ${tx.minY.toFixed(1)}) to (${tx.maxX.toFixed(1)}, ${tx.maxY.toFixed(1)}): ${size}x${size} pixels`);
@@ -88,7 +90,7 @@ self.onmessage = (ev: MessageEvent<Msg>) => {
   console.log(`Polygon rings: ${polygons.length}`);
   console.log(`After rasterization: ${polyMask.reduce((sum,val) => sum + val, 0)} pixels inside polygon`);
   console.log(`Input poses: ${P.length} total`);
-  console.log(`After spatial culling: ${candidatePoses.length} poses remaining for this tile`);
+  console.log(`After spatial culling (AABB): ${candidatePoses.length} poses remaining for this tile`);
 
   // Main loop: per pixel within polygon mask; test pose coverage by projection
   for (let idx=0; idx<elev.length; idx++) {

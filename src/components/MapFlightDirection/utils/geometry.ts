@@ -256,6 +256,18 @@ export function sampleCameraPositionsOnFlightPath(
         lastPhotoDistance = targetDistance;
       }
     }
+
+    // ✅ Ensure we always place a final camera at the segment end
+    if (segment.length >= 2) {
+      const N = segment.length;
+      const endBearing = geoBearing([segment[N - 2][0], segment[N - 2][1]], [segment[N - 1][0], segment[N - 1][1]]);
+      const end = segment[N - 1];
+      const prevCam = cameraPositions[cameraPositions.length - 1];
+      const tailGap = haversineDistance([prevCam[0], prevCam[1]], [end[0], end[1]]);
+      if (tailGap > 0.25 * photoSpacingMeters) {
+        cameraPositions.push([end[0], end[1], end[2], endBearing]);
+      }
+    }
   }
   
   return cameraPositions;

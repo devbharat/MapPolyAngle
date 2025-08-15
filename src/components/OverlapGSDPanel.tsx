@@ -11,6 +11,8 @@ type Props = {
   mapRef: React.RefObject<any>;
   mapboxToken: string;
   onLineSpacingChange?: (lineSpacing: number) => void;
+  onPhotoSpacingChange?: (photoSpacing: number) => void;
+  onAltitudeChange?: (altitudeAGL: number) => void;
 };
 
 // Sony RX1R II camera specifications
@@ -22,7 +24,7 @@ const sonyRX1R2Camera: CameraModel = {
   h_px: 5304,
 };
 
-export function OverlapGSDPanel({ mapRef, mapboxToken, onLineSpacingChange }: Props) {
+export function OverlapGSDPanel({ mapRef, mapboxToken, onLineSpacingChange, onPhotoSpacingChange, onAltitudeChange }: Props) {
   const [cameraText, setCameraText] = useState(JSON.stringify(sonyRX1R2Camera, null, 2));
   const [altitude, setAltitude] = useState(100); // AGL in meters
   const [frontOverlap, setFrontOverlap] = useState(80); // percentage
@@ -62,6 +64,15 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, onLineSpacingChange }: Pr
   React.useEffect(() => {
     onLineSpacingChange?.(lineSpacing);
   }, [lineSpacing, onLineSpacingChange]);
+
+  // Propagate photo spacing and altitude up so the map can render trigger ticks & 3D height
+  React.useEffect(() => {
+    onPhotoSpacingChange?.(photoSpacing);
+  }, [photoSpacing, onPhotoSpacingChange]);
+
+  React.useEffect(() => {
+    onAltitudeChange?.(altitude);
+  }, [altitude, onAltitudeChange]);
 
   // Generate poses from existing flight lines using 3D paths
   const generatePosesFromFlightLines = useCallback((): PoseMeters[] => {

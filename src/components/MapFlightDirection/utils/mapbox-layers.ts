@@ -143,11 +143,110 @@ export function addFlightLinesForPolygon(
 export function removeFlightLinesForPolygon(map: MapboxMap, polygonId: string) {
   const layerId = `flight-lines-layer-${polygonId}`;
   const sourceId = `flight-lines-source-${polygonId}`;
-
+  
   if (map.getLayer(layerId)) {
     map.removeLayer(layerId);
   }
   if (map.getSource(sourceId)) {
     map.removeSource(sourceId);
   }
+}
+
+// -------------------------------------------------------------------
+// Trigger tick marks (camera trigger positions) along flight lines
+// -------------------------------------------------------------------
+
+function sampleTriggerPoints(line: [number, number][], spacingM: number): [number, number][] {
+  if (line.length < 2 || spacingM <= 0) return [];
+  const [A, B] = line as [[number, number], [number, number]];
+  const total = haversineDistance(A, B);
+  if (total === 0) return [A];
+  
+  // Calculate bearing from A to B
+  const dLng = B[0] - A[0];
+  const dLat = B[1] - A[1];
+  const bearing = Math.atan2(dLng * Math.cos(A[1] * Math.PI / 180), dLat) * 180 / Math.PI;
+
+  const pts: [number, number][] = [];
+  // Place a trigger at the line start
+  pts.push(A);
+  let d = spacingM;
+  while (d < total) {
+    pts.push(geoDestination(A, bearing, d) as [number, number]);
+    d += spacingM;
+  }
+  // Always place one at the end to avoid uncovered tail
+  pts.push(B);
+  return pts;
+}
+
+export function addTriggerPointsForPolygon(
+  map: MapboxMap,
+  polygonId: string,
+  flightLines: number[][][],
+  spacingM: number
+) {
+  const points: any[] = [];
+  for (const ln of flightLines) {
+    const pts = sampleTriggerPoints(ln as [number, number][], spacingM);
+    for (const p of pts) {
+      points.push({
+        type: 'Feature',
+        geometry: { type: 'Point', coordinates: p },
+        properties: { spacing: spacingM }
+      });
+    }
+  }
+
+  const sourceId = `flight-triggers-source-${polygonId}`;
+  const circleLayerId = `flight-triggers-layer-${polygonId}`;
+  const labelLayerId = `flight-triggers-label-${polygonId}`;
+
+  if (map.getLayer(circleLayerId)) map.removeLayer(circleLayerId);
+  if (map.getLayer(labelLayerId)) map.removeLayer(labelLayerId);
+  if (map.getSource(sourceId)) map.removeSource(sourceId);
+
+  map.addSource(sourceId, {
+    type: 'geojson',
+    data: { type: 'FeatureCollection', features: points },
+  } as any);
+
+  map.addLayer({
+    id: circleLayerId,
+    type: 'circle',
+    source: sourceId,
+    paint: {
+      'circle-radius': 3,
+      'circle-color': '#111827',
+      'circle-stroke-width': 1,
+      'circle-stroke-color': '#ffffff'
+    }
+  });
+
+  map.addLayer({
+    id: labelLayerId,
+    type: 'symbol',
+    source: sourceId,
+    layout: {
+      'text-field': ['concat', ['to-string', ['round', ['get', 'spacing']]], ' m'],
+      'text-size': 10,
+      'text-offset': [0, 1.2],
+      'text-anchor': 'top',
+      'symbol-avoid-edges': true
+    },
+    paint: {
+      'text-color': '#374151',
+      'text-halo-color': '#ffffff',
+      'text-halo-width': 0.75
+    }
+  });
+}
+
+export function removeTriggerPointsForPolygon(map: MapboxMap, polygonId: string) {
+  const sourceId = `flight-triggers-source-${polygonId}`;
+  const circleLayerId = `flight-triggers-layer-${polygonId}`;
+  const labelLayerId = `flight-triggers-label-${polygonId}`;
+  if (map.getLayer(circleLayerId)) map.removeLayer(circleLayerId);
+  if (map.getLayer(labelLayerId)) map.removeLayer(labelLayerId);
+  if (map.getSource(sourceId)) map.removeSource(sourceId);
 }

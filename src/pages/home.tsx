@@ -19,6 +19,8 @@ export default function Home() {
   
   // Flight planning parameters
   const [lineSpacing, setLineSpacing] = useState(100); // Default 100m spacing
+  const [photoSpacing, setPhotoSpacing] = useState(60); // derived from camera, altitude, front overlap
+  const [altitudeAGL, setAltitudeAGL] = useState(100);
   
   const terrainZoom = 15; // This is now a fallback - actual zoom is calculated dynamically
   const sampleStep = 1;
@@ -421,6 +423,8 @@ export default function Home() {
                     mapRef={mapRef} 
                     mapboxToken={mapboxToken} 
                     onLineSpacingChange={handleLineSpacingChange}
+                    onPhotoSpacingChange={setPhotoSpacing}
+                    onAltitudeChange={setAltitudeAGL}
                   />
                 </CardContent>
               </Card>
@@ -438,6 +442,8 @@ export default function Home() {
           terrainZoom={terrainZoom}
           sampleStep={sampleStep}
           lineSpacing={lineSpacing}
+          photoSpacing={photoSpacing}
+          baseAltitudeAGL={altitudeAGL}
           onAnalysisStart={handleAnalysisStart}
           onAnalysisComplete={handleAnalysisComplete}
           onError={handleError}
