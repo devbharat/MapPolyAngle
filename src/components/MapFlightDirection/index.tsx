@@ -17,7 +17,7 @@ import '@mapbox/mapbox-gl-draw/dist/mapbox-gl-draw.css';
 import { useMapInitialization } from './hooks/useMapInitialization';
 import { usePolygonAnalysis } from './hooks/usePolygonAnalysis';
 import { addFlightLinesForPolygon, removeFlightLinesForPolygon } from './utils/mapbox-layers';
-import { update3DPathLayer, remove3DPathLayer } from './utils/deckgl-layers';
+import { update3DPathLayer, remove3DPathLayer, update3DCameraPointsLayer, remove3DCameraPointsLayer } from './utils/deckgl-layers';
 import { build3DFlightPath } from './utils/geometry';
 import { PolygonAnalysisResult } from './types';
 
@@ -38,6 +38,12 @@ export const MapFlightDirection = React.forwardRef<
     clearPolygon: (polygonId: string) => void;
     startPolygonDrawing: () => void;
     getPolygonResults: () => PolygonAnalysisResult[];
+    getMap: () => MapboxMap | undefined;
+    getPolygons: () => [number,number][][];
+    getFlightLines: () => Map<string, { flightLines: number[][][]; lineSpacing: number }>;
+    getPolygonTiles: () => Map<string, any[]>;
+    addCameraPoints: (polygonId: string, positions: [number, number, number][]) => void;
+    removeCameraPoints: (polygonId: string) => void;
   },
   Props
 >(
@@ -61,6 +67,7 @@ export const MapFlightDirection = React.forwardRef<
 
     const [polygonResults, setPolygonResults] = useState<Map<string, PolygonAnalysisResult>>(new Map());
     const [polygonTiles, setPolygonTiles] = useState<Map<string, any[]>>(new Map());
+    const [polygonFlightLines, setPolygonFlightLines] = useState<Map<string, { flightLines: number[][][]; lineSpacing: number }>>(new Map());
     const [deckLayers, setDeckLayers] = useState<any[]>([]);
 
     const handleAnalysisResult = useCallback(
@@ -83,18 +90,25 @@ export const MapFlightDirection = React.forwardRef<
 
         if (mapRef.current) {
           console.log('Adding flight lines...');
-          const { flightLines, lineSpacing } = addFlightLinesForPolygon(
+          const flightLinesResult = addFlightLinesForPolygon(
             mapRef.current,
             result.polygonId,
             result.polygon.coordinates,
             result.result.contourDirDeg,
             result.result.fitQuality
           );
-          console.log(`Added ${flightLines.length} flight lines with ${lineSpacing}m spacing`);
+          console.log(`Added ${flightLinesResult.flightLines.length} flight lines with ${flightLinesResult.lineSpacing}m spacing`);
 
-          if (result.result.maxElevation !== undefined && flightLines.length > 0 && deckOverlayRef.current) {
+          // Store flight lines for access by other components
+          setPolygonFlightLines((prev) => {
+            const newFlightLines = new Map(prev);
+            newFlightLines.set(result.polygonId, flightLinesResult);
+            return newFlightLines;
+          });
+
+          if (result.result.maxElevation !== undefined && flightLinesResult.flightLines.length > 0 && deckOverlayRef.current) {
             console.log('Building 3D flight path...');
-            const path3d = build3DFlightPath(flightLines, tiles, lineSpacing, 100);
+            const path3d = build3DFlightPath(flightLinesResult.flightLines, tiles, flightLinesResult.lineSpacing, 100);
             console.log('3D path built, updating layer...');
             update3DPathLayer(deckOverlayRef.current, result.polygonId, path3d, setDeckLayers);
             console.log('3D layer updated');
@@ -155,6 +169,11 @@ export const MapFlightDirection = React.forwardRef<
             onAnalysisComplete?.(Array.from(newResults.values()));
             return newResults;
           });
+          setPolygonFlightLines((prev) => {
+            const newFlightLines = new Map(prev);
+            newFlightLines.delete(polygonId);
+            return newFlightLines;
+          });
           setPolygonTiles((prev) => {
             const newTiles = new Map(prev);
             newTiles.delete(polygonId);
@@ -207,7 +226,33 @@ export const MapFlightDirection = React.forwardRef<
         }
       },
       getPolygonResults: () => Array.from(polygonResults.values()),
-    }), [polygonResults, cancelAllAnalyses]);
+      getMap: () => mapRef.current,
+      getPolygons: (): [number,number][][] => {
+        // Return rings for all drawn polygons (single-ring only)
+        const draw = drawRef.current;
+        if (!draw) return [];
+        const coll = draw.getAll();
+        const rings: [number,number][][] = [];
+        for (const f of coll.features) {
+          if (f.geometry?.type === "Polygon" && Array.isArray(f.geometry.coordinates?.[0])) {
+            rings.push(f.geometry.coordinates[0] as [number,number][]);
+          }
+        }
+        return rings;
+      },
+      getFlightLines: () => polygonFlightLines,
+      getPolygonTiles: () => polygonTiles,
+      addCameraPoints: (polygonId: string, positions: [number, number, number][]) => {
+        if (deckOverlayRef.current) {
+          update3DCameraPointsLayer(deckOverlayRef.current, polygonId, positions, setDeckLayers);
+        }
+      },
+      removeCameraPoints: (polygonId: string) => {
+        if (deckOverlayRef.current) {
+          remove3DCameraPointsLayer(deckOverlayRef.current, polygonId, setDeckLayers);
+        }
+      },
+    }), [polygonResults, polygonFlightLines, polygonTiles, cancelAllAnalyses]);
 
     return <div ref={mapContainer} style={{ position: 'relative', width: '100%', height: '100%' }} />;
   }

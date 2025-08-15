@@ -7,6 +7,7 @@ import { Button } from '@/components/ui/button';
 import { LoadingSpinner } from '@/components/ui/loading-spinner';
 import { useIsMobile } from '@/hooks/use-mobile';
 import { Map, Trash2, CheckCircle, AlertCircle, TrendingUp, Target, X } from 'lucide-react';
+import OverlapGSDPanel from "@/components/OverlapGSDPanel";
 
 export default function Home() {
   const isMobile = useIsMobile();
@@ -404,6 +405,12 @@ export default function Home() {
                       * Spacing adapts to polygon width perpendicular to flight direction
                     </div>
                   </div>
+                </CardContent>
+              </Card>
+
+              <Card className="backdrop-blur-md bg-white/95 mt-4">
+                <CardContent className="p-3">
+                  <OverlapGSDPanel mapRef={mapRef} mapboxToken={mapboxToken} />
                 </CardContent>
               </Card>
             </>

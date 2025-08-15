@@ -7,7 +7,7 @@
  ***********************************************************************/
 
 import { MapboxOverlay } from '@deck.gl/mapbox';
-import { PathLayer, SolidPolygonLayer } from '@deck.gl/layers';
+import { PathLayer, SolidPolygonLayer, ScatterplotLayer } from '@deck.gl/layers';
 import { COORDINATE_SYSTEM } from '@deck.gl/core';
 import { destination as geoDestination, calculateBearing as geoBearing } from '@/utils/terrainAspectHybrid';
 
@@ -75,6 +75,57 @@ export function remove3DPathLayer(
   setLayers((currentLayers) => {
     const filteredLayers = currentLayers.filter(
       (l) => !l.id.includes(`drone-path-${polygonId}`) && !l.id.includes(`drone-centerline-${polygonId}`)
+    );
+    overlay.setProps({ layers: filteredLayers });
+    return filteredLayers;
+  });
+}
+
+export function update3DCameraPointsLayer(
+  overlay: MapboxOverlay,
+  polygonId: string,
+  cameraPositions: [number, number, number][],
+  setLayers: React.Dispatch<React.SetStateAction<any[]>>
+) {
+  const cameraLayer = new ScatterplotLayer({
+    id: `camera-points-${polygonId}`,
+    data: cameraPositions.map((pos, index) => ({
+      position: pos,
+      index: index + 1,
+      altitude: pos[2]
+    })),
+    getPosition: (d: any) => d.position,
+    getRadius: 8,
+    getFillColor: [255, 71, 87, 255], // Red color #ff4757
+    getLineColor: [255, 255, 255, 255], // White outline
+    lineWidthMinPixels: 2,
+    radiusUnits: 'meters',
+    coordinateSystem: COORDINATE_SYSTEM.LNGLAT,
+    parameters: {
+      depthTest: true,
+      depthWrite: true,
+    },
+  });
+
+  setLayers((currentLayers) => {
+    // Remove existing camera points for this polygon
+    const filteredLayers = currentLayers.filter(
+      (l) => !l.id.includes(`camera-points-${polygonId}`)
+    );
+    const newLayers = [...filteredLayers, cameraLayer];
+    overlay.setProps({ layers: newLayers });
+    return newLayers;
+  });
+}
+
+export function remove3DCameraPointsLayer(
+  overlay: MapboxOverlay,
+  polygonId: string,
+  setLayers: React.Dispatch<React.SetStateAction<any[]>>
+) {
+  setLayers((currentLayers) => {
+    const filteredLayers = currentLayers.filter(
+      (l) => !l.id.includes(`camera-points-${polygonId}`)
     );
     overlay.setProps({ layers: filteredLayers });
     return filteredLayers;

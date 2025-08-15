@@ -202,6 +202,65 @@ export function build3DFlightPath(
   return path;
 }
 
+/**
+ * Sample camera positions along 3D flight path at specified intervals
+ * @param path3D The 3D flight path segments
+ * @param photoSpacingMeters Distance between photos in meters
+ * @returns Array of camera positions with yaw [lng, lat, altitude, yawDeg]
+ */
+export function sampleCameraPositionsOnFlightPath(
+  path3D: [number, number, number][][],
+  photoSpacingMeters: number
+): [number, number, number, number][] {
+  const cameraPositions: [number, number, number, number][] = [];
+  
+  for (const segment of path3D) {
+    if (segment.length < 2) continue;
+    
+    let totalDistance = 0;
+    let lastPhotoDistance = 0;
+    
+    // For the first point, calculate initial bearing from first to second point
+    if (segment.length >= 2) {
+      const initialBearing = geoBearing([segment[0][0], segment[0][1]], [segment[1][0], segment[1][1]]);
+      cameraPositions.push([segment[0][0], segment[0][1], segment[0][2], initialBearing]);
+    }
+    
+    for (let i = 1; i < segment.length; i++) {
+      const prevPoint = segment[i - 1];
+      const currPoint = segment[i];
+      
+      // Calculate bearing for this segment (flight direction)
+      const segmentBearing = geoBearing([prevPoint[0], prevPoint[1]], [currPoint[0], currPoint[1]]);
+      
+      // Calculate distance between consecutive points
+      const stepDistance = haversineDistance([prevPoint[0], prevPoint[1]], [currPoint[0], currPoint[1]]);
+      const stepStartDistance = totalDistance;
+      totalDistance += stepDistance;
+      
+      // Check if we need to add camera positions along this step
+      while (lastPhotoDistance + photoSpacingMeters <= totalDistance) {
+        const targetDistance = lastPhotoDistance + photoSpacingMeters;
+        
+        // How far along this step is the target distance?
+        const distanceIntoStep = targetDistance - stepStartDistance;
+        const interpolationRatio = stepDistance > 0 ? distanceIntoStep / stepDistance : 0;
+        
+        // Interpolate position along the step
+        const lng = prevPoint[0] + (currPoint[0] - prevPoint[0]) * interpolationRatio;
+        const lat = prevPoint[1] + (currPoint[1] - prevPoint[1]) * interpolationRatio;
+        const alt = prevPoint[2] + (currPoint[2] - prevPoint[2]) * interpolationRatio;
+        
+        // Use the bearing of this segment as the yaw (flight direction)
+        cameraPositions.push([lng, lat, alt, segmentBearing]);
+        lastPhotoDistance = targetDistance;
+      }
+    }
+  }
+  
+  return cameraPositions;
+}
+
 export function calculateOptimalTerrainZoom(polygon: { coordinates: number[][] }): number {
   const coords = polygon.coordinates;
   if (coords.length < 3) return 15;
