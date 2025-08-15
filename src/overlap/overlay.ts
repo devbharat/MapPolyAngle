@@ -46,41 +46,8 @@ function encodeOverlapToImage(overlap: Uint16Array, size: number, maxValue: numb
   canvas.width = size; canvas.height = size;
   const ctx = canvas.getContext("2d", { willReadFrequently: true })!;
   const img = ctx.createImageData(size, size);
-  
-  // Collect statistics for debugging
-  let minVal = Infinity, maxVal = -Infinity, sum = 0, count = 0;
-  const values: number[] = [];
-  
-  for (let i = 0; i < overlap.length; i++) {
-    const v = overlap[i];
-    if (v > 0) {
-      values.push(v);
-      minVal = Math.min(minVal, v);
-      maxVal = Math.max(maxVal, v);
-      sum += v;
-      count++;
-    }
-  }
-  
-  const meanVal = count > 0 ? sum / count : 0;
-  console.log(`OVERLAP Stats - Count: ${count}, Min: ${minVal}, Max: ${maxVal}, Mean: ${meanVal.toFixed(2)}, Provided maxValue: ${maxValue}`);
-  
-  // Auto-adjust maxValue based on actual data if the provided value seems off
-  let effectiveMax = maxValue;
-  if (count > 0) {
-    if (maxVal < maxValue * 0.1) {
-      // If actual max is much smaller than provided max, use actual data range
-      effectiveMax = Math.max(maxVal * 1.2, meanVal * 2);
-      console.log(`Auto-adjusting overlap max from ${maxValue} to ${effectiveMax.toFixed(1)} based on small data range`);
-    } else if (maxVal > maxValue * 2) {
-      // If actual max is much larger than provided max, expand the range
-      effectiveMax = maxVal * 1.1;
-      console.log(`Auto-adjusting overlap max from ${maxValue} to ${effectiveMax.toFixed(1)} based on large data range`);
-    }
-  }
-  
-  console.log(`Using effective overlap max: ${effectiveMax.toFixed(1)}`);
-  
+  const effectiveMax = Math.max(1, maxValue); // Consistent across tiles
+
   for (let i = 0, j = 0; i < overlap.length; i++, j += 4) {
     const v = overlap[i];
     if (v === 0) {
@@ -88,8 +55,7 @@ function encodeOverlapToImage(overlap: Uint16Array, size: number, maxValue: numb
       img.data[j] = 0; img.data[j + 1] = 0; img.data[j + 2] = 0; img.data[j + 3] = 0;
       continue;
     }
-    
-    // Normalize to 0-1 range
+    // Normalize to 0-1 range (consistent)
     const t = effectiveMax > 0 ? Math.min(1, v / effectiveMax) : 0;
     const [r, g, b] = heatmapColor(t);
     
@@ -98,8 +64,6 @@ function encodeOverlapToImage(overlap: Uint16Array, size: number, maxValue: numb
     img.data[j + 2] = b;
     img.data[j + 3] = 200; // Good opacity for overlay
   }
-  
-  console.log(`OVERLAP - Sample normalized values: ${values.slice(0, 10).map(v => (v / effectiveMax).toFixed(3)).join(', ')}`);
   
   ctx.putImageData(img, 0, 0);
   return canvas;
@@ -114,34 +78,7 @@ function encodeGsdToImage(gsd: Float32Array, size: number, gsdMax = 0.50): HTMLC
   canvas.width = size; canvas.height = size;
   const ctx = canvas.getContext("2d", { willReadFrequently: true })!;
   const img = ctx.createImageData(size, size);
-  
-  // Collect statistics for debugging
-  let minVal = Infinity, maxVal = -Infinity, sum = 0, count = 0;
-  const values: number[] = [];
-  
-  for (let i = 0; i < gsd.length; i++) {
-    const g = gsd[i];
-    if (Number.isFinite(g)) {
-      values.push(g);
-      minVal = Math.min(minVal, g);
-      maxVal = Math.max(maxVal, g);
-      sum += g;
-      count++;
-    }
-  }
-  
-  const meanVal = count > 0 ? sum / count : 0;
-  console.log(`GSD Stats - Count: ${count}, Min: ${minVal.toFixed(4)}, Max: ${maxVal.toFixed(4)}, Mean: ${meanVal.toFixed(4)}, Provided gsdMax: ${gsdMax}`);
-  
-  // Auto-adjust gsdMax based on actual data if the provided value seems too high
-  let effectiveMax = gsdMax;
-  if (count > 0 && maxVal < gsdMax * 0.2) {
-    // If actual max is less than 20% of provided gsdMax, use a better range
-    effectiveMax = Math.max(maxVal * 1.2, meanVal * 2); // Use 120% of max or 2x mean, whichever is larger
-    console.log(`Auto-adjusting GSD max from ${gsdMax} to ${effectiveMax.toFixed(4)} based on data range`);
-  }
-  
-  console.log(`Using effective GSD max: ${effectiveMax.toFixed(4)}`);
+  const effectiveMax = Math.max(1e-6, gsdMax); // Consistent across tiles
   
   for (let i = 0, j = 0; i < gsd.length; i++, j += 4) {
     const g = gsd[i];
@@ -150,9 +87,7 @@ function encodeGsdToImage(gsd: Float32Array, size: number, gsdMax = 0.50): HTMLC
       img.data[j] = 0; img.data[j + 1] = 0; img.data[j + 2] = 0; img.data[j + 3] = 0;
       continue;
     }
-    
-    // Normalize: higher GSD (worse resolution) → closer to 1 (warmer colors = red)
-    // Lower GSD (better resolution) → closer to 0 (cooler colors = blue/green)
+    // Normalize: higher GSD (worse) → 1 (warmer); lower (better) → 0 (cooler)
     const t = Math.max(0, Math.min(1, g / effectiveMax));
     const [r, g_color, b] = heatmapColor(t);
     
@@ -161,13 +96,6 @@ function encodeGsdToImage(gsd: Float32Array, size: number, gsdMax = 0.50): HTMLC
     img.data[j + 2] = b;
     img.data[j + 3] = 200; // Good opacity for overlay
   }
-  
-    console.log(`GSD - Sample normalized values: ${values.slice(0, 10).map(v => (v / effectiveMax).toFixed(3)).join(', ')}`);
-
-/**
- * Convert GSD values to a heatmap visualization  
- * Higher GSD = worse resolution = warmer colors (red), Lower GSD = better resolution = cooler colors (blue/green)
- */
   
   ctx.putImageData(img, 0, 0);
   return canvas;

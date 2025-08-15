@@ -17,13 +17,17 @@ function preparePoses(poses: PoseMeters[]) {
 }
 
 function buildPolygonMask(polygons: {ring:[number,number][]}[], z:number, x:number, y:number, size:number): Uint8Array {
-  const tx = tileMetersBounds(z,x,y);
+  const tx = tileMetersBounds(z, x, y);
+  // ✅ CRITICAL: use the real tile size to derive pixel size
+  // (Mapbox terrain-rgb .pngraw is 256px unless explicitly requested otherwise)
+  tx.pixelSize = (tx.maxX - tx.minX) / size;
   const ringsPx: Array<Array<[number,number]>> = [];
   for (const poly of polygons) {
     const ringPx: Array<[number,number]> = [];
     for (const [lng,lat] of poly.ring) {
       const mx = (lng * Math.PI/180) * 6378137;
       const my = 6378137 * Math.log(Math.tan(Math.PI/4 + (Math.max(-85.05112878, Math.min(85.05112878, lat))*Math.PI/180)/2));
+      // worldToPixel now uses the corrected tx.pixelSize
       const [col,row] = worldToPixel(tx, mx, my);
       ringPx.push([col,row]);
     }
@@ -43,8 +47,8 @@ self.onmessage = (ev: MessageEvent<Msg>) => {
   // Precompute per-pose matrices
   const P = preparePoses(poses);
 
-  // Build polygon mask
-  const polyMask = buildPolygonMask(polygons, z,x,y,size);
+  // Build polygon mask (now using correct per-tile pixel size internally)
+  const polyMask = buildPolygonMask(polygons, z, x, y, size);
 
   // Tile outputs
   const overlap = new Uint16Array(size*size);

@@ -32,7 +32,7 @@ function loadImage(url: string, signal?: AbortSignal): Promise<HTMLImageElement>
   });
 }
 
-export function tilesCoveringPolygon(polygon: PolygonLngLat, z: number) {
+export function tilesCoveringPolygon(polygon: PolygonLngLat, z: number, pad: number = 0) {
   const lons = polygon.ring.map(p=>p[0]);
   const lats = polygon.ring.map(p=>p[1]);
   const min = { lon: Math.min(...lons), lat: Math.min(...lats) };
@@ -40,8 +40,8 @@ export function tilesCoveringPolygon(polygon: PolygonLngLat, z: number) {
   const tMin = lngLatToTile(min.lon, max.lat, z);
   const tMax = lngLatToTile(max.lon, min.lat, z);
   const tiles: {x:number;y:number}[] = [];
-  for (let x=tMin.x; x<=tMax.x; x++) {
-    for (let y=tMin.y; y<=tMax.y; y++) tiles.push({x,y});
+  for (let x=tMin.x - pad; x<=tMax.x + pad; x++) {
+    for (let y=tMin.y - pad; y<=tMax.y + pad; y++) tiles.push({x,y});
   }
   return tiles;
 }
