@@ -42,6 +42,14 @@ export default function Home() {
   const center = useMemo<[number, number]>(() => [8.54, 47.37], []);
   const initialZoom = useMemo(() => 13, []);
 
+  // Expose mapRef to window for console testing
+  React.useEffect(() => {
+    if (mapRef.current) {
+      (window as any).mapApi = mapRef.current;
+      console.log('🔧 Map API available as window.mapApi for console testing');
+    }
+  }, [mapRef.current]);
+
   // Memoize handlers to prevent unnecessary re-renders
   const handleAnalysisStart = useCallback((polygonId: string) => {
     setAnalyzingPolygons(prev => new Set(prev).add(polygonId));
@@ -202,6 +210,7 @@ export default function Home() {
               variant="outline"
               className="h-8 px-2 whitespace-nowrap"
               onClick={() => mapRef.current?.openFlightplanFilePicker?.()}
+              title="Import Wingtra .flightplan - preserves file bearings, use 'Optimize' button for terrain-optimal directions"
             >
               <Upload className="w-3 h-3 mr-1" />
               Import Flightplan
@@ -329,18 +338,21 @@ export default function Home() {
                           <div className="flex gap-2 mb-2">
                             {hasOverride ? (
                               <Button size="sm" className="h-7 px-2 text-xs"
-                                      onClick={() => mapRef.current?.optimizePolygonDirection?.(polygonId)}>
-                                Optimize direction
+                                      onClick={() => mapRef.current?.optimizePolygonDirection?.(polygonId)}
+                                      title="Drop file override and use terrain-optimal direction">
+                                🎯 Optimize direction
                               </Button>
                             ) : (
                               <Button size="sm" variant="outline" className="h-7 px-2 text-xs"
-                                      onClick={() => mapRef.current?.revertPolygonToImportedDirection?.(polygonId)}>
-                                Use file direction
+                                      onClick={() => mapRef.current?.revertPolygonToImportedDirection?.(polygonId)}
+                                      title="Restore Wingtra file bearing/spacing">
+                                📁 Use file direction
                               </Button>
                             )}
                             <Button size="sm" variant="outline" className="h-7 px-2 text-xs"
-                                    onClick={() => mapRef.current?.runFullAnalysis?.(polygonId)}>
-                              Full Analysis
+                                    onClick={() => mapRef.current?.runFullAnalysis?.(polygonId)}
+                                    title="Clear overrides, run fresh analysis, and ask for new params">
+                              🔄 Full Analysis
                             </Button>
                           </div>
                         )}

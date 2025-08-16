@@ -398,6 +398,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
     // ---------- Wingtra flightplan import ----------
     const importWingtraFromText = useCallback(async (json: string): Promise<{ added: number; total: number; areas: ImportedFlightplanArea[] }> => {
       try {
+        console.log(`📥 Importing Wingtra flightplan...`);
         const parsed = JSON.parse(json);
         const imported = importWingtraFlightPlan(parsed, { angleConvention: 'northCW' }); // change if you need eastCW
         const areasOut: ImportedFlightplanArea[] = [];
@@ -407,6 +408,8 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           return { added: 0, total: imported.items.length, areas: [] };
         }
 
+        console.log(`📦 Found ${imported.items.length} areas in flightplan`);
+        
         suspendAutoAnalysisRef.current = true;
         const newRings: [number, number][][] = [];
         const newIds: string[] = [];
@@ -534,6 +537,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         }
 
         suspendAutoAnalysisRef.current = false;
+        console.log(`✅ Successfully imported ${newIds.length} areas with file bearings preserved. Use "Optimize" to get terrain-optimal directions.`);
         return { added: newIds.length, total: imported.items.length, areas: areasOut };
       } catch (e) {
         onError?.(`Failed to import flightplan: ${e instanceof Error ? e.message : 'Unknown error'}`);
@@ -655,6 +659,8 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
     }, [polygonResults, polygonTiles, bearingOverrides, onFlightLinesUpdated]);
 
     const optimizePolygonDirection = useCallback((polygonId: string) => {
+      console.log(`🎯 Optimizing direction for polygon ${polygonId} - switching to terrain-optimal bearing`);
+      
       // drop override and rebuild using terrain-optimal on next apply
       setBearingOverrides((prev) => {
         const next = new Map(prev);
@@ -665,6 +671,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       // Check if we have analysis results, if not run analysis first
       const hasResults = polygonResults.has(polygonId);
       if (!hasResults) {
+        console.log(`⚡ No terrain analysis yet for polygon ${polygonId}, running analysis first...`);
         // Need to run analysis to get terrain-optimal direction
         const draw = drawRef.current as any;
         const f = draw?.get?.(polygonId);
@@ -677,9 +684,11 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       // Re-apply current params (this will redraw lines using analysis direction)
       const params = polygonParams.get(polygonId);
       if (params) {
+        console.log(`✅ Applying terrain-optimal direction for polygon ${polygonId}`);
         applyPolygonParams(polygonId, params);
       } else {
         // If params missing, analyze & request params
+        console.log(`📝 Missing params for polygon ${polygonId}, requesting user input...`);
         const draw = drawRef.current as any;
         const f = draw?.get?.(polygonId);
         if (f?.geometry?.type === 'Polygon') analyzePolygon(polygonId, f);
@@ -687,6 +696,8 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
     }, [polygonParams, polygonResults, applyPolygonParams, analyzePolygon]);
 
     const revertPolygonToImportedDirection = useCallback((polygonId: string) => {
+      console.log(`📁 Reverting polygon ${polygonId} to file direction (Wingtra bearing/spacing)`);
+      
       const original = importedOriginals.get(polygonId);
       const res = polygonResults.get(polygonId);
       if (!original || !res || !mapRef.current) return;
@@ -722,10 +733,13 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         update3DPathLayer(deckOverlayRef.current, polygonId, path3d, setDeckLayers);
       }
 
+      console.log(`✅ Restored file direction: ${original.bearingDeg}° bearing, ${original.lineSpacingM}m spacing`);
       onFlightLinesUpdated?.(polygonId);
     }, [importedOriginals, polygonResults, polygonParams, polygonTiles, onFlightLinesUpdated]);
 
     const runFullAnalysis = useCallback((polygonId: string) => {
+      console.log(`🔄 Running full analysis for polygon ${polygonId} - clearing overrides and requesting fresh params`);
+      
       // Clear any overrides and remove existing results to force fresh analysis
       setBearingOverrides((prev) => {
         const next = new Map(prev);
@@ -754,6 +768,8 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       if (deckOverlayRef.current) {
         remove3DPathLayer(deckOverlayRef.current, polygonId, setDeckLayers);
       }
+
+      console.log(`⚡ Starting fresh terrain analysis for polygon ${polygonId}...`);
 
       // Trigger fresh analysis as if manually drawn
       const draw = drawRef.current as any;
