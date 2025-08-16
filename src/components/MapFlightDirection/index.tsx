@@ -136,25 +136,20 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
     // ---------- analysis callbacks ----------
     const handleAnalysisResult = useCallback(
       (result: PolygonAnalysisResult, tiles: any[]) => {
-        // Keep analysis result & tiles
-        let updatedResults: PolygonAnalysisResult[];
+        // 1) Commit result and notify parent from inside the updater to avoid races
         setPolygonResults((prev) => {
           const next = new Map(prev);
           next.set(result.polygonId, result);
-          updatedResults = Array.from(next.values());
+          onAnalysisComplete?.(Array.from(next.values()));
           return next;
         });
 
+        // 2) Store tiles
         setPolygonTiles((prev) => {
           const next = new Map(prev);
           next.set(result.polygonId, tiles);
           return next;
         });
-
-        // Call the callback after state updates are complete
-        if (updatedResults!) {
-          onAnalysisComplete?.(updatedResults);
-        }
 
         // Decide which heading/spacing to use when drawing
         const params = polygonParamsRef.current.get(result.polygonId);
@@ -256,17 +251,12 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           if (deckOverlayRef.current) {
             remove3DPathLayer(deckOverlayRef.current, polygonId, setDeckLayers);
           }
-          let updatedResults: PolygonAnalysisResult[];
           setPolygonResults((prev) => {
             const next = new Map(prev);
             next.delete(polygonId);
-            updatedResults = Array.from(next.values());
+            onAnalysisComplete?.(Array.from(next.values()));
             return next;
           });
-          // Call callback after state update
-          if (updatedResults!) {
-            onAnalysisComplete?.(updatedResults);
-          }
           setPolygonFlightLines((prev) => {
             const next = new Map(prev);
             next.delete(polygonId);
@@ -533,9 +523,14 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
 
           // Kick GSD auto-run path via parent callback
           onFlightLinesUpdated?.(polygonId);
+        }
 
-          // 👉 Run terrain analysis now so "Analysis Result" is available immediately.
-          // This does not rotate lines because the Wingtra override is still set.
+        // 👉 Re-enable auto-analysis before running explicit analysis to avoid race conditions
+        suspendAutoAnalysisRef.current = false;
+
+        // 👉 Run terrain analysis now so "Analysis Result" is available immediately.
+        // This does not rotate lines because the Wingtra override is still set.
+        for (const polygonId of newIds) {
           const draw = drawRef.current as any;
           const feature = draw?.get?.(polygonId);
           if (feature?.geometry?.type === 'Polygon') {
@@ -543,7 +538,6 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           }
         }
 
-        suspendAutoAnalysisRef.current = false;
         console.log(`✅ Successfully imported ${newIds.length} areas with file bearings preserved. Use "Optimize" to get terrain-optimal directions.`);
         return { added: newIds.length, total: imported.items.length, areas: areasOut };
       } catch (e) {
