@@ -708,6 +708,40 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       onFlightLinesUpdated?.(polygonId);
     }, [importedOriginals, polygonResults, polygonParams, polygonTiles, onFlightLinesUpdated]);
 
+    const runFullAnalysis = useCallback((polygonId: string) => {
+      // Clear any overrides and remove existing results to force fresh analysis
+      setBearingOverrides((prev) => {
+        const next = new Map(prev);
+        next.delete(polygonId);
+        return next;
+      });
+
+      // Clear existing results
+      setPolygonResults((prev) => {
+        const next = new Map(prev);
+        next.delete(polygonId);
+        return next;
+      });
+
+      setPolygonParams((prev) => {
+        const next = new Map(prev);
+        next.delete(polygonId);
+        return next;
+      });
+
+      // Clear existing flight lines
+      if (mapRef.current) {
+        removeFlightLinesForPolygon(mapRef.current, polygonId);
+      }
+
+      // Trigger fresh analysis as if manually drawn
+      const draw = drawRef.current as any;
+      const f = draw?.get?.(polygonId);
+      if (f?.geometry?.type === 'Polygon') {
+        analyzePolygon(polygonId, f);
+      }
+    }, [analyzePolygon]);
+
     useImperativeHandle(ref, () => ({
       clearAllDrawings: () => {
         if (drawRef.current) drawRef.current.deleteAll();
@@ -787,6 +821,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
 
       optimizePolygonDirection,
       revertPolygonToImportedDirection,
+      runFullAnalysis,
 
       getBearingOverrides: () => Object.fromEntries(bearingOverrides),
       getImportedOriginals: () => Object.fromEntries(importedOriginals),
@@ -795,7 +830,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       cancelAllAnalyses, applyPolygonParams,
       bearingOverrides, importedOriginals,
       importKmlFromText, importWingtraFromText,
-      optimizePolygonDirection, revertPolygonToImportedDirection
+      optimizePolygonDirection, revertPolygonToImportedDirection, runFullAnalysis
     ]);
 
     return (

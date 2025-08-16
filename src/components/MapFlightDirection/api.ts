@@ -62,6 +62,7 @@ export interface MapFlightDirectionAPI {
   // Overrides & optimization
   optimizePolygonDirection(polygonId: string): void;                 // drop override → use terrain-optimal
   revertPolygonToImportedDirection(polygonId: string): void;         // re-apply file heading/spacing
+  runFullAnalysis(polygonId: string): void;                          // run complete analysis pipeline (as if manually drawn)
   getBearingOverrides(): Record<string, { bearingDeg: number; lineSpacingM?: number; source: 'wingtra' | 'user' }>;
   getImportedOriginals(): Record<string, { bearingDeg: number; lineSpacingM: number }>;
 }

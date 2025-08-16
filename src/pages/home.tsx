@@ -175,6 +175,8 @@ export default function Home() {
 
   const isAnalyzing = analyzingPolygons.size > 0;
   const hasResults = polygonResults.length > 0;
+  const hasImportedPolygons = Object.keys(importedOriginals).length > 0;
+  const hasPolygonsToAnalyze = hasResults || hasImportedPolygons;
 
   return (
     <div className="h-screen flex flex-col bg-gray-50">
@@ -336,6 +338,10 @@ export default function Home() {
                                 Use file direction
                               </Button>
                             )}
+                            <Button size="sm" variant="outline" className="h-7 px-2 text-xs"
+                                    onClick={() => mapRef.current?.runFullAnalysis?.(polygonId)}>
+                              Full Analysis
+                            </Button>
                           </div>
                         )}
                         
@@ -426,7 +432,7 @@ export default function Home() {
           {/* Always mount the GSD Panel to ensure auto-run callback is registered */}
           <Card className="backdrop-blur-md bg-white/95 mt-4">
             <CardContent className="p-3">
-              <div className={hasResults ? '' : 'opacity-50 pointer-events-none'}>
+              <div className={hasPolygonsToAnalyze ? '' : 'opacity-50 pointer-events-none'}>
                 <OverlapGSDPanel 
                   mapRef={mapRef} 
                   mapboxToken={mapboxToken} 
