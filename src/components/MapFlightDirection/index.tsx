@@ -16,7 +16,7 @@ import '@mapbox/mapbox-gl-draw/dist/mapbox-gl-draw.css';
 
 import { useMapInitialization } from './hooks/useMapInitialization';
 import { usePolygonAnalysis } from './hooks/usePolygonAnalysis';
-import { addFlightLinesForPolygon, removeFlightLinesForPolygon, addTriggerPointsForPolygon, removeTriggerPointsForPolygon } from './utils/mapbox-layers';
+import { addFlightLinesForPolygon, removeFlightLinesForPolygon, clearAllFlightLines, addTriggerPointsForPolygon, removeTriggerPointsForPolygon, clearAllTriggerPoints } from './utils/mapbox-layers';
 import { update3DPathLayer, remove3DPathLayer, update3DCameraPointsLayer, remove3DCameraPointsLayer } from './utils/deckgl-layers';
 import { build3DFlightPath, calculateFlightLineSpacing } from './utils/geometry';
 import { PolygonAnalysisResult, PolygonParams } from './types';
@@ -447,13 +447,23 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           setDeckLayers([]);
           deckOverlayRef.current.setProps({ layers: [] });
         }
-        // Remove any existing trigger points
+        // Remove any existing flight lines and trigger points
         if (mapRef.current) {
-          polygonResults.forEach((_, polygonId) => {
-            removeTriggerPointsForPolygon(mapRef.current!, polygonId);
-          });
+          // Use comprehensive clearing for both flight lines and trigger points
+          clearAllFlightLines(mapRef.current);
+          clearAllTriggerPoints(mapRef.current);
         }
+        
+        // Clear internal state
+        setPolygonResults(new Map());
+        setPolygonTiles(new Map());
+        setPolygonFlightLines(new Map());
+        setPolygonParams(new Map());
+        
         cancelAllAnalyses();
+        
+        // Clear GSD overlays and analysis
+        onClearGSD?.();
       },
       clearPolygon: (polygonId: string) => {
         if (drawRef.current) {

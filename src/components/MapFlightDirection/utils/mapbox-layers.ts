@@ -278,3 +278,67 @@ export function removeTriggerPointsForPolygon(map: MapboxMap, polygonId: string)
     console.warn(`Failed to remove source ${sourceId}:`, e);
   }
 }
+
+/**
+ * Clear all flight lines from the map (for use when clearing all polygons)
+ */
+export function clearAllFlightLines(map: MapboxMap) {
+  if (!map || !map.isStyleLoaded()) return;
+  
+  const layers = map.getStyle().layers || [];
+  const sources = map.getStyle().sources || {};
+  
+  // Remove all flight line layers
+  for (const layer of layers) {
+    if (layer.id.startsWith('flight-lines-layer-')) {
+      try {
+        map.removeLayer(layer.id);
+      } catch (e) {
+        console.warn(`Failed to remove flight line layer ${layer.id}:`, e);
+      }
+    }
+  }
+  
+  // Remove all flight line sources
+  for (const sourceId of Object.keys(sources)) {
+    if (sourceId.startsWith('flight-lines-source-')) {
+      try {
+        map.removeSource(sourceId);
+      } catch (e) {
+        console.warn(`Failed to remove flight line source ${sourceId}:`, e);
+      }
+    }
+  }
+}
+
+/**
+ * Clear all trigger points from the map (for use when clearing all polygons)
+ */
+export function clearAllTriggerPoints(map: MapboxMap) {
+  if (!map || !map.isStyleLoaded()) return;
+  
+  const layers = map.getStyle().layers || [];
+  const sources = map.getStyle().sources || {};
+  
+  // Remove all trigger point layers
+  for (const layer of layers) {
+    if (layer.id.startsWith('flight-triggers-')) {
+      try {
+        map.removeLayer(layer.id);
+      } catch (e) {
+        console.warn(`Failed to remove trigger layer ${layer.id}:`, e);
+      }
+    }
+  }
+  
+  // Remove all trigger point sources
+  for (const sourceId of Object.keys(sources)) {
+    if (sourceId.startsWith('flight-triggers-source-')) {
+      try {
+        map.removeSource(sourceId);
+      } catch (e) {
+        console.warn(`Failed to remove trigger source ${sourceId}:`, e);
+      }
+    }
+  }
+}

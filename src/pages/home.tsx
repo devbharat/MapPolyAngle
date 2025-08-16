@@ -102,6 +102,7 @@ export default function Home() {
 
   const clearAllDrawings = useCallback(() => {
     mapRef.current?.clearAllDrawings?.();
+    clearGSDRef.current?.(); // Clear GSD overlays and analysis
     setPolygonResults([]);
     setAnalyzingPolygons(new Set());
     setParamsByPolygon({});
