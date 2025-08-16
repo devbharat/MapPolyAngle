@@ -1,4 +1,4 @@
-import type { CameraModel, PoseMeters, PolygonLngLat, TileResult } from "./types";
+import type { CameraModel, PoseMeters, PolygonLngLat, TileResult, WorkerOut } from "./types";
 import { lngLatToTile, tileCornersLngLat } from "./mercator";
 
 export async function fetchTerrainRGBA(
@@ -56,8 +56,8 @@ export class OverlapWorker {
     this.worker = new Worker(new URL("./worker.ts", import.meta.url), { type: "module" });
   }
   runTile(args: any) {
-    return new Promise<TileResult>((resolve) => {
-      const onMsg = (e: MessageEvent<TileResult>) => {
+    return new Promise<WorkerOut>((resolve) => {
+      const onMsg = (e: MessageEvent<WorkerOut>) => {
         this.worker.removeEventListener("message", onMsg as any);
         resolve(e.data);
       };

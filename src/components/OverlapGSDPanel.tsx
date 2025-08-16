@@ -2,11 +2,12 @@ import React, { useCallback, useMemo, useRef, useState } from "react";
 import type mapboxgl from "mapbox-gl";
 import { OverlapWorker, fetchTerrainRGBA, tilesCoveringPolygon } from "@/overlap/controller";
 import { addOrUpdateTileOverlay, clearRunOverlays } from "@/overlap/overlay";
-import type { CameraModel, PoseMeters, PolygonLngLat, GSDStats } from "@/overlap/types";
+import type { CameraModel, PoseMeters, PolygonLngLatWithId, GSDStats, PolygonTileStats } from "@/overlap/types";
 import { lngLatToMeters } from "@/overlap/mercator";
 import { sampleCameraPositionsOnFlightPath, build3DFlightPath } from "@/components/MapFlightDirection/utils/geometry";
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
 
 type Props = {
   // Ref to MapFlightDirection (must expose getMap() and getPolygons())
@@ -28,6 +29,31 @@ const sonyRX1R2Camera: CameraModel = {
   h_px: 5304,
 };
 
+// Helper function to calculate polygon area in acres
+function calculatePolygonAreaAcres(ring: [number, number][]): number {
+  if (ring.length < 3) return 0;
+  
+  // Use shoelace formula to calculate area in square degrees
+  let area = 0;
+  for (let i = 0; i < ring.length; i++) {
+    const j = (i + 1) % ring.length;
+    area += ring[i][0] * ring[j][1];
+    area -= ring[j][0] * ring[i][1];
+  }
+  area = Math.abs(area) / 2;
+  
+  // Convert from square degrees to square meters (approximate)
+  // This is a rough approximation - for precise calculations, use proper geodesic methods
+  const avgLat = ring.reduce((sum, point) => sum + point[1], 0) / ring.length;
+  const latRadians = avgLat * Math.PI / 180;
+  const metersPerDegreeLng = 111320 * Math.cos(latRadians);
+  const metersPerDegreeLat = 110540;
+  const areaSquareMeters = area * metersPerDegreeLng * metersPerDegreeLat;
+  
+  // Convert to acres (1 acre = 4046.86 square meters)
+  return areaSquareMeters / 4046.86;
+}
+
 export function OverlapGSDPanel({ mapRef, mapboxToken, onLineSpacingChange, onPhotoSpacingChange, onAltitudeChange, onAutoRun, onClearExposed }: Props) {
   const [cameraText, setCameraText] = useState(JSON.stringify(sonyRX1R2Camera, null, 2));
   const [altitude, setAltitude] = useState(100); // AGL in meters
@@ -41,6 +67,12 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, onLineSpacingChange, onPh
   const [autoGenerate, setAutoGenerate] = useState(true);
   const [showCameraPoints, setShowCameraPoints] = useState(false); // Changed default to false
   const [gsdStats, setGsdStats] = useState<GSDStats | null>(null);
+  const [perPolygonStats, setPerPolygonStats] = useState<Map<string, {
+    polygonId: string;
+    gsdStats: GSDStats;
+    areaAcres: number;
+    imageCount: number;
+  }>>(new Map());
   const runIdRef = useRef<string>("");
   const autoTriesRef = useRef(0);
 
@@ -196,11 +228,10 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, onLineSpacingChange, onPh
     return [];
   }, [autoGenerate, generatePosesFromFlightLines]);
 
-  const getPolygons = useCallback((): PolygonLngLat[] => {
+  const getPolygons = useCallback((): PolygonLngLatWithId[] => {
     const api = mapRef.current;
-    if (!api?.getPolygons) return [];
-    const rings: [number,number][][] = api.getPolygons(); // each is ring: [lng,lat][]
-    return rings.map(r => ({ ring: r }));
+    if (!api?.getPolygonsWithIds) return [];
+    return api.getPolygonsWithIds(); // returns { id?: string; ring: [number, number][] }[]
   }, [mapRef]);
 
   const compute = useCallback(async () => {
@@ -235,25 +266,74 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, onLineSpacingChange, onPh
         }
       }
 
-      // Process sequentially for simplicity (can parallelize with multiple workers)
-      const allGsdStats: GSDStats[] = [];
+      // Process tiles and collect per-polygon statistics
+      const perPolygonResults = new Map<string, PolygonTileStats[]>();
+      
       for (const t of tiles) {
         const imgData = await fetchTerrainRGBA(t.z, t.x, t.y, mapboxToken);
         const tile = { z:t.z, x:t.x, y:t.y, size: imgData.width, data: imgData.data };
         const res = await worker.runTile({ tile, polygons, poses, camera } as any);
 
-        // Collect GSD statistics from each tile
-        if (res.gsdStats) {
-          allGsdStats.push(res.gsdStats);
+        // Group results by polygon ID
+        if (res.perPolygon) {
+          for (const polyStats of res.perPolygon) {
+            if (!perPolygonResults.has(polyStats.polygonId)) {
+              perPolygonResults.set(polyStats.polygonId, []);
+            }
+            perPolygonResults.get(polyStats.polygonId)!.push(polyStats);
+          }
         }
 
         if (showOverlap) addOrUpdateTileOverlay(map, res, { kind: "overlap", runId, opacity });
         if (showGsd) addOrUpdateTileOverlay(map, res, { kind: "gsd", runId, opacity, gsdMax: 0.1 });
       }
 
-      // Aggregate GSD statistics from all tiles
-      const aggregatedStats = aggregateGSDStats(allGsdStats);
-      setGsdStats(aggregatedStats);
+      // Aggregate statistics per polygon
+      const aggregatedPerPolygon = new Map<string, {
+        polygonId: string;
+        gsdStats: GSDStats;
+        areaAcres: number;
+        imageCount: number;
+      }>();
+
+      perPolygonResults.forEach((tileStats: PolygonTileStats[], polygonId: string) => {
+        // Find the corresponding polygon to calculate area
+        const polygon = polygons.find(p => (p.id || 'unknown') === polygonId);
+        const areaAcres = polygon ? calculatePolygonAreaAcres(polygon.ring) : 0;
+
+        // Aggregate GSD stats across all tiles for this polygon
+        const allGsdStats = tileStats.map((ts: PolygonTileStats) => ts.gsdStats).filter(Boolean);
+        const aggregatedGsdStats = aggregateGSDStats(allGsdStats);
+
+        // Count unique poses (images) that hit this polygon
+        const uniquePoseIds = new Set<number>();
+        for (const ts of tileStats) {
+          for (let i = 0; i < ts.hitPoseIds.length; i++) {
+            uniquePoseIds.add(ts.hitPoseIds[i]);
+          }
+        }
+
+        aggregatedPerPolygon.set(polygonId, {
+          polygonId,
+          gsdStats: aggregatedGsdStats,
+          areaAcres,
+          imageCount: uniquePoseIds.size
+        });
+      });
+
+      setPerPolygonStats(aggregatedPerPolygon);
+
+      // Also set the overall cumulative GSD stats for backward compatibility
+      const allGsdStats: GSDStats[] = [];
+      perPolygonResults.forEach((tileStats: PolygonTileStats[]) => {
+        for (const ts of tileStats) {
+          if (ts.gsdStats) {
+            allGsdStats.push(ts.gsdStats);
+          }
+        }
+      });
+      const cumulativeStats = aggregateGSDStats(allGsdStats);
+      setGsdStats(cumulativeStats);
 
       // Add camera position markers in 3D
       if (showCameraPoints && poses.length > 0) {
@@ -334,6 +414,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, onLineSpacingChange, onPh
       
       // Clear GSD statistics
       setGsdStats(null);
+      setPerPolygonStats(new Map());
     }
   }, [mapRef]);
 
@@ -366,12 +447,86 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, onLineSpacingChange, onPh
       </div>
 
       {/* GSD Statistics and Histogram */}
+      {/* Per-Polygon Statistics */}
+      {perPolygonStats.size > 0 && (
+        <div className="space-y-2">
+          {Array.from(perPolygonStats.entries()).map(([polygonId, stats]) => (
+            <Card key={polygonId} className="mt-2">
+              <CardHeader className="pb-3">
+                <CardTitle className="text-sm flex items-center gap-2">
+                  Polygon Analysis
+                  <Badge variant="secondary" className="text-xs">
+                    {polygonId || 'unknown'}
+                  </Badge>
+                </CardTitle>
+                <CardDescription className="text-xs">
+                  Area: {stats.areaAcres.toFixed(2)} acres • Images: {stats.imageCount} • Pixels: {stats.gsdStats.count.toLocaleString()}
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                {/* Summary Statistics */}
+                <div className="grid grid-cols-3 gap-4 text-xs">
+                  <div className="text-center">
+                    <div className="font-medium text-green-600">{(stats.gsdStats.min * 100).toFixed(1)} cm</div>
+                    <div className="text-gray-500">Min GSD</div>
+                  </div>
+                  <div className="text-center">
+                    <div className="font-medium text-blue-600">{(stats.gsdStats.mean * 100).toFixed(1)} cm</div>
+                    <div className="text-gray-500">Mean GSD</div>
+                  </div>
+                  <div className="text-center">
+                    <div className="font-medium text-red-600">{(stats.gsdStats.max * 100).toFixed(1)} cm</div>
+                    <div className="text-gray-500">Max GSD</div>
+                  </div>
+                </div>
+
+                {/* Histogram */}
+                <div className="h-48">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <BarChart data={stats.gsdStats.histogram.map(bin => ({
+                      gsd: (bin.bin * 100).toFixed(1),
+                      count: bin.count,
+                      gsdValue: bin.bin
+                    }))}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
+                      <XAxis 
+                        dataKey="gsd" 
+                        tick={{ fontSize: 10 }}
+                        label={{ value: 'GSD (cm)', position: 'insideBottom', offset: -5, style: { fontSize: '10px' } }}
+                      />
+                      <YAxis 
+                        tick={{ fontSize: 10 }}
+                        label={{ value: 'Pixel Count', angle: -90, position: 'insideLeft', style: { fontSize: '10px' } }}
+                      />
+                      <Tooltip 
+                        formatter={(value, name) => [value?.toLocaleString(), 'Pixels']}
+                        labelFormatter={(label) => `GSD: ${label} cm`}
+                        labelStyle={{ fontSize: '11px' }}
+                        contentStyle={{ fontSize: '11px' }}
+                      />
+                      <Bar 
+                        dataKey="count" 
+                        fill="#8b5cf6" 
+                        stroke="#7c3aed"
+                        strokeWidth={0.5}
+                        radius={[1, 1, 0, 0]}
+                      />
+                    </BarChart>
+                  </ResponsiveContainer>
+                </div>
+              </CardContent>
+            </Card>
+          ))}
+        </div>
+      )}
+
+      {/* Overall GSD Statistics */}
       {gsdStats && gsdStats.count > 0 && (
         <Card className="mt-2">
           <CardHeader className="pb-3">
-            <CardTitle className="text-sm">GSD Analysis Results</CardTitle>
+            <CardTitle className="text-sm">Overall GSD Analysis</CardTitle>
             <CardDescription className="text-xs">
-              Ground Sample Distance statistics for {gsdStats.count.toLocaleString()} pixels
+              Cumulative Ground Sample Distance statistics for {gsdStats.count.toLocaleString()} pixels
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">

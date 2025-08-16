@@ -32,6 +32,20 @@ export type GSDStats = {
   histogram: { bin: number; count: number }[];
 };
 
+export type PolygonLngLat = { ring: [number, number][] }; // single-ring polygon
+
+// Allow passing polygon IDs so we can report per‑polygon stats deterministically
+export type PolygonLngLatWithId = { id?: string; ring: [number, number][] };
+
+// Per‑polygon statistics for a single tile
+export type PolygonTileStats = {
+  polygonId: string;
+  activePixelCount: number;
+  gsdStats: GSDStats;
+  /** Set of global pose indices (in the 'poses' array) that saw this polygon in this tile */
+  hitPoseIds: Uint32Array;
+};
+
 export type TileResult = {
   z: number; x: number; y: number; size: number;
   maxOverlap: number;
@@ -41,11 +55,9 @@ export type TileResult = {
   gsdStats?: GSDStats; // Per-tile GSD statistics
 };
 
-export type PolygonLngLat = { ring: [number, number][] }; // single-ring polygon
-
 export type WorkerIn = {
   tile: TileRGBA;
-  polygons: PolygonLngLat[];  // mask to these polygons
+  polygons: PolygonLngLatWithId[];  // mask to these polygons
   poses: PoseMeters[];        // pre-converted to EPSG:3857 meters
   camera: CameraModel;
   options?: {
@@ -57,4 +69,7 @@ export type WorkerIn = {
   };
 };
 
-export type WorkerOut = TileResult;
+export type WorkerOut = TileResult & {
+  /** Per‑polygon stats for this tile (empty if no active pixels fell in any polygon) */
+  perPolygon?: PolygonTileStats[];
+};

@@ -45,6 +45,7 @@ export const MapFlightDirection = React.forwardRef<
     getPolygonResults: () => PolygonAnalysisResult[];
     getMap: () => MapboxMap | undefined;
     getPolygons: () => [number,number][][];
+    getPolygonsWithIds: () => { id?: string; ring: [number, number][] }[];
     getFlightLines: () => Map<string, { flightLines: number[][][]; lineSpacing: number }>;
     getPolygonTiles: () => Map<string, any[]>;
     addCameraPoints: (polygonId: string, positions: [number, number, number][]) => void;
@@ -268,6 +269,22 @@ export const MapFlightDirection = React.forwardRef<
           }
         }
         return rings;
+      },
+      getPolygonsWithIds: (): { id?: string; ring: [number, number][] }[] => {
+        // Return polygons with their IDs for per-polygon analysis
+        const draw = drawRef.current;
+        if (!draw) return [];
+        const coll = draw.getAll();
+        const polygonsWithIds: { id?: string; ring: [number, number][] }[] = [];
+        for (const f of coll.features) {
+          if (f.geometry?.type === "Polygon" && Array.isArray(f.geometry.coordinates?.[0])) {
+            polygonsWithIds.push({
+              id: f.id as string | undefined,
+              ring: f.geometry.coordinates[0] as [number, number][]
+            });
+          }
+        }
+        return polygonsWithIds;
       },
       getFlightLines: () => polygonFlightLines,
       getPolygonTiles: () => polygonTiles,
