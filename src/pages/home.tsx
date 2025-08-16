@@ -170,7 +170,7 @@ export default function Home() {
                 Flight Plan Analyser
               </h1>
               <p className="hidden md:block text-[11px] text-gray-500">
-                Terrain‑aware line planning &amp; GSD
+                Terrain‑aware flight planning &amp; GSD analysis
               </p>
             </div>
           </div>

@@ -81,6 +81,51 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
   const tileCacheRef = useRef<Map<string, { width: number; height: number; data: Uint8ClampedArray }>>(new Map());
   const autoTriesRef = useRef(0);
 
+  // Helper function to generate user-friendly polygon names
+  const getPolygonDisplayName = useCallback((polygonId: string): { displayName: string; shortId: string } => {
+    const api = mapRef.current;
+    if (!api?.getPolygonsWithIds) return { displayName: 'Unknown', shortId: polygonId.slice(0, 8) };
+    
+    const polygons = api.getPolygonsWithIds();
+    const index = polygons.findIndex((p: any) => (p.id || 'unknown') === polygonId);
+    
+    return {
+      displayName: index >= 0 ? `Polygon ${index + 1}` : 'Unknown',
+      shortId: polygonId.slice(0, 8)
+    };
+  }, [mapRef]);
+
+  // Helper function to highlight polygon on map
+  const highlightPolygon = useCallback((polygonId: string) => {
+    const api = mapRef.current;
+    const map = api?.getMap?.();
+    if (!map || !api?.getPolygonsWithIds) return;
+
+    const polygons = api.getPolygonsWithIds();
+    const targetPolygon = polygons.find((p: any) => (p.id || 'unknown') === polygonId);
+    
+    if (targetPolygon && targetPolygon.ring?.length >= 4) {
+      // Calculate bounds manually and use fitBounds with array format
+      const lngs = targetPolygon.ring.map((coord: [number, number]) => coord[0]);
+      const lats = targetPolygon.ring.map((coord: [number, number]) => coord[1]);
+      
+      const minLng = Math.min(...lngs);
+      const maxLng = Math.max(...lngs);
+      const minLat = Math.min(...lats);
+      const maxLat = Math.max(...lats);
+      
+      // Use the array format for fitBounds: [[minLng, minLat], [maxLng, maxLat]]
+      map.fitBounds([[minLng, minLat], [maxLng, maxLat]], {
+        padding: 50,
+        duration: 1000,
+        maxZoom: 16
+      });
+
+      // Optional: Flash the polygon briefly (could add temporary highlight layer)
+      // For now, the map pan/zoom provides visual feedback
+    }
+  }, [mapRef]);
+
   const parseCamera = useCallback((): CameraModel | null => {
     try { return JSON.parse(cameraText); } catch { return null; }
   }, [cameraText]);
@@ -341,7 +386,8 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
         // Use single global runId for overlays
         if (showOverlap) addOrUpdateTileOverlay(map, res, { kind: "overlap", runId, opacity });
         if (showGsd) addOrUpdateTileOverlay(map, res, { kind: "gsd", runId, opacity, gsdMax: 0.1 });
-      }      // Aggregate statistics per polygon (update only the ones we computed)
+      }      
+      // Aggregate statistics per polygon - FIXED: Process ALL polygons that had tiles updated
       const aggregatedPerPolygon = new Map<string, {
         polygonId: string;
         gsdStats: GSDStats;
@@ -349,17 +395,35 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
         imageCount: number;
       }>();
 
-      perPolygonResults.forEach((tileStats: PolygonTileStats[], polygonId: string) => {
-        const polygon = allPolygons.find((p: any) => (p.id || 'unknown') === polygonId);
-        const areaAcres = polygon ? calculatePolygonAreaAcres(polygon.ring) : 0;
+      // Get all polygons that had any tile stats updated (not just target polygons)
+      const allUpdatedPolygonIds = new Set<string>();
+      perPolygonResults.forEach((_, polygonId) => allUpdatedPolygonIds.add(polygonId));
+      
+      // Also include any polygons that were updated in the cache during this run
+      perPolyTileStatsRef.current.forEach((_, polygonId) => {
+        if (allPolygons.some((p: any) => (p.id || 'unknown') === polygonId)) {
+          allUpdatedPolygonIds.add(polygonId);
+        }
+      });
 
-        // Aggregate GSD stats across all tiles for this polygon
-        const allGsdStats = tileStats.map((ts: PolygonTileStats) => ts.gsdStats).filter(Boolean);
+      // Re-aggregate stats for all affected polygons using the complete tile cache
+      allUpdatedPolygonIds.forEach(polygonId => {
+        const polygon = allPolygons.find((p: any) => (p.id || 'unknown') === polygonId);
+        if (!polygon) return;
+        
+        const areaAcres = calculatePolygonAreaAcres(polygon.ring);
+
+        // Get all tile stats for this polygon from the cache
+        const polygonTileStatsMap = perPolyTileStatsRef.current.get(polygonId);
+        if (!polygonTileStatsMap || polygonTileStatsMap.size === 0) return;
+        
+        const allTileStats = Array.from(polygonTileStatsMap.values());
+        const allGsdStats = allTileStats.map(ts => ts.gsdStats).filter(Boolean);
         const aggregatedGsdStats = aggregateGSDStats(allGsdStats);
 
         // Count unique poses (images) that hit this polygon
         const uniquePoseIds = new Set<number>();
-        for (const ts of tileStats) {
+        for (const ts of allTileStats) {
           for (let i = 0; i < ts.hitPoseIds.length; i++) {
             uniquePoseIds.add(ts.hitPoseIds[i]);
           }
@@ -521,73 +585,83 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
       {/* Per-Polygon Statistics */}
       {perPolygonStats.size > 0 && (
         <div className="space-y-2">
-          {Array.from(perPolygonStats.entries()).map(([polygonId, stats]) => (
-            <Card key={polygonId} className="mt-2">
-              <CardHeader className="pb-3">
-                <CardTitle className="text-sm flex items-center gap-2">
-                  Polygon Analysis
-                  <Badge variant="secondary" className="text-xs">
-                    {polygonId || 'unknown'}
-                  </Badge>
-                </CardTitle>
-                <CardDescription className="text-xs">
-                  Area: {stats.areaAcres.toFixed(2)} acres • Images: {stats.imageCount} • Pixels: {stats.gsdStats.count.toLocaleString()}
-                </CardDescription>
-              </CardHeader>
-              <CardContent className="space-y-4">
-                {/* Summary Statistics */}
-                <div className="grid grid-cols-3 gap-4 text-xs">
-                  <div className="text-center">
-                    <div className="font-medium text-green-600">{(stats.gsdStats.min * 100).toFixed(1)} cm</div>
-                    <div className="text-gray-500">Min GSD</div>
+          {Array.from(perPolygonStats.entries()).map(([polygonId, stats]) => {
+            const { displayName, shortId } = getPolygonDisplayName(polygonId);
+            
+            return (
+              <Card 
+                key={polygonId} 
+                className="mt-2 cursor-pointer hover:shadow-md transition-shadow border-l-4 border-l-blue-500" 
+                onClick={() => highlightPolygon(polygonId)}
+              >
+                <CardHeader className="pb-3">
+                  <CardTitle className="text-sm flex items-center gap-2">
+                    <span>{displayName}</span>
+                    <Badge variant="secondary" className="text-xs font-mono">
+                      #{shortId}
+                    </Badge>
+                  </CardTitle>
+                  <CardDescription className="text-xs">
+                    Area: {stats.areaAcres.toFixed(2)} acres • Images: {stats.imageCount} • Pixels: {stats.gsdStats.count.toLocaleString()}
+                    <br />
+                    <span className="text-blue-600">Click to view on map</span>
+                  </CardDescription>
+                </CardHeader>
+                <CardContent className="space-y-4">
+                  {/* Summary Statistics */}
+                  <div className="grid grid-cols-3 gap-4 text-xs">
+                    <div className="text-center">
+                      <div className="font-medium text-green-600">{(stats.gsdStats.min * 100).toFixed(1)} cm</div>
+                      <div className="text-gray-500">Min GSD</div>
+                    </div>
+                    <div className="text-center">
+                      <div className="font-medium text-blue-600">{(stats.gsdStats.mean * 100).toFixed(1)} cm</div>
+                      <div className="text-gray-500">Mean GSD</div>
+                    </div>
+                    <div className="text-center">
+                      <div className="font-medium text-red-600">{(stats.gsdStats.max * 100).toFixed(1)} cm</div>
+                      <div className="text-gray-500">Max GSD</div>
+                    </div>
                   </div>
-                  <div className="text-center">
-                    <div className="font-medium text-blue-600">{(stats.gsdStats.mean * 100).toFixed(1)} cm</div>
-                    <div className="text-gray-500">Mean GSD</div>
-                  </div>
-                  <div className="text-center">
-                    <div className="font-medium text-red-600">{(stats.gsdStats.max * 100).toFixed(1)} cm</div>
-                    <div className="text-gray-500">Max GSD</div>
-                  </div>
-                </div>
 
-                {/* Histogram */}
-                <div className="h-48">
-                  <ResponsiveContainer width="100%" height="100%">
-                    <BarChart data={stats.gsdStats.histogram.map(bin => ({
-                      gsd: (bin.bin * 100).toFixed(1),
-                      count: bin.count,
-                      gsdValue: bin.bin
-                    }))}>
-                      <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
-                      <XAxis 
-                        dataKey="gsd" 
-                        tick={{ fontSize: 10 }}
-                        label={{ value: 'GSD (cm)', position: 'insideBottom', offset: -5, style: { fontSize: '10px' } }}
-                      />
-                      <YAxis 
-                        tick={{ fontSize: 10 }}
-                        label={{ value: 'Pixel Count', angle: -90, position: 'insideLeft', style: { fontSize: '10px' } }}
-                      />
-                      <Tooltip 
-                        formatter={(value, name) => [value?.toLocaleString(), 'Pixels']}
-                        labelFormatter={(label) => `GSD: ${label} cm`}
-                        labelStyle={{ fontSize: '11px' }}
-                        contentStyle={{ fontSize: '11px' }}
-                      />
-                      <Bar 
-                        dataKey="count" 
-                        fill="#8b5cf6" 
-                        stroke="#7c3aed"
-                        strokeWidth={0.5}
-                        radius={[1, 1, 0, 0]}
-                      />
-                    </BarChart>
-                  </ResponsiveContainer>
-                </div>
-              </CardContent>
-            </Card>
-          ))}
+                  {/* Histogram */}
+                  <div className="h-48">
+                    <ResponsiveContainer width="100%" height="100%">
+                      <BarChart data={stats.gsdStats.histogram.map(bin => ({
+                        gsd: (bin.bin * 100).toFixed(1),
+                        count: bin.count,
+                        gsdValue: bin.bin
+                      }))}>
+                        <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
+                        <XAxis 
+                          dataKey="gsd" 
+                          tick={{ fontSize: 10 }}
+                          label={{ value: 'GSD (cm)', position: 'insideBottom', offset: -5, style: { fontSize: '10px' } }}
+                        />
+                        <YAxis 
+                          tick={{ fontSize: 10 }}
+                          label={{ value: 'Pixel Count', angle: -90, position: 'insideLeft', style: { fontSize: '10px' } }}
+                        />
+                        <Tooltip 
+                          formatter={(value, name) => [value?.toLocaleString(), 'Pixels']}
+                          labelFormatter={(label) => `GSD: ${label} cm`}
+                          labelStyle={{ fontSize: '11px' }}
+                          contentStyle={{ fontSize: '11px' }}
+                        />
+                        <Bar 
+                          dataKey="count" 
+                          fill="#8b5cf6" 
+                          stroke="#7c3aed"
+                          strokeWidth={0.5}
+                          radius={[1, 1, 0, 0]}
+                        />
+                      </BarChart>
+                    </ResponsiveContainer>
+                  </div>
+                </CardContent>
+              </Card>
+            );
+          })}
         </div>
       )}
 
