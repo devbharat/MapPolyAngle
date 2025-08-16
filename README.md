@@ -4,10 +4,13 @@
 
 A sophisticated web application for drone flight planning that analyzes terrain topography to determine optimal flight directions and provides comprehensive Ground Sample Distance (GSD) analysis with visual overlap heatmaps.
 
+🚀 **[Try the Live Demo](https://map-poly-angle.vercel.app)** 🚀
+
 ![Flight Plan Analyser](https://img.shields.io/badge/version-1.0.0-blue.svg)
 ![React](https://img.shields.io/badge/React-18.3.1-61dafb.svg)
 ![TypeScript](https://img.shields.io/badge/TypeScript-5.6.3-3178c6.svg)
 ![Mapbox](https://img.shields.io/badge/Mapbox-GL_JS-000000.svg)
+![Live Demo](https://img.shields.io/badge/Live_Demo-Vercel-000000.svg)
 
 ## 🌟 Features
 
@@ -314,8 +317,8 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 🔗 Links
 
+- **Live Demo**: [map-poly-angle.vercel.app](https://map-poly-angle.vercel.app)
 - **Documentation**: [docs.example.com](https://docs.example.com)
-- **Demo**: [demo.flightplan.app](https://demo.flightplan.app)
 - **Issues**: [GitHub Issues](https://github.com/devbharat/MapPolyAngle/issues)
 - **Discussions**: [GitHub Discussions](https://github.com/devbharat/MapPolyAngle/discussions)
 
