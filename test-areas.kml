@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+  <Document>
+    <name>Test Survey Areas</name>
+    <description>Sample KML for testing flight planning with auto-pan</description>
+    
+    <Placemark>
+      <name>Test Area 1 - Central</name>
+      <description>A sample rectangular area for drone survey</description>
+      <Polygon>
+        <outerBoundaryIs>
+          <LinearRing>
+            <coordinates>
+              8.540,47.370,0
+              8.545,47.370,0
+              8.545,47.375,0
+              8.540,47.375,0
+              8.540,47.370,0
+            </coordinates>
+          </LinearRing>
+        </outerBoundaryIs>
+      </Polygon>
+    </Placemark>
+    
+    <Placemark>
+      <name>Test Area 2 - North</name>
+      <description>Northern area to test auto-pan bounds</description>
+      <Polygon>
+        <outerBoundaryIs>
+          <LinearRing>
+            <coordinates>
+              8.535,47.380,0
+              8.540,47.380,0
+              8.540,47.385,0
+              8.535,47.385,0
+              8.535,47.380,0
+            </coordinates>
+          </LinearRing>
+        </outerBoundaryIs>
+      </Polygon>
+    </Placemark>
+    
+    <Placemark>
+      <name>Test Area 3 - South</name>
+      <description>Southern area to test bounds calculation</description>
+      <Polygon>
+        <outerBoundaryIs>
+          <LinearRing>
+            <coordinates>
+              8.550,47.360,0
+              8.555,47.360,0
+              8.555,47.365,0
+              8.550,47.365,0
+              8.550,47.360,0
+            </coordinates>
+          </LinearRing>
+        </outerBoundaryIs>
+      </Polygon>
+    </Placemark>
+    
+  </Document>
+</kml>
