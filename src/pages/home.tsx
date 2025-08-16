@@ -5,7 +5,7 @@ import { Card, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { LoadingSpinner } from '@/components/ui/loading-spinner';
 import { useIsMobile } from '@/hooks/use-mobile';
-import { Map, Trash2, CheckCircle, AlertCircle, TrendingUp, Target, X } from 'lucide-react';
+import { Map, Trash2, CheckCircle, AlertCircle, TrendingUp, Target, X, Upload } from 'lucide-react';
 import OverlapGSDPanel from "@/components/OverlapGSDPanel";
 import PolygonParamsDialog from "@/components/PolygonParamsDialog";
 import type { PolygonParams } from '@/components/MapFlightDirection/types';
@@ -210,10 +210,16 @@ export default function Home() {
             <CardContent className="p-3">
               <div className="flex items-center justify-between mb-2">
                 <h3 className="font-medium text-gray-900">Analysis Results</h3>
-                <Button size="sm" variant="outline" onClick={clearAllDrawings}>
-                  <Trash2 className="w-3 h-3 mr-1" />
-                  Clear All
-                </Button>
+                <div className="flex gap-2">
+                  <Button size="sm" variant="outline" onClick={() => mapRef.current?.openKmlFilePicker?.()}>
+                    <Upload className="w-3 h-3 mr-1" />
+                    Import KML
+                  </Button>
+                  <Button size="sm" variant="outline" onClick={clearAllDrawings}>
+                    <Trash2 className="w-3 h-3 mr-1" />
+                    Clear All
+                  </Button>
+                </div>
               </div>
               
               {isAnalyzing && (
