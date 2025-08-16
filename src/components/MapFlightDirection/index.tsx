@@ -18,8 +18,17 @@ import { useMapInitialization } from './hooks/useMapInitialization';
 import { usePolygonAnalysis } from './hooks/usePolygonAnalysis';
 import { addFlightLinesForPolygon, removeFlightLinesForPolygon, addTriggerPointsForPolygon, removeTriggerPointsForPolygon } from './utils/mapbox-layers';
 import { update3DPathLayer, remove3DPathLayer, update3DCameraPointsLayer, remove3DCameraPointsLayer } from './utils/deckgl-layers';
-import { build3DFlightPath } from './utils/geometry';
-import { PolygonAnalysisResult } from './types';
+import { build3DFlightPath, calculateFlightLineSpacing } from './utils/geometry';
+import { PolygonAnalysisResult, PolygonParams } from './types';
+
+/** Default camera identical to the one in OverlapGSDPanel */
+const DEFAULT_CAMERA = {
+  f_m: 0.035,
+  sx_m: 4.88e-6,
+  sy_m: 4.88e-6,
+  w_px: 7952,
+  h_px: 5304
+};
 
 interface Props {
   mapboxToken: string;
@@ -27,14 +36,15 @@ interface Props {
   zoom?: number;
   terrainZoom?: number;
   sampleStep?: number;
-  lineSpacing?: number; // Flight line spacing in meters (default: 100)
-  photoSpacing?: number; // Trigger distance in meters
-  baseAltitudeAGL?: number; // AGL used to lift path above terrain
+
+  /** Called after terrain direction is known, but before lines are drawn. */
+  onRequestParams?: (polygonId: string, ring: [number, number][]) => void;
+
   onAnalysisComplete?: (results: PolygonAnalysisResult[]) => void;
   onAnalysisStart?: (polygonId: string) => void;
   onError?: (error: string, polygonId?: string) => void;
-  onFlightLinesUpdated?: (changed: string | '__all__') => void; // polygon-scoped
-  onClearGSD?: () => void; // NEW: Called to clear GSD overlays when polygons are deleted
+  onFlightLinesUpdated?: (changed: string | '__all__') => void;
+  onClearGSD?: () => void;
 }
 
 export const MapFlightDirection = React.forwardRef<
@@ -46,10 +56,15 @@ export const MapFlightDirection = React.forwardRef<
     getMap: () => MapboxMap | undefined;
     getPolygons: () => [number,number][][];
     getPolygonsWithIds: () => { id?: string; ring: [number, number][] }[];
-    getFlightLines: () => Map<string, { flightLines: number[][][]; lineSpacing: number }>;
+    /** Now includes altitudeAGL used for the 3D path. */
+    getFlightLines: () => Map<string, { flightLines: number[][][]; lineSpacing: number; altitudeAGL: number }>;
     getPolygonTiles: () => Map<string, any[]>;
     addCameraPoints: (polygonId: string, positions: [number, number, number][]) => void;
     removeCameraPoints: (polygonId: string) => void;
+    /** Apply per‑polygon params → draw lines + 3D path and notify downstream. */
+    applyPolygonParams: (polygonId: string, params: PolygonParams) => void;
+    /** Expose current per‑polygon params map to other panels if needed. */
+    getPerPolygonParams: () => Record<string, PolygonParams>;
   },
   Props
 >(
@@ -60,9 +75,7 @@ export const MapFlightDirection = React.forwardRef<
       zoom = 13,
       terrainZoom = 12,
       sampleStep = 2,
-      lineSpacing = 100,
-      photoSpacing = 60,
-      baseAltitudeAGL = 100,
+      onRequestParams,
       onAnalysisComplete,
       onAnalysisStart,
       onError,
@@ -78,30 +91,45 @@ export const MapFlightDirection = React.forwardRef<
 
     const [polygonResults, setPolygonResults] = useState<Map<string, PolygonAnalysisResult>>(new Map());
     const [polygonTiles, setPolygonTiles] = useState<Map<string, any[]>>(new Map());
-    const [polygonFlightLines, setPolygonFlightLines] = useState<Map<string, { flightLines: number[][][]; lineSpacing: number }>>(new Map());
+    
+    /** Flight lines + spacing + altitude actually used to build 3D path. */
+    const [polygonFlightLines, setPolygonFlightLines] = useState<
+      Map<string, { flightLines: number[][][]; lineSpacing: number; altitudeAGL: number }>
+    >(new Map());
+
+    /** Per‑polygon parameters provided by user via dialog. */
+    const [polygonParams, setPolygonParams] = useState<Map<string, PolygonParams>>(new Map());
+
     const [deckLayers, setDeckLayers] = useState<any[]>([]);
 
     const handleAnalysisResult = useCallback(
       (result: PolygonAnalysisResult, tiles: any[]) => {
-        console.log('Analysis completed, adding flight lines and 3D paths...', result);
-        
+        // Store analysis + tiles regardless of params (we need direction later)
         setPolygonResults((prev) => {
-          const newResults = new Map(prev);
-          newResults.set(result.polygonId, result);
-          onAnalysisComplete?.(Array.from(newResults.values()));
-          return newResults;
+          const next = new Map(prev);
+          next.set(result.polygonId, result);
+          onAnalysisComplete?.(Array.from(next.values()));
+          return next;
         });
 
-        // Store tiles for this polygon
         setPolygonTiles((prev) => {
-          const newTiles = new Map(prev);
-          newTiles.set(result.polygonId, tiles);
-          return newTiles;
+          const next = new Map(prev);
+          next.set(result.polygonId, tiles);
+          return next;
         });
+
+        // If params exist → we can immediately build lines/path
+        const params = polygonParams.get(result.polygonId);
+        if (!params) {
+          // Ask parent to prompt user for this polygon
+          onRequestParams?.(result.polygonId, result.polygon.coordinates);
+          return;
+        }
 
         if (mapRef.current) {
-          console.log('Adding flight lines...');
-          const flightLinesResult = addFlightLinesForPolygon(
+          const lineSpacing = calculateFlightLineSpacing(DEFAULT_CAMERA, params.altitudeAGL, params.sideOverlap);
+
+          const lines = addFlightLinesForPolygon(
             mapRef.current,
             result.polygonId,
             result.polygon.coordinates,
@@ -109,33 +137,22 @@ export const MapFlightDirection = React.forwardRef<
             lineSpacing,
             result.result.fitQuality
           );
-          console.log(`Added ${flightLinesResult.flightLines.length} flight lines with ${flightLinesResult.lineSpacing}m spacing`);
 
-          // Store flight lines for access by other components
           setPolygonFlightLines((prev) => {
-            const newFlightLines = new Map(prev);
-            newFlightLines.set(result.polygonId, flightLinesResult);
-            return newFlightLines;
+            const next = new Map(prev);
+            next.set(result.polygonId, { ...lines, altitudeAGL: params.altitudeAGL });
+            return next;
           });
 
-          // Notify ONLY this polygon changed (so downstream recomputes just this one)
           onFlightLinesUpdated?.(result.polygonId);
 
-          if (result.result.maxElevation !== undefined && flightLinesResult.flightLines.length > 0 && deckOverlayRef.current) {
-            console.log('Building 3D flight path...');
-            const path3d = build3DFlightPath(
-              flightLinesResult.flightLines,
-              tiles,
-              flightLinesResult.lineSpacing,
-              baseAltitudeAGL
-            );
-            console.log('3D path built, updating layer...');
+          if (deckOverlayRef.current && lines.flightLines.length > 0) {
+            const path3d = build3DFlightPath(lines.flightLines, tiles, lines.lineSpacing, params.altitudeAGL);
             update3DPathLayer(deckOverlayRef.current, result.polygonId, path3d, setDeckLayers);
-            console.log('3D layer updated');
           }
         }
       },
-      [onAnalysisComplete, lineSpacing, baseAltitudeAGL, onFlightLinesUpdated]
+      [onAnalysisComplete, onFlightLinesUpdated, polygonParams, onRequestParams]
     );
 
     const memoizedOnAnalysisStart = useCallback((polygonId: string) => {
@@ -200,6 +217,11 @@ export const MapFlightDirection = React.forwardRef<
             newTiles.delete(polygonId);
             return newTiles;
           });
+          setPolygonParams((prev) => {
+            const next = new Map(prev);
+            next.delete(polygonId);
+            return next;
+          });
           
           // Clear GSD overlays and camera positions
           onClearGSD?.();
@@ -227,6 +249,49 @@ export const MapFlightDirection = React.forwardRef<
       onLoad: onMapLoad,
       onError: memoizedOnError,
     });
+
+    // ————————————————————————————————————————————————
+    // Imperative API (used by Home/Dialogs)
+    // ————————————————————————————————————————————————
+    const applyPolygonParams = useCallback((polygonId: string, params: PolygonParams) => {
+      // Store params
+      setPolygonParams((prev) => {
+        const next = new Map(prev);
+        next.set(polygonId, params);
+        return next;
+      });
+
+      // If we already have analysis + tiles → build lines & path now
+      const res = polygonResults.get(polygonId);
+      const tiles = polygonTiles.get(polygonId) || [];
+      if (!res || !mapRef.current) return;
+
+      const lineSpacing = calculateFlightLineSpacing(DEFAULT_CAMERA, params.altitudeAGL, params.sideOverlap);
+
+      // Rebuild lines & path for this polygon
+      removeFlightLinesForPolygon(mapRef.current, polygonId);
+      const fl = addFlightLinesForPolygon(
+        mapRef.current,
+        polygonId,
+        res.polygon.coordinates,
+        res.result.contourDirDeg,
+        lineSpacing,
+        res.result.fitQuality
+      );
+
+      setPolygonFlightLines((prev) => {
+        const next = new Map(prev);
+        next.set(polygonId, { ...fl, altitudeAGL: params.altitudeAGL });
+        return next;
+      });
+
+      onFlightLinesUpdated?.(polygonId);
+
+      if (deckOverlayRef.current && fl.flightLines.length > 0) {
+        const path3d = build3DFlightPath(fl.flightLines, tiles, fl.lineSpacing, params.altitudeAGL);
+        update3DPathLayer(deckOverlayRef.current, polygonId, path3d, setDeckLayers);
+      }
+    }, [polygonResults, polygonTiles, onFlightLinesUpdated]);
 
     useImperativeHandle(ref, () => ({
       clearAllDrawings: () => {
@@ -298,59 +363,9 @@ export const MapFlightDirection = React.forwardRef<
           remove3DCameraPointsLayer(deckOverlayRef.current, polygonId, setDeckLayers);
         }
       },
-    }), [polygonResults, polygonFlightLines, polygonTiles, cancelAllAnalyses]);
-
-    // Keep latest maps in refs so we don't re-run this effect when polygons change
-    const polygonResultsRef = useRef(polygonResults);
-    React.useEffect(() => { polygonResultsRef.current = polygonResults; }, [polygonResults]);
-    const polygonTilesRef = useRef(polygonTiles);
-    React.useEffect(() => { polygonTilesRef.current = polygonTiles; }, [polygonTiles]);
-
-    // 🔁 Re‑apply flight lines and 3D path ONLY when spacing/altitude change
-    React.useEffect(() => {
-      const map = mapRef.current;
-      const overlay = deckOverlayRef.current;
-      if (!map || !overlay) return;
-      if (!map.isStyleLoaded()) return; // Wait for map to be fully ready
-      if (polygonResultsRef.current.size === 0) return;
-
-      const newFlightLines = new Map<string, { flightLines: number[][][]; lineSpacing: number }>();
-
-      polygonResultsRef.current.forEach((res, polygonId) => {
-        // Rebuild lines with new spacing
-        removeFlightLinesForPolygon(map, polygonId);
-        const fl = addFlightLinesForPolygon(
-          map,
-          polygonId,
-          res.polygon.coordinates,
-          res.result.contourDirDeg,
-          lineSpacing,
-          res.result.fitQuality
-        );
-        newFlightLines.set(polygonId, fl);
-
-        // Rebuild 3D path with current altitude
-        const tiles = polygonTilesRef.current.get(polygonId) || [];
-        if (tiles.length > 0 && fl.flightLines.length > 0) {
-          const path3d = build3DFlightPath(fl.flightLines, tiles, fl.lineSpacing, baseAltitudeAGL);
-          update3DPathLayer(overlay, polygonId, path3d, setDeckLayers);
-        }
-
-        // Update trigger tick marks on 2D lines
-        removeTriggerPointsForPolygon(map, polygonId);
-        // Commented out: trigger points removed per user request
-        // if (fl.flightLines.length > 0 && photoSpacing > 0) {
-        //   addTriggerPointsForPolygon(map, polygonId, fl.flightLines, photoSpacing);
-        // }
-      });
-
-      setPolygonFlightLines(newFlightLines);
-      
-      // Notify spacing/alt change → downstream should recompute ALL polygons
-      if (newFlightLines.size > 0) {
-        onFlightLinesUpdated?.('__all__');
-      }
-    }, [lineSpacing, photoSpacing, baseAltitudeAGL, onFlightLinesUpdated]);
+      applyPolygonParams,
+      getPerPolygonParams: () => Object.fromEntries(polygonParams),
+    }), [polygonResults, polygonFlightLines, polygonTiles, cancelAllAnalyses, applyPolygonParams, polygonParams]);
 
     return <div ref={mapContainer} style={{ position: 'relative', width: '100%', height: '100%' }} />;
   }

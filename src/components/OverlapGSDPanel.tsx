@@ -10,14 +10,12 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Badge } from "@/components/ui/badge";
 
 type Props = {
-  // Ref to MapFlightDirection (must expose getMap() and getPolygons())
   mapRef: React.RefObject<any>;
   mapboxToken: string;
-  onLineSpacingChange?: (lineSpacing: number) => void;
-  onPhotoSpacingChange?: (photoSpacing: number) => void;
-  onAltitudeChange?: (altitudeAGL: number) => void;
+  /** Provide per‑polygon params (altitude/front/side) so we can compute per‑polygon photoSpacing. */
+  getPerPolygonParams?: () => Record<string, { altitudeAGL: number; frontOverlap: number; sideOverlap: number }>;
   onAutoRun?: (autoRunFn: (opts?: { polygonId?: string; reason?: 'lines'|'spacing'|'alt'|'manual' }) => void) => void;
-  onClearExposed?: (clearFn: () => void) => void; // NEW: Callback to provide clear function
+  onClearExposed?: (clearFn: () => void) => void;
 };
 
 // Sony RX1R II camera specifications
@@ -54,7 +52,7 @@ function calculatePolygonAreaAcres(ring: [number, number][]): number {
   return areaSquareMeters / 4046.86;
 }
 
-export function OverlapGSDPanel({ mapRef, mapboxToken, onLineSpacingChange, onPhotoSpacingChange, onAltitudeChange, onAutoRun, onClearExposed }: Props) {
+export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAutoRun, onClearExposed }: Props) {
   const [cameraText, setCameraText] = useState(JSON.stringify(sonyRX1R2Camera, null, 2));
   const [altitude, setAltitude] = useState(100); // AGL in meters
   const [frontOverlap, setFrontOverlap] = useState(80); // percentage
@@ -83,6 +81,14 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, onLineSpacingChange, onPh
   const parseCamera = useCallback((): CameraModel | null => {
     try { return JSON.parse(cameraText); } catch { return null; }
   }, [cameraText]);
+
+  // Helper: per‑polygon spacing from camera + altitude/front
+  const photoSpacingFor = useCallback((altitudeAGL: number, frontOverlap: number): number => {
+    const camera = parseCamera();
+    if (!camera) return 60;
+    const groundHeight = (camera.h_px * camera.sy_m * altitudeAGL) / camera.f_m;
+    return groundHeight * (1 - frontOverlap / 100);
+  }, [parseCamera]);
 
   // Function to aggregate GSD statistics from multiple tiles
   const aggregateGSDStats = useCallback((tileStats: GSDStats[]): GSDStats => {
@@ -165,64 +171,48 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, onLineSpacingChange, onPh
 
   const { photoSpacing, lineSpacing } = calculateFlightParameters();
 
-  // Notify parent when line spacing changes
-  React.useEffect(() => {
-    onLineSpacingChange?.(lineSpacing);
-  }, [lineSpacing, onLineSpacingChange]);
-
-  // Propagate photo spacing and altitude up so the map can render trigger ticks & 3D height
-  React.useEffect(() => {
-    onPhotoSpacingChange?.(photoSpacing);
-  }, [photoSpacing, onPhotoSpacingChange]);
-
-  React.useEffect(() => {
-    onAltitudeChange?.(altitude);
-  }, [altitude, onAltitudeChange]);
-
   // Generate poses from existing flight lines using 3D paths
   const generatePosesFromFlightLines = useCallback((): PoseMeters[] => {
     const api = mapRef.current;
     if (!api?.getFlightLines || !api?.getPolygonTiles) return [];
-    
+    const paramsMap = getPerPolygonParams?.() ?? {};
+
     const flightLinesMap = api.getFlightLines();
     const tilesMap = api.getPolygonTiles();
     const poses: PoseMeters[] = [];
     let poseId = 0;
 
-    // Process each polygon's flight lines using 3D paths
-    for (const [polygonId, { flightLines, lineSpacing }] of flightLinesMap) {
+    for (const [polygonId, { flightLines, lineSpacing, altitudeAGL }] of flightLinesMap) {
       const tiles = tilesMap.get(polygonId) || [];
-      
       if (flightLines.length === 0 || tiles.length === 0) continue;
-      
-      // Use the same 3D flight path building logic as the visualization
+
+      // Use altitude from params map if present, otherwise fall back to what the 3D path used
+      const p = paramsMap[polygonId];
+      const altForThisPoly = p?.altitudeAGL ?? altitudeAGL ?? 100;
+      const photoSpacing = photoSpacingFor(altForThisPoly, p?.frontOverlap ?? 80);
+
       const path3D = build3DFlightPath(
-        flightLines, 
-        tiles, 
-        lineSpacing, 
-        altitude  // height above ground (AGL)
+        flightLines,
+        tiles,
+        lineSpacing,
+        altForThisPoly
       );
-      
-      // Sample camera positions along the 3D flight path
+
       const cameraPositions = sampleCameraPositionsOnFlightPath(path3D, photoSpacing);
-      
-      // Convert to poses format
+
       cameraPositions.forEach(([lng, lat, altMSL, yawDeg]) => {
-        // Convert to EPSG:3857 meters
         const [x, y] = lngLatToMeters(lng, lat);
-        
         poses.push({
           id: `photo_${poseId++}`,
-          x, y, z: altMSL,  // altitude is already MSL from the 3D flight path
-          omega_deg: 0,     // level (nadir)
-          phi_deg: 0,       // level (nadir) 
-          kappa_deg: yawDeg // flight direction yaw with no sideslip
+          x, y, z: altMSL,
+          omega_deg: 0,
+          phi_deg: 0,
+          kappa_deg: yawDeg
         });
       });
     }
-    
     return poses;
-  }, [mapRef, altitude, photoSpacing]);
+  }, [getPerPolygonParams, mapRef, photoSpacingFor]);
 
   const parsePosesMeters = useCallback((): PoseMeters[] | null => {
     if (autoGenerate) {

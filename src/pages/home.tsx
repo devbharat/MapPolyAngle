@@ -1,31 +1,28 @@
 import React, { useState, useRef, useCallback, useMemo } from 'react';
 import { MapFlightDirection } from '@/components/MapFlightDirection';
 import { PolygonAnalysisResult } from '@/components/MapFlightDirection/types';
-import { AspectResult } from '@/utils/terrainAspectHybrid';
 import { Card, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { LoadingSpinner } from '@/components/ui/loading-spinner';
 import { useIsMobile } from '@/hooks/use-mobile';
 import { Map, Trash2, CheckCircle, AlertCircle, TrendingUp, Target, X } from 'lucide-react';
 import OverlapGSDPanel from "@/components/OverlapGSDPanel";
+import PolygonParamsDialog from "@/components/PolygonParamsDialog";
+import type { PolygonParams } from '@/components/MapFlightDirection/types';
 
 export default function Home() {
   const isMobile = useIsMobile();
-  const mapRef = useRef<any>(null); // Ref to access map methods
-  
-  // Updated state for multiple polygons
+  const mapRef = useRef<any>(null);
+
   const [polygonResults, setPolygonResults] = useState<PolygonAnalysisResult[]>([]);
   const [analyzingPolygons, setAnalyzingPolygons] = useState<Set<string>>(new Set());
-  
-  // Flight planning parameters
-  const [lineSpacing, setLineSpacing] = useState(100); // Default 100m spacing
-  const [photoSpacing, setPhotoSpacing] = useState(60); // derived from camera, altitude, front overlap
-  const [altitudeAGL, setAltitudeAGL] = useState(100);
-  
-  // Auto-run GSD analysis when flight lines are updated
+
+  // NEW: per‑polygon flight parameters
+  const [paramsByPolygon, setParamsByPolygon] = useState<Record<string, PolygonParams>>({});
+  const [paramsDialog, setParamsDialog] = useState<{ open: boolean; polygonId: string | null }>({ open: false, polygonId: null });
+
+  // Auto-run GSD analysis when flight lines are updated (already wired)
   const autoRunGSDRef = useRef<((opts?: { polygonId?: string; reason?: 'lines'|'spacing'|'alt'|'manual' }) => void) | null>(null);
-  
-  // Reference to clear function from OverlapGSDPanel
   const clearGSDRef = useRef<(() => void) | null>(null);
   
   const terrainZoom = 15; // This is now a fallback - actual zoom is calculated dynamically
@@ -60,18 +57,33 @@ export default function Home() {
     }
   }, []);
 
-  const handleLineSpacingChange = useCallback((newLineSpacing: number) => {
-    setLineSpacing(newLineSpacing);
+  // MapFlightDirection now calls us to request params per polygon
+  const handleRequestParams = useCallback((polygonId: string) => {
+    setParamsDialog({ open: true, polygonId });
   }, []);
 
-  // Handler for when flight lines are updated - automatically trigger GSD analysis
+  const handleApplyParams = useCallback((params: PolygonParams) => {
+    const polygonId = paramsDialog.polygonId!;
+    // Send params down to MapFlightDirection so it can draw lines + 3D path
+    mapRef.current?.applyPolygonParams?.(polygonId, params);
+    // Store for GSD per‑polygon camera sampling
+    setParamsByPolygon(prev => ({ ...prev, [polygonId]: params }));
+    setParamsDialog({ open: false, polygonId: null });
+  }, [paramsDialog.polygonId]);
+
+  const handleCloseParams = useCallback(() => {
+    setParamsDialog({ open: false, polygonId: null });
+  }, []);
+
+  const handleLineSpacingChange = useCallback((newLineSpacing: number) => {
+    // Remove old global line spacing handler - now per-polygon
+  }, []);
+
   const handleFlightLinesUpdated = useCallback((which: string | '__all__') => {
     if (!autoRunGSDRef.current) return;
     if (which === '__all__') {
-      // spacing / altitude changed → recompute everything
       autoRunGSDRef.current({ reason: 'spacing' });
     } else {
-      // a single polygon's flight lines changed → recompute only that polygon
       autoRunGSDRef.current({ polygonId: which, reason: 'lines' });
     }
   }, []);
@@ -88,17 +100,18 @@ export default function Home() {
   }, []);
 
   const clearAllDrawings = useCallback(() => {
-    if (mapRef.current?.clearAllDrawings) {
-      mapRef.current.clearAllDrawings();
-    }
+    mapRef.current?.clearAllDrawings?.();
     setPolygonResults([]);
     setAnalyzingPolygons(new Set());
+    setParamsByPolygon({});
   }, []);
 
   const clearSpecificPolygon = useCallback((polygonId: string) => {
-    if (mapRef.current?.clearPolygon) {
-      mapRef.current.clearPolygon(polygonId);
-    }
+    mapRef.current?.clearPolygon?.(polygonId);
+    setParamsByPolygon(prev => {
+      const { [polygonId]: removed, ...rest } = prev;
+      return rest;
+    });
   }, []);
 
   // Helper function to get quality indicator
@@ -175,6 +188,19 @@ export default function Home() {
       </header>
 
       <div className="flex-1 relative">
+        {/* PER‑POLYGON PARAMS DIALOG */}
+        <PolygonParamsDialog
+          open={paramsDialog.open}
+          polygonId={paramsDialog.polygonId}
+          onClose={handleCloseParams}
+          onSubmit={handleApplyParams}
+          defaults={{
+            altitudeAGL: paramsByPolygon[paramsDialog.polygonId || ""]?.altitudeAGL ?? 100,
+            frontOverlap: paramsByPolygon[paramsDialog.polygonId || ""]?.frontOverlap ?? 80,
+            sideOverlap: paramsByPolygon[paramsDialog.polygonId || ""]?.sideOverlap ?? 70,
+          }}
+        />
+
         {/* Right Side Panel - Combined Controls and Instructions - Hidden on mobile */}
         {!isMobile && (
           <div className="absolute top-2 right-2 z-40 w-80 max-h-[calc(100vh-120px)] overflow-y-auto">
@@ -350,9 +376,7 @@ export default function Home() {
                 <OverlapGSDPanel 
                   mapRef={mapRef} 
                   mapboxToken={mapboxToken} 
-                  onLineSpacingChange={handleLineSpacingChange}
-                  onPhotoSpacingChange={setPhotoSpacing}
-                  onAltitudeChange={setAltitudeAGL}
+                  getPerPolygonParams={() => paramsByPolygon}
                   onAutoRun={handleAutoRunReceived}
                   onClearExposed={handleClearReceived}
                 />
@@ -370,12 +394,10 @@ export default function Home() {
           zoom={initialZoom}
           terrainZoom={terrainZoom}
           sampleStep={sampleStep}
-          lineSpacing={lineSpacing}
-          photoSpacing={photoSpacing}
-          baseAltitudeAGL={altitudeAGL}
           onAnalysisStart={handleAnalysisStart}
           onAnalysisComplete={handleAnalysisComplete}
           onError={handleError}
+          onRequestParams={handleRequestParams}
           onFlightLinesUpdated={handleFlightLinesUpdated}
           onClearGSD={() => clearGSDRef.current?.()}
         />

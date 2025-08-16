@@ -15,3 +15,10 @@ export interface PolygonAnalysisResult {
   polygon: AspectPolygon;
   terrainZoom: number; // Track which zoom level was used
 }
+
+/** Per‑polygon flight planning parameters set by the user. */
+export interface PolygonParams {
+  altitudeAGL: number;   // meters above ground
+  frontOverlap: number;  // percent 0–95
+  sideOverlap: number;   // percent 0–95
+}
