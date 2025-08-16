@@ -8,6 +8,7 @@ import { sampleCameraPositionsOnFlightPath, build3DFlightPath } from "@/componen
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
+import { toast } from "@/hooks/use-toast";
 
 type Props = {
   mapRef: React.RefObject<any>;
@@ -31,25 +32,25 @@ const sonyRX1R2Camera: CameraModel = {
 function calculatePolygonAreaAcres(ring: [number, number][]): number {
   if (ring.length < 3) return 0;
   
-  // Use shoelace formula to calculate area in square degrees
-  let area = 0;
+  // Use spherical excess formula for accurate area calculation
+  // This is more accurate than the planar shoelace approximation, especially at scale
+  const R = 6371008.8; // mean Earth radius in meters
+  let sum = 0;
+  
   for (let i = 0; i < ring.length; i++) {
-    const j = (i + 1) % ring.length;
-    area += ring[i][0] * ring[j][1];
-    area -= ring[j][0] * ring[i][1];
+    const [λ1, φ1] = ring[i];
+    const [λ2, φ2] = ring[(i + 1) % ring.length];
+    const lon1 = λ1 * Math.PI / 180;
+    const lon2 = λ2 * Math.PI / 180;
+    const lat1 = φ1 * Math.PI / 180;
+    const lat2 = φ2 * Math.PI / 180;
+    sum += (lon2 - lon1) * (2 + Math.sin(lat1) + Math.sin(lat2));
   }
-  area = Math.abs(area) / 2;
   
-  // Convert from square degrees to square meters (approximate)
-  // This is a rough approximation - for precise calculations, use proper geodesic methods
-  const avgLat = ring.reduce((sum, point) => sum + point[1], 0) / ring.length;
-  const latRadians = avgLat * Math.PI / 180;
-  const metersPerDegreeLng = 111320 * Math.cos(latRadians);
-  const metersPerDegreeLat = 110540;
-  const areaSquareMeters = area * metersPerDegreeLng * metersPerDegreeLat;
+  const areaSquareMeters = Math.abs(sum) * R * R / 2;
   
-  // Convert to acres (1 acre = 4046.86 square meters)
-  return areaSquareMeters / 4046.86;
+  // Convert to acres (1 acre = 4046.8564224 square meters)
+  return areaSquareMeters / 4046.8564224;
 }
 
 export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAutoRun, onClearExposed }: Props) {
@@ -119,31 +120,28 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
     });
     const overallMean = totalCount > 0 ? totalSum / totalCount : 0;
 
-    // Aggregate histograms by creating new bins across the full range
+    // Improved histogram aggregation to avoid double-counting from overlapping bins
     const numBins = 20;
-    const binSize = (totalMax - totalMin) / numBins;
-    const histogram: { bin: number; count: number }[] = [];
-    
-    for (let i = 0; i < numBins; i++) {
-      const binStart = totalMin + i * binSize;
-      const binEnd = binStart + binSize;
-      const binCenter = binStart + binSize / 2;
+    const histogram: { bin: number; count: number }[] = Array.from({length: numBins}, (_, i) => ({
+      bin: totalMin + (i + 0.5) * (totalMax - totalMin) / numBins,
+      count: 0
+    }));
+
+    // Map each tile's histogram bins to the global binning scheme
+    for (const stat of validStats) {
+      if (stat.histogram.length === 0) continue;
       
-      // Sum counts from all tiles for this bin range
-      let binCount = 0;
-      validStats.forEach(stat => {
-        stat.histogram.forEach(bin => {
-          const binBinStart = bin.bin - (stat.max - stat.min) / (stat.histogram.length * 2);
-          const binBinEnd = bin.bin + (stat.max - stat.min) / (stat.histogram.length * 2);
-          
-          // Check if this histogram bin overlaps with our aggregated bin
-          if (binBinEnd > binStart && binBinStart < binEnd) {
-            binCount += bin.count;
-          }
-        });
-      });
+      const tileRange = stat.max - stat.min || 1;
+      const tileBinWidth = tileRange / stat.histogram.length;
       
-      histogram.push({ bin: binCenter, count: binCount });
+      for (const {bin, count} of stat.histogram) {
+        // Map this bin to the closest global bin
+        const globalIdx = Math.max(0, Math.min(
+          numBins - 1,
+          Math.floor((bin - totalMin) / (totalMax - totalMin) * numBins)
+        ));
+        histogram[globalIdx].count += count;
+      }
     }
 
     return {
@@ -244,12 +242,23 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
       : allPolygons;
 
     if (!camera || !poses || poses.length===0 || targetPolygons.length===0) {
-      alert("Please provide valid camera, poses, and draw at least one polygon.");
+      toast({ 
+        variant: "destructive", 
+        title: "Missing inputs", 
+        description: "Please provide valid camera, poses, and draw at least one polygon." 
+      });
       return;
     }
 
     const map: mapboxgl.Map | undefined = mapRef.current?.getMap?.();
-    if (!map) { alert("Map not ready."); return; }
+    if (!map || !map.isStyleLoaded?.()) {
+      toast({ 
+        variant: "destructive", 
+        title: "Map not ready", 
+        description: "Please wait for the map to load completely." 
+      });
+      return;
+    }
 
     // Option B: Use single global runId to avoid stacked overlays
     const now = Date.now();
@@ -291,6 +300,15 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
             data: new Uint8ClampedArray(imgData.data)
           };
           tileCacheRef.current.set(cacheKey, tileData);
+          
+          // Simple LRU: limit cache size to prevent unbounded memory growth
+          const MAX_TILES = 256;
+          if (tileCacheRef.current.size > MAX_TILES) {
+            const firstKey = tileCacheRef.current.keys().next().value;
+            if (firstKey) {
+              tileCacheRef.current.delete(firstKey);
+            }
+          }
         }
         
         // Create a fresh copy for the worker (since ArrayBuffers get transferred/detached)
@@ -355,23 +373,18 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
         });
       });
 
-      // Merge into state: only overwrite entries we just recomputed
+      // Update per‑polygon stats and recompute overall in one consistent step
       setPerPolygonStats(prev => {
         const next = new Map(prev);
         aggregatedPerPolygon.forEach((v, k) => next.set(k, v));
+        
+        // Recompute overall from the updated map to keep things consistent
+        const overall = aggregateGSDStats(
+          Array.from(next.values()).map(v => v.gsdStats)
+        );
+        setGsdStats(overall);
+        
         return next;
-      });
-
-      // Recompute "Overall" from the current perPolygonStats map (cheap and consistent)
-      setGsdStats(curr => {
-        const toAgg: GSDStats[] = [];
-        // include newly computed ones
-        aggregatedPerPolygon.forEach(v => toAgg.push(v.gsdStats));
-        // include existing ones we didn't touch
-        perPolygonStats.forEach((v, k) => {
-          if (!aggregatedPerPolygon.has(k)) toAgg.push(v.gsdStats);
-        });
-        return aggregateGSDStats(toAgg);
       });
 
       // Add camera position markers in 3D

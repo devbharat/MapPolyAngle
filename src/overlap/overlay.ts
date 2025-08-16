@@ -109,7 +109,7 @@ export function addOrUpdateTileOverlay(
     canvas = encodeGsdToImage(result.gsdMin, result.size, opts.gsdMax ?? 0.5);
   }
 
-  // Mapbox image source needs a URL; use data URL for the canvas
+  // Convert to data URL (required for Mapbox image source)
   const url = canvas.toDataURL("image/png");
 
   const exists = !!map.getSource(sourceId);
@@ -126,31 +126,61 @@ export function addOrUpdateTileOverlay(
       paint: { "raster-opacity": opts.opacity ?? 0.85 },
     });
   } else {
-    // Update by removing/adding (robust across versions)
-    if (map.getLayer(layerId)) map.removeLayer(layerId);
-    if (map.getSource(sourceId)) map.removeSource(sourceId);
-    map.addSource(sourceId, {
-      type: "image",
-      url,
-      coordinates: corners,
-    } as any);
-    map.addLayer({
-      id: layerId,
-      type: "raster",
-      source: sourceId,
-      paint: { "raster-opacity": opts.opacity ?? 0.85 },
-    });
+    // More efficient update: just update the source URL if possible
+    try {
+      const source: any = map.getSource(sourceId);
+      if (source && source.updateImage) {
+        source.updateImage({ url, coordinates: corners });
+      } else {
+        // Fallback to remove/add pattern for robustness
+        if (map.getLayer(layerId)) map.removeLayer(layerId);
+        if (map.getSource(sourceId)) map.removeSource(sourceId);
+        map.addSource(sourceId, {
+          type: "image",
+          url,
+          coordinates: corners,
+        } as any);
+        map.addLayer({
+          id: layerId,
+          type: "raster",
+          source: sourceId,
+          paint: { "raster-opacity": opts.opacity ?? 0.85 },
+        });
+      }
+    } catch (e) {
+      // Fallback to remove/add pattern for robustness
+      if (map.getLayer(layerId)) map.removeLayer(layerId);
+      if (map.getSource(sourceId)) map.removeSource(sourceId);
+      map.addSource(sourceId, {
+        type: "image",
+        url,
+        coordinates: corners,
+      } as any);
+      map.addLayer({
+        id: layerId,
+        type: "raster",
+        source: sourceId,
+        paint: { "raster-opacity": opts.opacity ?? 0.85 },
+      });
+    }
   }
 }
 
 export function clearRunOverlays(map: mapboxgl.Map, runId: string) {
+  if (!map.isStyleLoaded?.()) return;
+  
   const layers = map.getStyle().layers || [];
   for (const layer of layers) {
     const id = layer.id;
     if (id.startsWith(`ogsd-${runId}-`)) {
-      if (map.getLayer(id)) map.removeLayer(id);
-      const sourceId = id; // we used same id
-      if (map.getSource(sourceId)) map.removeSource(sourceId);
+      try {
+        if (map.getLayer(id)) map.removeLayer(id);
+        const sourceId = id; // we used same id
+        if (map.getSource(sourceId)) map.removeSource(sourceId);
+      } catch (e) {
+        // Silently handle removal errors in case of rapid style changes
+        console.warn(`Failed to remove overlay ${id}:`, e);
+      }
     }
   }
 }
