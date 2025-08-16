@@ -59,11 +59,20 @@ export default function PolygonParamsDialog({
           </label>
 
           <div className="flex gap-2 pt-1">
-            <Button size="sm" className="flex-1"
+            <Button
+              size="sm"
+              className="flex-1 min-w-0 h-8 px-2 text-xs"
               onClick={() => onSubmit({ altitudeAGL, frontOverlap, sideOverlap })}>
               Apply
             </Button>
-            <Button size="sm" variant="outline" onClick={onClose}>Cancel</Button>
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-8 px-2 text-xs whitespace-nowrap"
+              onClick={onClose}
+            >
+              Cancel
+            </Button>
           </div>
           <p className="text-[11px] text-gray-500">
             After applying, flight lines and GSD will run for this polygon only.

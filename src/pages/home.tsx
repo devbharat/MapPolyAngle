@@ -158,31 +158,41 @@ export default function Home() {
 
   return (
     <div className="h-screen flex flex-col bg-gray-50">
-      {/* Header */}
-      <header className="bg-white shadow-sm border-b border-gray-200 px-4 md:px-6 py-3 md:py-4 relative z-50">
+      {/* Header (compact) */}
+      <header className="bg-white/95 backdrop-blur border-b border-gray-200 px-3 md:px-4 py-2 z-50">
         <div className="flex items-center justify-between">
-          <div className="flex items-center space-x-2 md:space-x-3">
-            <div className="w-6 h-6 md:w-8 md:h-8 bg-blue-600 rounded-lg flex items-center justify-center">
-              <Map className="w-4 h-4 md:w-5 md:h-5 text-white" />
+          <div className="flex items-center gap-2">
+            <div className="w-7 h-7 bg-blue-600 rounded-md flex items-center justify-center">
+              <Map className="w-4 h-4 text-white" />
             </div>
-            <div>
-              <h1 className="text-base md:text-xl font-medium text-gray-900">Terrain Flight Director</h1>
-              <p className="text-xs md:text-sm text-gray-500 hidden sm:block">Multi-polygon 3D plane fitting for optimal flight paths</p>
+            <div className="leading-tight">
+              <h1 className="text-sm md:text-base font-semibold text-gray-900 tracking-tight">
+                Flight Plan Analyser
+              </h1>
+              <p className="hidden md:block text-[11px] text-gray-500">
+                Terrain‑aware line planning &amp; GSD
+              </p>
             </div>
           </div>
-          
-          <div className="flex items-center space-x-2 md:space-x-4">
-            <div className="hidden sm:flex items-center space-x-1 md:space-x-2 bg-green-100 text-green-700 px-2 md:px-3 py-1 rounded-full text-xs md:text-sm">
-              <div className="w-1.5 h-1.5 md:w-2 md:h-2 bg-green-500 rounded-full"></div>
-              <span className="hidden sm:inline">Connected to Mapbox</span>
-              <span className="sm:hidden">Connected</span>
-            </div>
-            {hasResults && (
-              <div className="hidden sm:flex items-center space-x-1 md:space-x-2 bg-blue-100 text-blue-700 px-2 md:px-3 py-1 rounded-full text-xs md:text-sm">
-                <span className="hidden sm:inline">{polygonResults.length} polygon{polygonResults.length !== 1 ? 's' : ''} analyzed</span>
-                <span className="sm:hidden">{polygonResults.length} poly</span>
-              </div>
-            )}
+          <div className="flex items-center gap-2">
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-8 px-2 whitespace-nowrap"
+              onClick={() => mapRef.current?.openKmlFilePicker?.()}
+            >
+              <Upload className="w-3 h-3 mr-1" />
+              Import KML
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-8 px-2 whitespace-nowrap"
+              onClick={clearAllDrawings}
+            >
+              <Trash2 className="w-3 h-3 mr-1" />
+              Clear All
+            </Button>
           </div>
         </div>
       </header>
@@ -209,17 +219,7 @@ export default function Home() {
           <Card className="backdrop-blur-md bg-white/95">
             <CardContent className="p-3">
               <div className="flex items-center justify-between mb-2">
-                <h3 className="font-medium text-gray-900">Analysis Results</h3>
-                <div className="flex gap-2">
-                  <Button size="sm" variant="outline" onClick={() => mapRef.current?.openKmlFilePicker?.()}>
-                    <Upload className="w-3 h-3 mr-1" />
-                    Import KML
-                  </Button>
-                  <Button size="sm" variant="outline" onClick={clearAllDrawings}>
-                    <Trash2 className="w-3 h-3 mr-1" />
-                    Clear All
-                  </Button>
-                </div>
+                <h3 className="text-sm font-medium text-gray-900">Analysis Results</h3>
               </div>
               
               {isAnalyzing && (

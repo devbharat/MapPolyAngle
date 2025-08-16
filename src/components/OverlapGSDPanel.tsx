@@ -705,12 +705,17 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
       </div>
 
       <div className="flex gap-2 items-center">
-        <button onClick={() => compute()} disabled={running}
-                className="px-3 py-1.5 rounded bg-blue-600 text-white text-sm disabled:opacity-50">
+        <button
+          onClick={() => compute()}
+          disabled={running}
+          className="h-8 px-2 rounded bg-blue-600 text-white text-xs disabled:opacity-50"
+        >
           {running ? "Computing…" : "Manual Compute"}
         </button>
-        <button onClick={clear}
-                className="px-3 py-1.5 rounded border text-sm">
+        <button
+          onClick={clear}
+          className="h-8 px-2 rounded border text-xs"
+        >
           Clear overlay
         </button>
       </div>
