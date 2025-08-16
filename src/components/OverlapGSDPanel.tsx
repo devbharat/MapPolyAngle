@@ -72,8 +72,10 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
     imageCount: number;
   }>>(new Map());
   
-  // RunId per polygon so we can clear/update only the changed polygon
-  const runIdByPolygonRef = useRef<Map<string,string>>(new Map());
+  // Single global runId to avoid stacked overlays - Option B improvement
+  const globalRunIdRef = useRef<string | null>(null);
+  // Per-polygon, per-tile stats cache for correct cross-polygon crediting - Option B core feature
+  const perPolyTileStatsRef = useRef<Map<string, Map<string, PolygonTileStats>>>(new Map());
   // Cache raw tile data (width, height, and cloned pixel data) to avoid ArrayBuffer transfer issues
   const tileCacheRef = useRef<Map<string, { width: number; height: number; data: Uint8ClampedArray }>>(new Map());
   const autoTriesRef = useRef(0);
@@ -249,23 +251,15 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
     const map: mapboxgl.Map | undefined = mapRef.current?.getMap?.();
     if (!map) { alert("Map not ready."); return; }
 
-    // Pick which runIds to clear/update
+    // Option B: Use single global runId to avoid stacked overlays
     const now = Date.now();
-    const runIdsToUse = new Map<string, string>();
-    if (opts?.polygonId) {
-      // Single polygon update
-      const old = runIdByPolygonRef.current.get(opts.polygonId);
-      if (old) clearRunOverlays(map, old);
-      const rid = `${now}-${opts.polygonId}`;
-      runIdByPolygonRef.current.set(opts.polygonId, rid);
-      runIdsToUse.set(opts.polygonId, rid);
-    } else {
-      // Full recompute
-      runIdByPolygonRef.current.forEach((rid) => clearRunOverlays(map, rid));
-      runIdByPolygonRef.current.clear();
-      // one synthetic run for the "all" case
-      runIdsToUse.set('__ALL__', `${now}-ALL`);
+    if (!opts?.polygonId) {
+      // Full recompute - clear existing overlays
+      if (globalRunIdRef.current) clearRunOverlays(map, globalRunIdRef.current);
+      globalRunIdRef.current = `${now}`;
     }
+    const runId = globalRunIdRef.current ?? `${now}`; // first run fallback
+    if (!globalRunIdRef.current) globalRunIdRef.current = runId;
 
     setRunning(true);
     autoTriesRef.current = 0; // Reset retry counter when starting computation
@@ -284,7 +278,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
 
       // Process tiles and collect per-polygon statistics (only for target polygons)
       const perPolygonResults = new Map<string, PolygonTileStats[]>();
-      
+
       for (const t of tiles) {
         const cacheKey = `${t.z}/${t.x}/${t.y}`;
         let tileData = tileCacheRef.current.get(cacheKey);
@@ -302,10 +296,21 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
         // Create a fresh copy for the worker (since ArrayBuffers get transferred/detached)
         const freshData = new Uint8ClampedArray(tileData.data);
         const tile = { z:t.z, x:t.x, y:t.y, size: tileData.width, data: freshData };
-        const polysForThisRun = opts?.polygonId ? targetPolygons : allPolygons;
-        const res = await worker.runTile({ tile, polygons: polysForThisRun, poses, camera } as any);
+        
+        // Option B: Always pass ALL polygons so worker can credit hits to every polygon in overlapping tiles
+        const res = await worker.runTile({ tile, polygons: allPolygons, poses, camera } as any);
 
-        // Group results by polygon ID
+        // Option B: Track per-polygon, per-tile stats for correct cross-crediting
+        if (res.perPolygon) {
+          for (const polyStats of res.perPolygon) {
+            if (!perPolyTileStatsRef.current.has(polyStats.polygonId)) {
+              perPolyTileStatsRef.current.set(polyStats.polygonId, new Map());
+            }
+            perPolyTileStatsRef.current.get(polyStats.polygonId)!.set(cacheKey, polyStats);
+          }
+        }
+
+        // Group results by polygon ID (for legacy aggregation logic)
         if (res.perPolygon) {
           for (const polyStats of res.perPolygon) {
             if (!perPolygonResults.has(polyStats.polygonId)) {
@@ -315,17 +320,10 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
           }
         }
 
-        // Decide which runId to use
-        const runId =
-          opts?.polygonId
-            ? (runIdsToUse.get(opts.polygonId) as string)
-            : (runIdsToUse.get('__ALL__') as string);
-
+        // Use single global runId for overlays
         if (showOverlap) addOrUpdateTileOverlay(map, res, { kind: "overlap", runId, opacity });
         if (showGsd) addOrUpdateTileOverlay(map, res, { kind: "gsd", runId, opacity, gsdMax: 0.1 });
-      }
-
-      // Aggregate statistics per polygon (update only the ones we computed)
+      }      // Aggregate statistics per polygon (update only the ones we computed)
       const aggregatedPerPolygon = new Map<string, {
         polygonId: string;
         gsdStats: GSDStats;
@@ -454,11 +452,17 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
   const clear = useCallback(() => {
     const map: any = mapRef.current?.getMap?.();
     if (map) {
-      // Clear overlays for all polygons
-      runIdByPolygonRef.current.forEach((rid) => {
-        clearRunOverlays(map, rid);
-      });
-      runIdByPolygonRef.current.clear();
+      // Clear overlays using the current global runId (if exists)
+      if (globalRunIdRef.current) {
+        clearRunOverlays(map, globalRunIdRef.current);
+      }
+      
+      // Clear all stats cache
+      perPolyTileStatsRef.current.clear();
+      
+      // Generate new global runId for next computation
+      const now = Date.now();
+      globalRunIdRef.current = `${now}`;
       
       // Clear camera positions using the new 3D camera point methods
       const api = mapRef.current;
