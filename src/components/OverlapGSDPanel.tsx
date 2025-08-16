@@ -214,7 +214,11 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
   const generatePosesFromFlightLines = useCallback((): PoseMeters[] => {
     const api = mapRef.current;
     if (!api?.getFlightLines || !api?.getPolygonTiles) return [];
-    const paramsMap = getPerPolygonParams?.() ?? {};
+
+    // MERGE: internal Map params (from importer / dialog) + external overrides from Home
+    const internalParams = api.getPerPolygonParams?.() ?? {};
+    const externalParams = getPerPolygonParams?.() ?? {};
+    const paramsMap = { ...internalParams, ...externalParams };
 
     const flightLinesMap = api.getFlightLines();
     const tilesMap = api.getPolygonTiles();
@@ -225,8 +229,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
       const tiles = tilesMap.get(polygonId) || [];
       if (flightLines.length === 0 || tiles.length === 0) continue;
 
-      // Use altitude from params map if present, otherwise fall back to what the 3D path used
-      const p = paramsMap[polygonId];
+      const p = (paramsMap as any)[polygonId];
       const altForThisPoly = p?.altitudeAGL ?? altitudeAGL ?? 100;
       const photoSpacing = photoSpacingFor(altForThisPoly, p?.frontOverlap ?? 80);
 

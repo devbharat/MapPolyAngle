@@ -15,6 +15,16 @@ export interface PolygonWithId {
   ring: [number, number][];
 }
 
+export interface ImportedFlightplanArea {
+  polygonId: string;
+  params: FlightParams & {
+    angleDeg: number;
+    lineSpacingM: number;
+    triggerDistanceM: number;
+    source: 'wingtra';
+  };
+}
+
 export interface MapFlightDirectionAPI {
   // Core map operations
   clearAllDrawings(): void;
@@ -44,4 +54,14 @@ export interface MapFlightDirectionAPI {
   // KML import
   openKmlFilePicker(): void;
   importKmlFromText(kml: string): Promise<{ added: number; total: number }>;
+
+  // Wingtra flightplan import
+  openFlightplanFilePicker(): void;
+  importWingtraFromText(json: string): Promise<{ added: number; total: number; areas: ImportedFlightplanArea[] }>;
+
+  // Overrides & optimization
+  optimizePolygonDirection(polygonId: string): void;                 // drop override → use terrain-optimal
+  revertPolygonToImportedDirection(polygonId: string): void;         // re-apply file heading/spacing
+  getBearingOverrides(): Record<string, { bearingDeg: number; lineSpacingM?: number; source: 'wingtra' | 'user' }>;
+  getImportedOriginals(): Record<string, { bearingDeg: number; lineSpacingM: number }>;
 }

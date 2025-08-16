@@ -22,6 +22,10 @@ export default function Home() {
   const [paramsByPolygon, setParamsByPolygon] = useState<Record<string, PolygonParams>>({});
   const [paramsDialog, setParamsDialog] = useState<{ open: boolean; polygonId: string | null }>({ open: false, polygonId: null });
 
+  // Imported/or override state (queried from Map component)
+  const [importedOriginals, setImportedOriginals] = useState<Record<string, { bearingDeg: number; lineSpacingM: number }>>({});
+  const [overrides, setOverrides] = useState<Record<string, { bearingDeg: number; lineSpacingM?: number; source: 'wingtra' | 'user' }>>({});
+
   // Auto-run GSD analysis when flight lines are updated (already wired)
   const autoRunGSDRef = useRef<((opts?: { polygonId?: string; reason?: 'lines'|'spacing'|'alt'|'manual' }) => void) | null>(null);
   const clearGSDRef = useRef<(() => void) | null>(null);
@@ -81,11 +85,15 @@ export default function Home() {
   }, []);
 
   const handleFlightLinesUpdated = useCallback((which: string | '__all__') => {
-    if (!autoRunGSDRef.current) return;
-    if (which === '__all__') {
-      autoRunGSDRef.current({ reason: 'spacing' });
-    } else {
-      autoRunGSDRef.current({ polygonId: which, reason: 'lines' });
+    // trigger GSD recompute
+    if (autoRunGSDRef.current) {
+      if (which === '__all__') autoRunGSDRef.current({ reason: 'spacing' });
+      else autoRunGSDRef.current({ polygonId: which, reason: 'lines' });
+    }
+    // refresh imported/override state from Map
+    if (mapRef.current) {
+      setImportedOriginals(mapRef.current.getImportedOriginals?.() ?? {});
+      setOverrides(mapRef.current.getBearingOverrides?.() ?? {});
     }
   }, []);
 
@@ -100,12 +108,22 @@ export default function Home() {
     clearGSDRef.current = clearFn;
   }, []);
 
+  // Also refresh overrides when results change
+  React.useEffect(() => {
+    if (mapRef.current) {
+      setImportedOriginals(mapRef.current.getImportedOriginals?.() ?? {});
+      setOverrides(mapRef.current.getBearingOverrides?.() ?? {});
+    }
+  }, [polygonResults.length]);
+
   const clearAllDrawings = useCallback(() => {
     mapRef.current?.clearAllDrawings?.();
     clearGSDRef.current?.(); // Clear GSD overlays and analysis
     setPolygonResults([]);
     setAnalyzingPolygons(new Set());
     setParamsByPolygon({});
+    setImportedOriginals({});
+    setOverrides({});
   }, []);
 
   const clearSpecificPolygon = useCallback((polygonId: string) => {
@@ -181,6 +199,15 @@ export default function Home() {
               size="sm"
               variant="outline"
               className="h-8 px-2 whitespace-nowrap"
+              onClick={() => mapRef.current?.openFlightplanFilePicker?.()}
+            >
+              <Upload className="w-3 h-3 mr-1" />
+              Import Flightplan
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-8 px-2 whitespace-nowrap"
               onClick={() => mapRef.current?.openKmlFilePicker?.()}
             >
               <Upload className="w-3 h-3 mr-1" />
@@ -248,6 +275,8 @@ export default function Home() {
                   {polygonResults.map((polygonResult, index) => {
                     const { polygonId, result } = polygonResult;
                     const shortId = polygonId.slice(0, 8);
+                    const fromFile = !!importedOriginals[polygonId];
+                    const hasOverride = !!overrides[polygonId]; // currently using file heading
                     
                     return (
                       <div key={polygonId} className="border rounded-lg p-3 bg-white">
@@ -292,6 +321,23 @@ export default function Home() {
                             </span>
                           </div>
                         </div>
+
+                        {/* per-polygon actions when imported */}
+                        {fromFile && (
+                          <div className="flex gap-2 mb-2">
+                            {hasOverride ? (
+                              <Button size="sm" className="h-7 px-2 text-xs"
+                                      onClick={() => mapRef.current?.optimizePolygonDirection?.(polygonId)}>
+                                Optimize direction
+                              </Button>
+                            ) : (
+                              <Button size="sm" variant="outline" className="h-7 px-2 text-xs"
+                                      onClick={() => mapRef.current?.revertPolygonToImportedDirection?.(polygonId)}>
+                                Use file direction
+                              </Button>
+                            )}
+                          </div>
+                        )}
                         
                         {/* Secondary Metrics */}
                         <div className="space-y-1 text-xs">

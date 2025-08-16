@@ -1,11 +1,7 @@
+// src/components/MapFlightDirection/index.tsx
 /***********************************************************************
  * MapFlightDirection.tsx
- *
- * Main component that orchestrates the map, drawing, and analysis.
- *
- * © 2025 <your-name>. MIT License.
  ***********************************************************************/
-
 import React, { useRef, useState, useCallback, useImperativeHandle, useEffect } from 'react';
 import { Map as MapboxMap, LngLatLike } from 'mapbox-gl';
 import MapboxDraw from '@mapbox/mapbox-gl-draw';
@@ -16,15 +12,25 @@ import '@mapbox/mapbox-gl-draw/dist/mapbox-gl-draw.css';
 
 import { useMapInitialization } from './hooks/useMapInitialization';
 import { usePolygonAnalysis } from './hooks/usePolygonAnalysis';
-import { addFlightLinesForPolygon, removeFlightLinesForPolygon, clearAllFlightLines, addTriggerPointsForPolygon, removeTriggerPointsForPolygon, clearAllTriggerPoints } from './utils/mapbox-layers';
+import {
+  addFlightLinesForPolygon,
+  removeFlightLinesForPolygon,
+  clearAllFlightLines,
+  addTriggerPointsForPolygon,
+  removeTriggerPointsForPolygon,
+  clearAllTriggerPoints
+} from './utils/mapbox-layers';
 import { update3DPathLayer, remove3DPathLayer, update3DCameraPointsLayer, remove3DCameraPointsLayer } from './utils/deckgl-layers';
-import { build3DFlightPath, calculateFlightLineSpacing } from './utils/geometry';
+import { build3DFlightPath, calculateFlightLineSpacing, calculateOptimalTerrainZoom } from './utils/geometry';
 import { PolygonAnalysisResult, PolygonParams } from './types';
 import { parseKmlPolygons, calculateKmlBounds } from '@/utils/kml';
 import { SONY_RX1R2 } from '@/domain/camera';
-import type { MapFlightDirectionAPI } from './api';
+import type { MapFlightDirectionAPI, ImportedFlightplanArea } from './api';
+import { fetchTilesForPolygon } from './utils/terrain';
 
-/** Default camera identical to the one in OverlapGSDPanel */
+// NEW: Wingtra import helpers
+import { importWingtraFlightPlan } from '@/interop/wingtra/convert';
+
 const DEFAULT_CAMERA = SONY_RX1R2;
 
 interface Props {
@@ -34,9 +40,7 @@ interface Props {
   terrainZoom?: number;
   sampleStep?: number;
 
-  /** Called after terrain direction is known, but before lines are drawn. */
   onRequestParams?: (polygonId: string, ring: [number, number][]) => void;
-
   onAnalysisComplete?: (results: PolygonAnalysisResult[]) => void;
   onAnalysisStart?: (polygonId: string) => void;
   onError?: (error: string, polygonId?: string) => void;
@@ -66,30 +70,67 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
     const drawRef = useRef<MapboxDraw>();
     const deckOverlayRef = useRef<MapboxOverlay>();
 
-    // KML import state and refs
+    // File inputs
     const kmlInputRef = useRef<HTMLInputElement>(null);
+    const flightplanInputRef = useRef<HTMLInputElement>(null);
     const [isDraggingKml, setIsDraggingKml] = useState(false);
+
+    // Suspend auto-analysis during programmatic imports
+    const suspendAutoAnalysisRef = useRef(false);
 
     const [polygonResults, setPolygonResults] = useState<Map<string, PolygonAnalysisResult>>(new Map());
     const [polygonTiles, setPolygonTiles] = useState<Map<string, any[]>>(new Map());
-    
-    /** Flight lines + spacing + altitude actually used to build 3D path. */
+
+    // Flight lines + spacing + altitude actually used to build 3D path.
     const [polygonFlightLines, setPolygonFlightLines] = useState<
       Map<string, { flightLines: number[][][]; lineSpacing: number; altitudeAGL: number }>
     >(new Map());
 
-    /** Per‑polygon parameters provided by user via dialog. */
+    // Per‑polygon parameters provided by user (or by importer).
     const [polygonParams, setPolygonParams] = useState<Map<string, PolygonParams>>(new Map());
+
+    // Overrides: force a heading/spacing (e.g., from Wingtra file)
+    const [bearingOverrides, setBearingOverrides] = useState<
+      Map<string, { bearingDeg: number; lineSpacingM?: number; source: 'wingtra' | 'user' }>
+    >(new Map());
+
+    // Original file meta for revert
+    const [importedOriginals, setImportedOriginals] = useState<
+      Map<string, { bearingDeg: number; lineSpacingM: number }>
+    >(new Map());
 
     const [deckLayers, setDeckLayers] = useState<any[]>([]);
 
+    // ---------- helpers ----------
+    const fitMapToRings = useCallback((rings: [number, number][][]) => {
+      if (!mapRef.current || rings.length === 0) return;
+      let minLng = +Infinity, minLat = +Infinity, maxLng = -Infinity, maxLat = -Infinity;
+      for (const ring of rings) {
+        for (const [lng, lat] of ring) {
+          minLng = Math.min(minLng, lng);
+          maxLng = Math.max(maxLng, lng);
+          minLat = Math.min(minLat, lat);
+          maxLat = Math.max(maxLat, lat);
+        }
+      }
+      if (Number.isFinite(minLng) && Number.isFinite(minLat) && Number.isFinite(maxLng) && Number.isFinite(maxLat)) {
+        mapRef.current.fitBounds([[minLng, minLat], [maxLng, maxLat]], {
+          padding: 50,
+          duration: 1000,
+          maxZoom: 18
+        });
+      }
+    }, []);
+
+    // ---------- analysis callbacks ----------
     const handleAnalysisResult = useCallback(
       (result: PolygonAnalysisResult, tiles: any[]) => {
-        // Store analysis + tiles regardless of params (we need direction later)
+        // Keep analysis result & tiles
+        let updatedResults: PolygonAnalysisResult[];
         setPolygonResults((prev) => {
           const next = new Map(prev);
           next.set(result.polygonId, result);
-          onAnalysisComplete?.(Array.from(next.values()));
+          updatedResults = Array.from(next.values());
           return next;
         });
 
@@ -99,41 +140,59 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           return next;
         });
 
-        // If params exist → we can immediately build lines/path
+        // Call the callback after state updates are complete
+        if (updatedResults!) {
+          onAnalysisComplete?.(updatedResults);
+        }
+
+        // Decide which heading/spacing to use when drawing
         const params = polygonParams.get(result.polygonId);
+        const override = bearingOverrides.get(result.polygonId);
+        
         if (!params) {
-          // Ask parent to prompt user for this polygon
+          // For imported polygons (with overrides), don't ask for params - they're already set
+          if (override) {
+            console.log(`Skipping params dialog for imported polygon ${result.polygonId}`);
+            return;
+          }
+          // Ask parent to prompt user for this polygon (for manually drawn ones only)
           onRequestParams?.(result.polygonId, result.polygon.coordinates);
           return;
         }
 
-        if (mapRef.current) {
-          const lineSpacing = calculateFlightLineSpacing(DEFAULT_CAMERA, params.altitudeAGL, params.sideOverlap);
+        if (!mapRef.current) return;
 
-          const lines = addFlightLinesForPolygon(
-            mapRef.current,
-            result.polygonId,
-            result.polygon.coordinates,
-            result.result.contourDirDeg,
-            lineSpacing,
-            result.result.fitQuality
-          );
+        // Use override if present (e.g., file direction), otherwise terrain-optimal
+        const bearingDeg = override ? override.bearingDeg : result.result.contourDirDeg;
 
-          setPolygonFlightLines((prev) => {
-            const next = new Map(prev);
-            next.set(result.polygonId, { ...lines, altitudeAGL: params.altitudeAGL });
-            return next;
-          });
+        // Spacing: keep override spacing if present, otherwise recompute from params
+        const spacing =
+          override?.lineSpacingM ??
+          calculateFlightLineSpacing(DEFAULT_CAMERA, params.altitudeAGL, params.sideOverlap);
 
-          onFlightLinesUpdated?.(result.polygonId);
+        const lines = addFlightLinesForPolygon(
+          mapRef.current,
+          result.polygonId,
+          result.polygon.coordinates,
+          bearingDeg,
+          spacing,
+          result.result.fitQuality
+        );
 
-          if (deckOverlayRef.current && lines.flightLines.length > 0) {
-            const path3d = build3DFlightPath(lines.flightLines, tiles, lines.lineSpacing, params.altitudeAGL);
-            update3DPathLayer(deckOverlayRef.current, result.polygonId, path3d, setDeckLayers);
-          }
+        setPolygonFlightLines((prev) => {
+          const next = new Map(prev);
+          next.set(result.polygonId, { ...lines, altitudeAGL: params.altitudeAGL });
+          return next;
+        });
+
+        onFlightLinesUpdated?.(result.polygonId);
+
+        if (deckOverlayRef.current && lines.flightLines.length > 0) {
+          const path3d = build3DFlightPath(lines.flightLines, tiles, lines.lineSpacing, params.altitudeAGL);
+          update3DPathLayer(deckOverlayRef.current, result.polygonId, path3d, setDeckLayers);
         }
       },
-      [onAnalysisComplete, onFlightLinesUpdated, polygonParams, onRequestParams]
+      [onAnalysisComplete, onFlightLinesUpdated, polygonParams, bearingOverrides, onRequestParams]
     );
 
     const memoizedOnAnalysisStart = useCallback((polygonId: string) => {
@@ -152,127 +211,24 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       onError: memoizedOnError,
     });
 
+    // ---------- Mapbox Draw handlers ----------
     const handleDrawCreate = useCallback((e: any) => {
-      console.log('Draw create event:', e);
+      if (suspendAutoAnalysisRef.current) return;
       e.features.forEach((feature: any) => {
         if (feature.geometry.type === 'Polygon') {
-          console.log('Starting analysis for polygon:', feature.id);
           analyzePolygon(feature.id, feature);
         }
       });
     }, [analyzePolygon]);
 
     const handleDrawUpdate = useCallback((e: any) => {
+      if (suspendAutoAnalysisRef.current) return;
       e.features.forEach((feature: any) => {
         if (feature.geometry.type === 'Polygon') {
           analyzePolygon(feature.id, feature);
         }
       });
     }, [analyzePolygon]);
-
-    // Convert a ring to a Draw feature and trigger analysis.
-    const addRingAsDrawFeature = useCallback((ring: [number, number][], name?: string) => {
-      const draw = drawRef.current as any;
-      if (!draw) return;
-
-      // Mapbox Draw expects Polygon coordinates as an array of rings: [outer, hole1, hole2...]
-      const feature = {
-        type: 'Feature',
-        properties: { name: name || '' },
-        geometry: {
-          type: 'Polygon',
-          coordinates: [ring], // single ring only (outer)
-        },
-      };
-
-      // draw.add returns the id(s) of the added features
-      const id = draw.add(feature);
-      const featureId = Array.isArray(id) ? id[0] : id;
-
-      // Analyze immediately (some Draw builds emit draw.create; this is robust either way)
-      const f = (draw.get as any)?.(featureId);
-      if (f?.geometry?.type === 'Polygon') {
-        analyzePolygon(featureId, f);
-      }
-    }, [analyzePolygon]);
-
-    const importKmlFromText = useCallback(async (kmlText: string) => {
-      try {
-        const polygons = parseKmlPolygons(kmlText);
-        let added = 0;
-        
-        // Add all polygons to the map
-        for (const p of polygons) {
-          if (p.ring?.length >= 4) {
-            addRingAsDrawFeature(p.ring, p.name);
-            added++;
-          }
-        }
-        
-        // Pan map to show imported areas
-        if (added > 0 && mapRef.current) {
-          const bounds = calculateKmlBounds(polygons.filter(p => p.ring?.length >= 4));
-          if (bounds) {
-            // Add some padding around the bounds
-            const padding = 0.001; // roughly 100m at equator
-            const paddedBounds: [[number, number], [number, number]] = [
-              [bounds.minLng - padding, bounds.minLat - padding],
-              [bounds.maxLng + padding, bounds.maxLat + padding]
-            ];
-            
-            // Fit map to bounds with animation
-            mapRef.current.fitBounds(paddedBounds, {
-              padding: 50, // 50px padding from edges
-              duration: 1000, // 1 second animation
-              maxZoom: 18 // don't zoom in too much for small areas
-            });
-          }
-          
-          // Success feedback
-          console.log(`Successfully imported ${added} polygon${added !== 1 ? 's' : ''} from KML`);
-        } else if (polygons.length > 0) {
-          onError?.("KML contained polygons but none were valid (need at least 4 coordinates)");
-        } else {
-          onError?.("No valid polygons found in KML file");
-        }
-        
-        return { added, total: polygons.length };
-      } catch (error) {
-        const message = error instanceof Error ? error.message : "Failed to parse KML file";
-        onError?.(message);
-        return { added: 0, total: 0 };
-      }
-    }, [addRingAsDrawFeature, onError]);
-
-    // Handle <input type="file">
-    const handleKmlFileChange = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
-      const files = Array.from(e.target.files || []).filter(f => /\.kml$/i.test(f.name));
-      
-      if (files.length === 0) {
-        onError?.("Please select valid .kml files");
-        return;
-      }
-      
-      let totalAdded = 0;
-      let totalFiles = files.length;
-      
-      for (const file of files) {
-        try {
-          const text = await file.text();
-          const result = await importKmlFromText(text);
-          totalAdded += result.added;
-        } catch (error) {
-          onError?.(`Failed to read file ${file.name}: ${error instanceof Error ? error.message : 'Unknown error'}`);
-        }
-      }
-      
-      if (totalAdded > 0) {
-        console.log(`Successfully imported ${totalAdded} polygon${totalAdded !== 1 ? 's' : ''} from ${totalFiles} file${totalFiles !== 1 ? 's' : ''}`);
-      }
-      
-      // reset input so same file can be selected again if needed
-      if (kmlInputRef.current) kmlInputRef.current.value = '';
-    }, [importKmlFromText, onError]);
 
     const handleDrawDelete = useCallback((e: any) => {
       e.features.forEach((feature: any) => {
@@ -286,34 +242,49 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           if (deckOverlayRef.current) {
             remove3DPathLayer(deckOverlayRef.current, polygonId, setDeckLayers);
           }
+          let updatedResults: PolygonAnalysisResult[];
           setPolygonResults((prev) => {
-            const newResults = new Map(prev);
-            newResults.delete(polygonId);
-            onAnalysisComplete?.(Array.from(newResults.values()));
-            return newResults;
+            const next = new Map(prev);
+            next.delete(polygonId);
+            updatedResults = Array.from(next.values());
+            return next;
           });
+          // Call callback after state update
+          if (updatedResults!) {
+            onAnalysisComplete?.(updatedResults);
+          }
           setPolygonFlightLines((prev) => {
-            const newFlightLines = new Map(prev);
-            newFlightLines.delete(polygonId);
-            return newFlightLines;
+            const next = new Map(prev);
+            next.delete(polygonId);
+            return next;
           });
           setPolygonTiles((prev) => {
-            const newTiles = new Map(prev);
-            newTiles.delete(polygonId);
-            return newTiles;
+            const next = new Map(prev);
+            next.delete(polygonId);
+            return next;
           });
           setPolygonParams((prev) => {
             const next = new Map(prev);
             next.delete(polygonId);
             return next;
           });
-          
-          // Clear GSD overlays and camera positions
+          setBearingOverrides((prev) => {
+            const next = new Map(prev);
+            next.delete(polygonId);
+            return next;
+          });
+          setImportedOriginals((prev) => {
+            const next = new Map(prev);
+            next.delete(polygonId);
+            return next;
+          });
+
           onClearGSD?.();
         }
       });
     }, [cancelAnalysis, onAnalysisComplete, onClearGSD]);
 
+    // ---------- Map init ----------
     const onMapLoad = useCallback(
       (map: MapboxMap, draw: MapboxDraw, overlay: MapboxOverlay) => {
         mapRef.current = map;
@@ -335,13 +306,250 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       onError: memoizedOnError,
     });
 
-    // Support drag & drop directly onto the map container
+    // ---------- Draw utils ----------
+    const addRingAsDrawFeature = useCallback((ring: [number, number][], name?: string, extraProps?: Record<string, any>): string | undefined => {
+      const draw = drawRef.current as any;
+      if (!draw) return;
+
+      const feature = {
+        type: 'Feature',
+        properties: { name: name || '', ...(extraProps || {}) },
+        geometry: { type: 'Polygon', coordinates: [ring] },
+      };
+
+      const id = draw.add(feature);
+      const featureId = Array.isArray(id) ? id[0] : id;
+
+      // Only auto-analyze if not suspended (imports will analyze explicitly)
+      if (!suspendAutoAnalysisRef.current) {
+        const f = (draw.get as any)?.(featureId);
+        if (f?.geometry?.type === 'Polygon') analyzePolygon(featureId, f);
+      }
+      return featureId as string;
+    }, [analyzePolygon]);
+
+    // ---------- KML import (unchanged behavior) ----------
+    const importKmlFromText = useCallback(async (kmlText: string) => {
+      try {
+        const polygons = parseKmlPolygons(kmlText);
+        let added = 0;
+
+        for (const p of polygons) {
+          if (p.ring?.length >= 4) {
+            addRingAsDrawFeature(p.ring, p.name);
+            added++;
+          }
+        }
+
+        if (added > 0 && mapRef.current) {
+          const bounds = calculateKmlBounds(polygons.filter(p => p.ring?.length >= 4));
+          if (bounds) {
+            const padding = 0.001;
+            const padded: [[number, number], [number, number]] = [
+              [bounds.minLng - padding, bounds.minLat - padding],
+              [bounds.maxLng + padding, bounds.maxLat + padding]
+            ];
+            mapRef.current.fitBounds(padded, { padding: 50, duration: 1000, maxZoom: 18 });
+          }
+        } else if (polygons.length > 0) {
+          onError?.("KML contained polygons but none were valid (need at least 4 coordinates)");
+        } else {
+          onError?.("No valid polygons found in KML file");
+        }
+
+        return { added, total: polygons.length };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Failed to parse KML file";
+        onError?.(message);
+        return { added: 0, total: 0 };
+      }
+    }, [addRingAsDrawFeature, onError]);
+
+    const handleKmlFileChange = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
+      const files = Array.from(e.target.files || []).filter(f => /\.kml$/i.test(f.name));
+      if (files.length === 0) {
+        onError?.("Please select valid .kml files");
+        return;
+      }
+      let totalAdded = 0;
+      for (const file of files) {
+        try {
+          const text = await file.text();
+          const result = await importKmlFromText(text);
+          totalAdded += result.added;
+        } catch (error) {
+          onError?.(`Failed to read file ${file.name}: ${error instanceof Error ? error.message : 'Unknown error'}`);
+        }
+      }
+      if (kmlInputRef.current) kmlInputRef.current.value = '';
+    }, [importKmlFromText, onError]);
+
+    // ---------- Wingtra flightplan import ----------
+    const importWingtraFromText = useCallback(async (json: string): Promise<{ added: number; total: number; areas: ImportedFlightplanArea[] }> => {
+      try {
+        const parsed = JSON.parse(json);
+        const imported = importWingtraFlightPlan(parsed, { angleConvention: 'northCW' }); // change if you need eastCW
+        const areasOut: ImportedFlightplanArea[] = [];
+
+        if (!mapRef.current || !drawRef.current) {
+          onError?.('Map is not ready yet');
+          return { added: 0, total: imported.items.length, areas: [] };
+        }
+
+        suspendAutoAnalysisRef.current = true;
+        const newRings: [number, number][][] = [];
+        const newIds: string[] = [];
+        
+        // Batch state updates for better performance
+        const polygonsToUpdate = new Map();
+        const flightLinesToUpdate = new Map();
+
+        // 1) Add features (no analysis yet), set params + overrides, draw file lines immediately
+        for (const item of imported.items) {
+          const id = addRingAsDrawFeature(item.ring, `Flightplan Area`, { source: 'wingtra' });
+          if (!id) continue;
+          newIds.push(id);
+          newRings.push(item.ring as [number, number][]);
+
+          // Store polygon state for batch update
+          const polygonState = {
+            params: {
+              altitudeAGL: item.altitudeAGL,
+              frontOverlap: item.frontOverlap,
+              sideOverlap: item.sideOverlap
+            },
+            original: { bearingDeg: item.angleDeg, lineSpacingM: item.lineSpacingM },
+            override: { bearingDeg: item.angleDeg, lineSpacingM: item.lineSpacingM, source: 'wingtra' as const }
+          };
+          polygonsToUpdate.set(id, polygonState);
+
+          // draw lines now with file heading/spacing
+          const lines = addFlightLinesForPolygon(
+            mapRef.current,
+            id,
+            item.ring as number[][],
+            item.angleDeg,
+            item.lineSpacingM,
+            undefined
+          );
+          flightLinesToUpdate.set(id, { ...lines, altitudeAGL: item.altitudeAGL });
+
+          areasOut.push({
+            polygonId: id,
+            params: {
+              altitudeAGL: item.altitudeAGL,
+              frontOverlap: item.frontOverlap,
+              sideOverlap: item.sideOverlap,
+              angleDeg: item.angleDeg,
+              lineSpacingM: item.lineSpacingM,
+              triggerDistanceM: item.triggerDistanceM,
+              source: 'wingtra'
+            }
+          });
+        }
+
+        // Batch state updates
+        setPolygonParams(prev => {
+          const next = new Map(prev);
+          for (const [id, state] of Array.from(polygonsToUpdate.entries())) {
+            next.set(id, state.params);
+          }
+          return next;
+        });
+
+        setImportedOriginals(prev => {
+          const next = new Map(prev);
+          for (const [id, state] of Array.from(polygonsToUpdate.entries())) {
+            next.set(id, state.original);
+          }
+          return next;
+        });
+
+        setBearingOverrides(prev => {
+          const next = new Map(prev);
+          for (const [id, state] of Array.from(polygonsToUpdate.entries())) {
+            next.set(id, state.override);
+          }
+          return next;
+        });
+
+        setPolygonFlightLines(prev => {
+          const next = new Map(prev);
+          for (const [id, lines] of Array.from(flightLinesToUpdate.entries())) {
+            next.set(id, lines);
+          }
+          return next;
+        });
+
+        // 2) Fit map to imported rings
+        fitMapToRings(newRings);
+
+        // 3) Fetch tiles + build 3D paths + tell GSD panel to run (via callback)
+        for (let idx = 0; idx < newIds.length; idx++) {
+          const polygonId = newIds[idx];
+          const ring = newRings[idx];
+
+          // terrain zoom heuristic, tiles, store
+          const z = calculateOptimalTerrainZoom({ coordinates: ring as any });
+          const tiles = await fetchTilesForPolygon({ coordinates: ring as any }, z, mapboxToken, new AbortController().signal);
+          setPolygonTiles(prev => {
+            const next = new Map(prev);
+            next.set(polygonId, tiles);
+            return next;
+          });
+
+          // 3D path
+          const flEntry = polygonFlightLines.get(polygonId);
+          const lineSpacing = flEntry?.lineSpacing ?? imported.items[idx]?.lineSpacingM ?? 25;
+          const altitudeAGL = polygonParams.get(polygonId)?.altitudeAGL ?? imported.items[idx]?.altitudeAGL ?? 100;
+
+          if (deckOverlayRef.current && flEntry?.flightLines?.length) {
+            const path3d = build3DFlightPath(flEntry.flightLines, tiles, lineSpacing, altitudeAGL);
+            update3DPathLayer(deckOverlayRef.current, polygonId, path3d, setDeckLayers);
+          }
+
+          // Kick GSD auto-run path via parent callback
+          onFlightLinesUpdated?.(polygonId);
+
+          // For imported polygons, we skip initial analysis since we already have 
+          // all the parameters and have drawn the lines. Analysis will only run
+          // when user clicks "Optimize direction"
+        }
+
+        suspendAutoAnalysisRef.current = false;
+        return { added: newIds.length, total: imported.items.length, areas: areasOut };
+      } catch (e) {
+        onError?.(`Failed to import flightplan: ${e instanceof Error ? e.message : 'Unknown error'}`);
+        suspendAutoAnalysisRef.current = false;
+        return { added: 0, total: 0, areas: [] };
+      }
+    }, [mapboxToken, addRingAsDrawFeature, polygonFlightLines, polygonParams, fitMapToRings, analyzePolygon, onFlightLinesUpdated, onError]);
+
+    const handleFlightplanFileChange = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
+      const files = Array.from(e.target.files || []).filter(f =>
+        /\.flightplan$/i.test(f.name) || /\.json$/i.test(f.name)
+      );
+      if (files.length === 0) {
+        onError?.("Please select a valid Wingtra .flightplan (JSON) file");
+        return;
+      }
+      for (const file of files) {
+        try {
+          const text = await file.text();
+          await importWingtraFromText(text);
+        } catch (err) {
+          onError?.(`Failed to read file ${file.name}: ${err instanceof Error ? err.message : 'Unknown error'}`);
+        }
+      }
+      if (flightplanInputRef.current) flightplanInputRef.current.value = '';
+    }, [importWingtraFromText, onError]);
+
+    // ---------- Drag & drop (KML) ----------
     useEffect(() => {
       const el = mapContainer.current;
       if (!el) return;
 
       const onDragOver = (e: DragEvent) => {
-        // If a .kml is present, show copy cursor + overlay
         if (e.dataTransfer) {
           const hasKml = Array.from(e.dataTransfer.items || []).some((it) =>
             it.kind === 'file' && /\.kml$/i.test(it.type || it.getAsFile()?.name || '')
@@ -359,17 +567,14 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       const onDrop = async (e: DragEvent) => {
         e.preventDefault();
         setIsDraggingKml(false);
-        
+
         const files = Array.from(e.dataTransfer?.files || []).filter(f => /\.kml$/i.test(f.name));
-        
         if (files.length === 0) {
           onError?.("No valid .kml files found in drop");
           return;
         }
-        
+
         let totalAdded = 0;
-        let totalFiles = files.length;
-        
         for (const f of files) {
           try {
             const text = await f.text();
@@ -378,10 +583,6 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           } catch (error) {
             onError?.(`Failed to read file ${f.name}: ${error instanceof Error ? error.message : 'Unknown error'}`);
           }
-        }
-        
-        if (totalAdded > 0) {
-          console.log(`Successfully imported ${totalAdded} polygon${totalAdded !== 1 ? 's' : ''} from ${totalFiles} dropped file${totalFiles !== 1 ? 's' : ''}`);
         }
       };
 
@@ -393,34 +594,32 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         el.removeEventListener('dragleave', onDragLeave);
         el.removeEventListener('drop', onDrop);
       };
-    }, [importKmlFromText]);
+    }, [importKmlFromText, onError]);
 
-    // ————————————————————————————————————————————————
-    // Imperative API (used by Home/Dialogs)
-    // ————————————————————————————————————————————————
+    // ---------- Imperative API ----------
     const applyPolygonParams = useCallback((polygonId: string, params: PolygonParams) => {
-      // Store params
       setPolygonParams((prev) => {
         const next = new Map(prev);
         next.set(polygonId, params);
         return next;
       });
 
-      // If we already have analysis + tiles → build lines & path now
       const res = polygonResults.get(polygonId);
       const tiles = polygonTiles.get(polygonId) || [];
       if (!res || !mapRef.current) return;
 
-      const lineSpacing = calculateFlightLineSpacing(DEFAULT_CAMERA, params.altitudeAGL, params.sideOverlap);
+      // Respect override (bearing), recompute spacing from params unless overridden
+      const override = bearingOverrides.get(polygonId);
+      const bearingDeg = override ? override.bearingDeg : res.result.contourDirDeg;
+      const spacing = override?.lineSpacingM ?? calculateFlightLineSpacing(DEFAULT_CAMERA, params.altitudeAGL, params.sideOverlap);
 
-      // Rebuild lines & path for this polygon
       removeFlightLinesForPolygon(mapRef.current, polygonId);
       const fl = addFlightLinesForPolygon(
         mapRef.current,
         polygonId,
         res.polygon.coordinates,
-        res.result.contourDirDeg,
-        lineSpacing,
+        bearingDeg,
+        spacing,
         res.result.fitQuality
       );
 
@@ -436,49 +635,109 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         const path3d = build3DFlightPath(fl.flightLines, tiles, fl.lineSpacing, params.altitudeAGL);
         update3DPathLayer(deckOverlayRef.current, polygonId, path3d, setDeckLayers);
       }
-    }, [polygonResults, polygonTiles, onFlightLinesUpdated]);
+    }, [polygonResults, polygonTiles, bearingOverrides, onFlightLinesUpdated]);
+
+    const optimizePolygonDirection = useCallback((polygonId: string) => {
+      // drop override and rebuild using terrain-optimal on next apply
+      setBearingOverrides((prev) => {
+        const next = new Map(prev);
+        next.delete(polygonId);
+        return next;
+      });
+
+      // Check if we have analysis results, if not run analysis first
+      const hasResults = polygonResults.has(polygonId);
+      if (!hasResults) {
+        // Need to run analysis to get terrain-optimal direction
+        const draw = drawRef.current as any;
+        const f = draw?.get?.(polygonId);
+        if (f?.geometry?.type === 'Polygon') {
+          analyzePolygon(polygonId, f);
+        }
+        return;
+      }
+
+      // Re-apply current params (this will redraw lines using analysis direction)
+      const params = polygonParams.get(polygonId);
+      if (params) {
+        applyPolygonParams(polygonId, params);
+      } else {
+        // If params missing, analyze & request params
+        const draw = drawRef.current as any;
+        const f = draw?.get?.(polygonId);
+        if (f?.geometry?.type === 'Polygon') analyzePolygon(polygonId, f);
+      }
+    }, [polygonParams, polygonResults, applyPolygonParams, analyzePolygon]);
+
+    const revertPolygonToImportedDirection = useCallback((polygonId: string) => {
+      const original = importedOriginals.get(polygonId);
+      const res = polygonResults.get(polygonId);
+      if (!original || !res || !mapRef.current) return;
+
+      // restore override to file bearing/spacing
+      setBearingOverrides((prev) => {
+        const next = new Map(prev);
+        next.set(polygonId, { bearingDeg: original.bearingDeg, lineSpacingM: original.lineSpacingM, source: 'wingtra' });
+        return next;
+      });
+
+      const params = polygonParams.get(polygonId) ?? { altitudeAGL: 100, frontOverlap: 80, sideOverlap: 70 };
+
+      removeFlightLinesForPolygon(mapRef.current, polygonId);
+      const fl = addFlightLinesForPolygon(
+        mapRef.current,
+        polygonId,
+        res.polygon.coordinates,
+        original.bearingDeg,
+        original.lineSpacingM,
+        res.result.fitQuality
+      );
+
+      setPolygonFlightLines((prev) => {
+        const next = new Map(prev);
+        next.set(polygonId, { ...fl, altitudeAGL: params.altitudeAGL });
+        return next;
+      });
+
+      const tiles = polygonTiles.get(polygonId) || [];
+      if (deckOverlayRef.current && fl.flightLines.length > 0) {
+        const path3d = build3DFlightPath(fl.flightLines, tiles, fl.lineSpacing, params.altitudeAGL);
+        update3DPathLayer(deckOverlayRef.current, polygonId, path3d, setDeckLayers);
+      }
+
+      onFlightLinesUpdated?.(polygonId);
+    }, [importedOriginals, polygonResults, polygonParams, polygonTiles, onFlightLinesUpdated]);
 
     useImperativeHandle(ref, () => ({
       clearAllDrawings: () => {
-        if (drawRef.current) {
-          drawRef.current.deleteAll();
-        }
+        if (drawRef.current) drawRef.current.deleteAll();
         if (deckOverlayRef.current) {
           setDeckLayers([]);
           deckOverlayRef.current.setProps({ layers: [] });
         }
-        // Remove any existing flight lines and trigger points
         if (mapRef.current) {
-          // Use comprehensive clearing for both flight lines and trigger points
           clearAllFlightLines(mapRef.current);
           clearAllTriggerPoints(mapRef.current);
         }
-        
-        // Clear internal state
         setPolygonResults(new Map());
         setPolygonTiles(new Map());
         setPolygonFlightLines(new Map());
         setPolygonParams(new Map());
-        
+        setBearingOverrides(new Map());
+        setImportedOriginals(new Map());
+
         cancelAllAnalyses();
-        
-        // Clear GSD overlays and analysis
         onClearGSD?.();
       },
       clearPolygon: (polygonId: string) => {
-        if (drawRef.current) {
-          drawRef.current.delete(polygonId);
-        }
+        if (drawRef.current) drawRef.current.delete(polygonId);
       },
       startPolygonDrawing: () => {
-        if (drawRef.current) {
-          (drawRef.current as any).changeMode('draw_polygon');
-        }
+        if (drawRef.current) (drawRef.current as any).changeMode('draw_polygon');
       },
       getPolygonResults: () => Array.from(polygonResults.values()),
       getMap: () => mapRef.current,
       getPolygons: (): [number,number][][] => {
-        // Return rings for all drawn polygons (single-ring only)
         const draw = drawRef.current;
         if (!draw) return [];
         const coll = draw.getAll();
@@ -491,7 +750,6 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         return rings;
       },
       getPolygonsWithIds: (): { id?: string; ring: [number, number][] }[] => {
-        // Return polygons with their IDs for per-polygon analysis
         const draw = drawRef.current;
         if (!draw) return [];
         const coll = draw.getAll();
@@ -509,14 +767,10 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       getFlightLines: () => polygonFlightLines,
       getPolygonTiles: () => polygonTiles,
       addCameraPoints: (polygonId: string, positions: [number, number, number][]) => {
-        if (deckOverlayRef.current) {
-          update3DCameraPointsLayer(deckOverlayRef.current, polygonId, positions, setDeckLayers);
-        }
+        if (deckOverlayRef.current) update3DCameraPointsLayer(deckOverlayRef.current, polygonId, positions, setDeckLayers);
       },
       removeCameraPoints: (polygonId: string) => {
-        if (deckOverlayRef.current) {
-          remove3DCameraPointsLayer(deckOverlayRef.current, polygonId, setDeckLayers);
-        }
+        if (deckOverlayRef.current) remove3DCameraPointsLayer(deckOverlayRef.current, polygonId, setDeckLayers);
       },
       applyPolygonParams,
       getPerPolygonParams: () => Object.fromEntries(polygonParams),
@@ -525,14 +779,28 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         kmlInputRef.current?.click();
       },
       importKmlFromText,
-    }), [polygonResults, polygonFlightLines, polygonTiles, cancelAllAnalyses, applyPolygonParams, polygonParams, importKmlFromText]);
+
+      openFlightplanFilePicker: () => {
+        flightplanInputRef.current?.click();
+      },
+      importWingtraFromText,
+
+      optimizePolygonDirection,
+      revertPolygonToImportedDirection,
+
+      getBearingOverrides: () => Object.fromEntries(bearingOverrides),
+      getImportedOriginals: () => Object.fromEntries(importedOriginals),
+    }), [
+      polygonResults, polygonFlightLines, polygonTiles, polygonParams,
+      cancelAllAnalyses, applyPolygonParams,
+      bearingOverrides, importedOriginals,
+      importKmlFromText, importWingtraFromText,
+      optimizePolygonDirection, revertPolygonToImportedDirection
+    ]);
 
     return (
-      <div
-        ref={mapContainer}
-        style={{ position: 'relative', width: '100%', height: '100%' }}
-      >
-        {/* Hidden file picker for KMLs */}
+      <div ref={mapContainer} style={{ position: 'relative', width: '100%', height: '100%' }}>
+        {/* Hidden pickers */}
         <input
           ref={kmlInputRef}
           type="file"
@@ -541,30 +809,29 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           onChange={handleKmlFileChange}
           style={{ display: 'none' }}
         />
+        <input
+          ref={flightplanInputRef}
+          type="file"
+          accept=".flightplan,.json,application/json"
+          multiple
+          onChange={handleFlightplanFileChange}
+          style={{ display: 'none' }}
+        />
 
-        {/* Drag‑and‑drop overlay */}
+        {/* KML drag overlay */}
         {isDraggingKml && (
           <div
             style={{
-              position: 'absolute',
-              inset: 0,
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              background: 'rgba(59,130,246,0.08)', // blue-500 @ ~8%
-              border: '2px dashed rgba(59,130,246,0.6)',
-              zIndex: 10,
-              pointerEvents: 'none',
+              position: 'absolute', inset: 0, display: 'flex',
+              alignItems: 'center', justifyContent: 'center',
+              background: 'rgba(59,130,246,0.08)', border: '2px dashed rgba(59,130,246,0.6)',
+              zIndex: 10, pointerEvents: 'none',
             }}
           >
             <div
               style={{
-                padding: '8px 12px',
-                background: 'white',
-                borderRadius: 6,
-                boxShadow: '0 1px 3px rgba(0,0,0,0.15)',
-                fontSize: 12,
-                color: '#1f2937',
+                padding: '8px 12px', background: 'white', borderRadius: 6,
+                boxShadow: '0 1px 3px rgba(0,0,0,0.15)', fontSize: 12, color: '#1f2937',
               }}
             >
               Drop <strong>.kml</strong> file(s) to import areas
