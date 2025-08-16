@@ -181,6 +181,9 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           override?.lineSpacingM ??
           calculateFlightLineSpacing(DEFAULT_CAMERA, params.altitudeAGL, params.sideOverlap);
 
+        // Remove existing flight lines first to avoid Mapbox layer conflicts
+        removeFlightLinesForPolygon(mapRef.current, result.polygonId);
+        
         const lines = addFlightLinesForPolygon(
           mapRef.current,
           result.polygonId,
@@ -531,9 +534,13 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           // Kick GSD auto-run path via parent callback
           onFlightLinesUpdated?.(polygonId);
 
-          // For imported polygons, we skip initial analysis since we already have 
-          // all the parameters and have drawn the lines. Analysis will only run
-          // when user clicks "Optimize direction"
+          // 👉 Run terrain analysis now so "Analysis Result" is available immediately.
+          // This does not rotate lines because the Wingtra override is still set.
+          const draw = drawRef.current as any;
+          const feature = draw?.get?.(polygonId);
+          if (feature?.geometry?.type === 'Polygon') {
+            analyzePolygon(polygonId, feature);
+          }
         }
 
         suspendAutoAnalysisRef.current = false;
@@ -629,8 +636,9 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       const tiles = polygonTiles.get(polygonId) || [];
       if (!res || !mapRef.current) return;
 
-      // Respect override (bearing), recompute spacing from params unless overridden
-      const override = bearingOverrides.get(polygonId);
+      // Respect override (bearing), recompute spacing from params unless overridden.
+      // Use ref to avoid stale state when we change overrides and re-apply immediately.
+      const override = bearingOverridesRef.current.get(polygonId);
       const bearingDeg = override ? override.bearingDeg : res.result.contourDirDeg;
       const spacing = override?.lineSpacingM ?? calculateFlightLineSpacing(DEFAULT_CAMERA, params.altitudeAGL, params.sideOverlap);
 
@@ -656,44 +664,36 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         const path3d = build3DFlightPath(fl.flightLines, tiles, fl.lineSpacing, params.altitudeAGL);
         update3DPathLayer(deckOverlayRef.current, polygonId, path3d, setDeckLayers);
       }
-    }, [polygonResults, polygonTiles, bearingOverrides, onFlightLinesUpdated]);
+    }, [polygonResults, polygonTiles, onFlightLinesUpdated]);
 
     const optimizePolygonDirection = useCallback((polygonId: string) => {
       console.log(`🎯 Optimizing direction for polygon ${polygonId} - switching to terrain-optimal bearing`);
-      
-      // drop override and rebuild using terrain-optimal on next apply
+
+      // 1) Drop override in both state and ref so apply() sees latest immediately.
       setBearingOverrides((prev) => {
         const next = new Map(prev);
         next.delete(polygonId);
         return next;
       });
+      bearingOverridesRef.current = new Map(bearingOverridesRef.current);
+      bearingOverridesRef.current.delete(polygonId);
 
-      // Check if we have analysis results, if not run analysis first
+      // 2) Ensure we have terrain analysis; if not, run it first.
       const hasResults = polygonResults.has(polygonId);
       if (!hasResults) {
         console.log(`⚡ No terrain analysis yet for polygon ${polygonId}, running analysis first...`);
-        // Need to run analysis to get terrain-optimal direction
-        const draw = drawRef.current as any;
-        const f = draw?.get?.(polygonId);
-        if (f?.geometry?.type === 'Polygon') {
-          analyzePolygon(polygonId, f);
-        }
-        return;
-      }
-
-      // Re-apply current params (this will redraw lines using analysis direction)
-      const params = polygonParams.get(polygonId);
-      if (params) {
-        console.log(`✅ Applying terrain-optimal direction for polygon ${polygonId}`);
-        applyPolygonParams(polygonId, params);
-      } else {
-        // If params missing, analyze & request params
-        console.log(`📝 Missing params for polygon ${polygonId}, requesting user input...`);
         const draw = drawRef.current as any;
         const f = draw?.get?.(polygonId);
         if (f?.geometry?.type === 'Polygon') analyzePolygon(polygonId, f);
+        return;
       }
-    }, [polygonParams, polygonResults, applyPolygonParams, analyzePolygon]);
+
+      // 3) Re-apply params; apply() will now use res.result.contourDirDeg.
+      const params =
+        polygonParamsRef.current.get(polygonId) ?? { altitudeAGL: 100, frontOverlap: 80, sideOverlap: 70 };
+      console.log(`✅ Applying terrain-optimal direction for polygon ${polygonId}`);
+      applyPolygonParams(polygonId, params);
+    }, [polygonResults, applyPolygonParams, analyzePolygon]);
 
     const revertPolygonToImportedDirection = useCallback((polygonId: string) => {
       console.log(`📁 Reverting polygon ${polygonId} to file direction (Wingtra bearing/spacing)`);
@@ -708,6 +708,9 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         next.set(polygonId, { bearingDeg: original.bearingDeg, lineSpacingM: original.lineSpacingM, source: 'wingtra' });
         return next;
       });
+      // Also update ref for immediate visibility to any subsequent calls
+      bearingOverridesRef.current = new Map(bearingOverridesRef.current);
+      bearingOverridesRef.current.set(polygonId, { bearingDeg: original.bearingDeg, lineSpacingM: original.lineSpacingM, source: 'wingtra' });
 
       const params = polygonParams.get(polygonId) ?? { altitudeAGL: 100, frontOverlap: 80, sideOverlap: 70 };
 
