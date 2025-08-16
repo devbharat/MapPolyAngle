@@ -23,7 +23,7 @@ export default function Home() {
   const [altitudeAGL, setAltitudeAGL] = useState(100);
   
   // Auto-run GSD analysis when flight lines are updated
-  const autoRunGSDRef = useRef<(() => void) | null>(null);
+  const autoRunGSDRef = useRef<((opts?: { polygonId?: string; reason?: 'lines'|'spacing'|'alt'|'manual' }) => void) | null>(null);
   
   // Reference to clear function from OverlapGSDPanel
   const clearGSDRef = useRef<(() => void) | null>(null);
@@ -65,16 +65,21 @@ export default function Home() {
   }, []);
 
   // Handler for when flight lines are updated - automatically trigger GSD analysis
-  const handleFlightLinesUpdated = useCallback(() => {
-    if (autoRunGSDRef.current) {
-      autoRunGSDRef.current();
+  const handleFlightLinesUpdated = useCallback((which: string | '__all__') => {
+    if (!autoRunGSDRef.current) return;
+    if (which === '__all__') {
+      // spacing / altitude changed → recompute everything
+      autoRunGSDRef.current({ reason: 'spacing' });
+    } else {
+      // a single polygon's flight lines changed → recompute only that polygon
+      autoRunGSDRef.current({ polygonId: which, reason: 'lines' });
     }
-  }, []); // No dependencies needed since we use ref
+  }, []);
 
   // Handler to receive the auto-run function from OverlapGSDPanel
-  const handleAutoRunReceived = useCallback((autoRunFn: () => void) => {
+  const handleAutoRunReceived = useCallback((autoRunFn: (opts?: { polygonId?: string; reason?: 'lines'|'spacing'|'alt'|'manual' }) => void) => {
     autoRunGSDRef.current = autoRunFn;
-    // Don't call immediately - only call when flight lines are actually updated
+    // Don't call immediately—only when MapFlightDirection tells us something changed
   }, []);
 
   // Handler to receive the clear function from OverlapGSDPanel

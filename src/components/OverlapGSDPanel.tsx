@@ -16,7 +16,7 @@ type Props = {
   onLineSpacingChange?: (lineSpacing: number) => void;
   onPhotoSpacingChange?: (photoSpacing: number) => void;
   onAltitudeChange?: (altitudeAGL: number) => void;
-  onAutoRun?: (autoRunFn: () => void) => void; // NEW: Callback to provide auto-run function
+  onAutoRun?: (autoRunFn: (opts?: { polygonId?: string; reason?: 'lines'|'spacing'|'alt'|'manual' }) => void) => void;
   onClearExposed?: (clearFn: () => void) => void; // NEW: Callback to provide clear function
 };
 
@@ -73,7 +73,11 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, onLineSpacingChange, onPh
     areaAcres: number;
     imageCount: number;
   }>>(new Map());
-  const runIdRef = useRef<string>("");
+  
+  // RunId per polygon so we can clear/update only the changed polygon
+  const runIdByPolygonRef = useRef<Map<string,string>>(new Map());
+  // Cache raw tile data (width, height, and cloned pixel data) to avoid ArrayBuffer transfer issues
+  const tileCacheRef = useRef<Map<string, { width: number; height: number; data: Uint8ClampedArray }>>(new Map());
   const autoTriesRef = useRef(0);
 
   const parseCamera = useCallback((): CameraModel | null => {
@@ -234,12 +238,20 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, onLineSpacingChange, onPh
     return api.getPolygonsWithIds(); // returns { id?: string; ring: [number, number][] }[]
   }, [mapRef]);
 
-  const compute = useCallback(async () => {
+  /**
+   * Compute GSD/overlap for either:
+   *  - a single polygon (opts.polygonId provided), or
+   *  - all polygons (default)
+   */
+  const compute = useCallback(async (opts?: { polygonId?: string }) => {
     const camera = parseCamera();
     const poses = parsePosesMeters();
-    const polygons = getPolygons();
+    const allPolygons = getPolygons();
+    const targetPolygons = opts?.polygonId
+      ? allPolygons.filter(p => (p.id || 'unknown') === opts.polygonId)
+      : allPolygons;
 
-    if (!camera || !poses || poses.length===0 || polygons.length===0) {
+    if (!camera || !poses || poses.length===0 || targetPolygons.length===0) {
       alert("Please provide valid camera, poses, and draw at least one polygon.");
       return;
     }
@@ -247,32 +259,61 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, onLineSpacingChange, onPh
     const map: mapboxgl.Map | undefined = mapRef.current?.getMap?.();
     if (!map) { alert("Map not ready."); return; }
 
-    // Clear previous overlays for this run
-    if (runIdRef.current) clearRunOverlays(map, runIdRef.current);
-    const runId = `${Date.now()}`; runIdRef.current = runId;
+    // Pick which runIds to clear/update
+    const now = Date.now();
+    const runIdsToUse = new Map<string, string>();
+    if (opts?.polygonId) {
+      // Single polygon update
+      const old = runIdByPolygonRef.current.get(opts.polygonId);
+      if (old) clearRunOverlays(map, old);
+      const rid = `${now}-${opts.polygonId}`;
+      runIdByPolygonRef.current.set(opts.polygonId, rid);
+      runIdsToUse.set(opts.polygonId, rid);
+    } else {
+      // Full recompute
+      runIdByPolygonRef.current.forEach((rid) => clearRunOverlays(map, rid));
+      runIdByPolygonRef.current.clear();
+      // one synthetic run for the "all" case
+      runIdsToUse.set('__ALL__', `${now}-ALL`);
+    }
 
     setRunning(true);
     autoTriesRef.current = 0; // Reset retry counter when starting computation
 
     const worker = new OverlapWorker();
     try {
-      // Collect tiles for all polygons (dedup)
+      // Collect tiles only for target polygons (dedup)
       const seen = new Set<string>();
       const tiles: {z:number;x:number;y:number}[] = [];
-      for (const poly of polygons) {
+      for (const poly of targetPolygons) {
         for (const t of tilesCoveringPolygon(poly, zoom)) {
           const key = `${t.x}/${t.y}`; if (seen.has(key)) continue;
           seen.add(key); tiles.push({z: zoom, x: t.x, y: t.y});
         }
       }
 
-      // Process tiles and collect per-polygon statistics
+      // Process tiles and collect per-polygon statistics (only for target polygons)
       const perPolygonResults = new Map<string, PolygonTileStats[]>();
       
       for (const t of tiles) {
-        const imgData = await fetchTerrainRGBA(t.z, t.x, t.y, mapboxToken);
-        const tile = { z:t.z, x:t.x, y:t.y, size: imgData.width, data: imgData.data };
-        const res = await worker.runTile({ tile, polygons, poses, camera } as any);
+        const cacheKey = `${t.z}/${t.x}/${t.y}`;
+        let tileData = tileCacheRef.current.get(cacheKey);
+        if (!tileData) {
+          const imgData = await fetchTerrainRGBA(t.z, t.x, t.y, mapboxToken);
+          // Cache cloned data to avoid ArrayBuffer transfer issues
+          tileData = {
+            width: imgData.width,
+            height: imgData.height,
+            data: new Uint8ClampedArray(imgData.data)
+          };
+          tileCacheRef.current.set(cacheKey, tileData);
+        }
+        
+        // Create a fresh copy for the worker (since ArrayBuffers get transferred/detached)
+        const freshData = new Uint8ClampedArray(tileData.data);
+        const tile = { z:t.z, x:t.x, y:t.y, size: tileData.width, data: freshData };
+        const polysForThisRun = opts?.polygonId ? targetPolygons : allPolygons;
+        const res = await worker.runTile({ tile, polygons: polysForThisRun, poses, camera } as any);
 
         // Group results by polygon ID
         if (res.perPolygon) {
@@ -284,11 +325,17 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, onLineSpacingChange, onPh
           }
         }
 
+        // Decide which runId to use
+        const runId =
+          opts?.polygonId
+            ? (runIdsToUse.get(opts.polygonId) as string)
+            : (runIdsToUse.get('__ALL__') as string);
+
         if (showOverlap) addOrUpdateTileOverlay(map, res, { kind: "overlap", runId, opacity });
         if (showGsd) addOrUpdateTileOverlay(map, res, { kind: "gsd", runId, opacity, gsdMax: 0.1 });
       }
 
-      // Aggregate statistics per polygon
+      // Aggregate statistics per polygon (update only the ones we computed)
       const aggregatedPerPolygon = new Map<string, {
         polygonId: string;
         gsdStats: GSDStats;
@@ -297,8 +344,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, onLineSpacingChange, onPh
       }>();
 
       perPolygonResults.forEach((tileStats: PolygonTileStats[], polygonId: string) => {
-        // Find the corresponding polygon to calculate area
-        const polygon = polygons.find(p => (p.id || 'unknown') === polygonId);
+        const polygon = allPolygons.find((p: any) => (p.id || 'unknown') === polygonId);
         const areaAcres = polygon ? calculatePolygonAreaAcres(polygon.ring) : 0;
 
         // Aggregate GSD stats across all tiles for this polygon
@@ -321,19 +367,24 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, onLineSpacingChange, onPh
         });
       });
 
-      setPerPolygonStats(aggregatedPerPolygon);
-
-      // Also set the overall cumulative GSD stats for backward compatibility
-      const allGsdStats: GSDStats[] = [];
-      perPolygonResults.forEach((tileStats: PolygonTileStats[]) => {
-        for (const ts of tileStats) {
-          if (ts.gsdStats) {
-            allGsdStats.push(ts.gsdStats);
-          }
-        }
+      // Merge into state: only overwrite entries we just recomputed
+      setPerPolygonStats(prev => {
+        const next = new Map(prev);
+        aggregatedPerPolygon.forEach((v, k) => next.set(k, v));
+        return next;
       });
-      const cumulativeStats = aggregateGSDStats(allGsdStats);
-      setGsdStats(cumulativeStats);
+
+      // Recompute "Overall" from the current perPolygonStats map (cheap and consistent)
+      setGsdStats(curr => {
+        const toAgg: GSDStats[] = [];
+        // include newly computed ones
+        aggregatedPerPolygon.forEach(v => toAgg.push(v.gsdStats));
+        // include existing ones we didn't touch
+        perPolygonStats.forEach((v, k) => {
+          if (!aggregatedPerPolygon.has(k)) toAgg.push(v.gsdStats);
+        });
+        return aggregateGSDStats(toAgg);
+      });
 
       // Add camera position markers in 3D
       if (showCameraPoints && poses.length > 0) {
@@ -351,7 +402,8 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, onLineSpacingChange, onPh
         // Use the new 3D camera point methods
         const api = mapRef.current;
         if (api?.addCameraPoints) {
-          api.addCameraPoints(runId, cameraPositions);
+          const idForCameras = opts?.polygonId ?? '__ALL__';
+          api.addCameraPoints(idForCameras, cameraPositions);
         }
       }
     } finally {
@@ -361,7 +413,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, onLineSpacingChange, onPh
   }, [mapRef, mapboxToken, parseCamera, parsePosesMeters, getPolygons, zoom, opacity, showOverlap, showGsd, showCameraPoints]);
 
   // Auto-run function that can be called externally
-  const autoRun = useCallback(async () => {
+  const autoRun = useCallback(async (opts?: { polygonId?: string; reason?: 'lines'|'spacing'|'alt'|'manual' }) => {
     if (!autoGenerate || running) return;
     
     const api = mapRef.current;
@@ -370,12 +422,22 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, onLineSpacingChange, onPh
     const rings: [number, number][][] = api?.getPolygons?.() ?? [];
     const fl = api?.getFlightLines?.();
     const tiles = api?.getPolygonTiles?.();
-    const haveLines = !!fl && Array.from(fl.values()).some((v: any) => v.flightLines.length > 0);
-    const haveTiles = !!tiles && Array.from(tiles.values()).some((t: any) => (t?.length ?? 0) > 0);
+    const haveLines = !!fl && (
+      opts?.polygonId
+        ? !!fl.get(opts.polygonId) && fl.get(opts.polygonId).flightLines.length > 0
+        : Array.from(fl.values()).some((v: any) => v.flightLines.length > 0)
+    );
+    const haveTiles = !!tiles && (
+      opts?.polygonId
+        ? !!tiles.get(opts.polygonId) && (tiles.get(opts.polygonId)?.length ?? 0) > 0
+        : Array.from(tiles.values()).some((t: any) => (t?.length ?? 0) > 0)
+    );
 
-    if (ready && rings.length > 0 && haveLines && haveTiles) {
+    const havePolys = opts?.polygonId ? (api?.getPolygonsWithIds?.() ?? []).some((p:any)=>p.id===opts.polygonId) : (rings.length > 0);
+
+    if (ready && havePolys && haveLines && haveTiles) {
       autoTriesRef.current = 0;
-      compute(); // all prerequisites present
+      compute(opts?.polygonId ? { polygonId: opts.polygonId } : undefined); // compute single or all
       return;
     }
     
@@ -385,7 +447,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, onLineSpacingChange, onPh
       setTimeout(() => {
         // Check again if we should still retry (component might have unmounted or conditions changed)
         if (autoGenerate && !running && autoTriesRef.current > 0) {
-          autoRun();
+          autoRun(opts);
         }
       }, 300); // Slightly longer delay
     } else {
@@ -401,16 +463,18 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, onLineSpacingChange, onPh
 
   const clear = useCallback(() => {
     const map: any = mapRef.current?.getMap?.();
-    if (map && runIdRef.current) {
-      clearRunOverlays(map, runIdRef.current);
+    if (map) {
+      // Clear overlays for all polygons
+      runIdByPolygonRef.current.forEach((rid) => {
+        clearRunOverlays(map, rid);
+      });
+      runIdByPolygonRef.current.clear();
       
       // Clear camera positions using the new 3D camera point methods
       const api = mapRef.current;
       if (api?.removeCameraPoints) {
-        api.removeCameraPoints(runIdRef.current);
+        api.removeCameraPoints('__ALL__');
       }
-      
-      runIdRef.current = "";
       
       // Clear GSD statistics
       setGsdStats(null);
@@ -634,7 +698,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, onLineSpacingChange, onPh
       </div>
 
       <div className="flex gap-2 items-center">
-        <button onClick={compute} disabled={running}
+        <button onClick={() => compute()} disabled={running}
                 className="px-3 py-1.5 rounded bg-blue-600 text-white text-sm disabled:opacity-50">
           {running ? "Computing…" : "Manual Compute"}
         </button>

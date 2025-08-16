@@ -33,7 +33,7 @@ interface Props {
   onAnalysisComplete?: (results: PolygonAnalysisResult[]) => void;
   onAnalysisStart?: (polygonId: string) => void;
   onError?: (error: string, polygonId?: string) => void;
-  onFlightLinesUpdated?: () => void; // NEW: Called when flight lines are regenerated
+  onFlightLinesUpdated?: (changed: string | '__all__') => void; // polygon-scoped
   onClearGSD?: () => void; // NEW: Called to clear GSD overlays when polygons are deleted
 }
 
@@ -118,8 +118,8 @@ export const MapFlightDirection = React.forwardRef<
             return newFlightLines;
           });
 
-          // Notify that flight lines have been created/updated
-          onFlightLinesUpdated?.();
+          // Notify ONLY this polygon changed (so downstream recomputes just this one)
+          onFlightLinesUpdated?.(result.polygonId);
 
           if (result.result.maxElevation !== undefined && flightLinesResult.flightLines.length > 0 && deckOverlayRef.current) {
             console.log('Building 3D flight path...');
@@ -300,17 +300,23 @@ export const MapFlightDirection = React.forwardRef<
       },
     }), [polygonResults, polygonFlightLines, polygonTiles, cancelAllAnalyses]);
 
-    // 🔁 Re‑apply flight lines, trigger ticks and 3D path whenever spacing/altitude changes
+    // Keep latest maps in refs so we don't re-run this effect when polygons change
+    const polygonResultsRef = useRef(polygonResults);
+    React.useEffect(() => { polygonResultsRef.current = polygonResults; }, [polygonResults]);
+    const polygonTilesRef = useRef(polygonTiles);
+    React.useEffect(() => { polygonTilesRef.current = polygonTiles; }, [polygonTiles]);
+
+    // 🔁 Re‑apply flight lines and 3D path ONLY when spacing/altitude change
     React.useEffect(() => {
       const map = mapRef.current;
       const overlay = deckOverlayRef.current;
       if (!map || !overlay) return;
       if (!map.isStyleLoaded()) return; // Wait for map to be fully ready
-      if (polygonResults.size === 0) return;
+      if (polygonResultsRef.current.size === 0) return;
 
       const newFlightLines = new Map<string, { flightLines: number[][][]; lineSpacing: number }>();
 
-      polygonResults.forEach((res, polygonId) => {
+      polygonResultsRef.current.forEach((res, polygonId) => {
         // Rebuild lines with new spacing
         removeFlightLinesForPolygon(map, polygonId);
         const fl = addFlightLinesForPolygon(
@@ -324,7 +330,7 @@ export const MapFlightDirection = React.forwardRef<
         newFlightLines.set(polygonId, fl);
 
         // Rebuild 3D path with current altitude
-        const tiles = polygonTiles.get(polygonId) || [];
+        const tiles = polygonTilesRef.current.get(polygonId) || [];
         if (tiles.length > 0 && fl.flightLines.length > 0) {
           const path3d = build3DFlightPath(fl.flightLines, tiles, fl.lineSpacing, baseAltitudeAGL);
           update3DPathLayer(overlay, polygonId, path3d, setDeckLayers);
@@ -340,11 +346,11 @@ export const MapFlightDirection = React.forwardRef<
 
       setPolygonFlightLines(newFlightLines);
       
-      // Trigger callback to notify that flight lines have been updated
+      // Notify spacing/alt change → downstream should recompute ALL polygons
       if (newFlightLines.size > 0) {
-        onFlightLinesUpdated?.();
+        onFlightLinesUpdated?.('__all__');
       }
-    }, [lineSpacing, photoSpacing, baseAltitudeAGL, polygonResults, polygonTiles, onFlightLinesUpdated]);
+    }, [lineSpacing, photoSpacing, baseAltitudeAGL, onFlightLinesUpdated]);
 
     return <div ref={mapContainer} style={{ position: 'relative', width: '100%', height: '100%' }} />;
   }
