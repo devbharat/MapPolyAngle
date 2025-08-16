@@ -874,8 +874,11 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
     ]);
 
     return (
-      <div ref={mapContainer} style={{ position: 'relative', width: '100%', height: '100%' }}>
-        {/* Hidden pickers */}
+      <div style={{ position: 'relative', width: '100%', height: '100%' }}>
+        {/* ✅ EMPTY container that Mapbox owns */}
+        <div ref={mapContainer} style={{ position: 'absolute', inset: 0 }} />
+
+        {/* ✅ Siblings, not children of the Mapbox container */}
         <input
           ref={kmlInputRef}
           type="file"

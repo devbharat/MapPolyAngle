@@ -33,8 +33,6 @@ export function addFlightLinesForPolygon(
   lineSpacingM: number,
   quality?: string
 ): { flightLines: number[][][]; lineSpacing: number } {
-  removeFlightLinesForPolygon(map, polygonId);
-
   const bounds = getPolygonBounds(ring);
   const lineSpacing = lineSpacingM;
   const flightLines: number[][][] = [];
@@ -92,75 +90,59 @@ export function addFlightLinesForPolygon(
   }
 
   const sourceId = `flight-lines-source-${polygonId}`;
+  const layerId = `flight-lines-layer-${polygonId}`;
+
+  const data = {
+    type: 'FeatureCollection',
+    features: flightLines.map((line) => ({
+      type: 'Feature',
+      geometry: {
+        type: 'LineString',
+        coordinates: line,
+      },
+      properties: {},
+    })),
+  } as const;
+
+  // Source: update or add
   if (map.getSource(sourceId)) {
-    (map.getSource(sourceId) as any).setData({
-      type: 'FeatureCollection',
-      features: flightLines.map((line) => ({
-        type: 'Feature',
-        geometry: {
-          type: 'LineString',
-          coordinates: line,
-        },
-        properties: {},
-      })),
-    });
+    (map.getSource(sourceId) as any).setData(data);
   } else {
-    map.addSource(sourceId, {
-      type: 'geojson',
-      data: {
-        type: 'FeatureCollection',
-        features: flightLines.map((line) => ({
-          type: 'Feature',
-          geometry: {
-            type: 'LineString',
-            coordinates: line,
-          },
-          properties: {},
-        })),
+    map.addSource(sourceId, { type: 'geojson', data } as any);
+  }
+
+  // Layer: update or add (idempotent)
+  if (map.getLayer(layerId)) {
+    // Update paint properties if needed
+    map.setPaintProperty(layerId, 'line-color', getLineColor(quality));
+    map.setPaintProperty(layerId, 'line-opacity', 0.8);
+    map.setPaintProperty(layerId, 'line-width', 2);
+  } else {
+    map.addLayer({
+      id: layerId,
+      type: 'line',
+      source: sourceId,
+      layout: {
+        'line-join': 'round',
+        'line-cap': 'round',
+      },
+      paint: {
+        'line-color': getLineColor(quality),
+        'line-width': 2,
+        'line-opacity': 0.8,
       },
     });
   }
-
-  const layerId = `flight-lines-layer-${polygonId}`;
-  map.addLayer({
-    id: layerId,
-    type: 'line',
-    source: sourceId,
-    layout: {
-      'line-join': 'round',
-      'line-cap': 'round',
-    },
-    paint: {
-      'line-color': getLineColor(quality),
-      'line-width': 2,
-      'line-opacity': 0.8,
-    },
-  });
 
   return { flightLines, lineSpacing };
 }
 
 export function removeFlightLinesForPolygon(map: MapboxMap, polygonId: string) {
-  if (!map || !map.isStyleLoaded()) return; // Safety check for map readiness
-  
   const layerId = `flight-lines-layer-${polygonId}`;
   const sourceId = `flight-lines-source-${polygonId}`;
   
-  try {
-    if (map.getLayer(layerId)) {
-      map.removeLayer(layerId);
-    }
-  } catch (e) {
-    console.warn(`Failed to remove layer ${layerId}:`, e);
-  }
-  
-  try {
-    if (map.getSource(sourceId)) {
-      map.removeSource(sourceId);
-    }
-  } catch (e) {
-    console.warn(`Failed to remove source ${sourceId}:`, e);
-  }
+  try { if (map.getLayer(layerId)) map.removeLayer(layerId); } catch {}
+  try { if (map.getSource(sourceId)) map.removeSource(sourceId); } catch {}
 }
 
 // -------------------------------------------------------------------
@@ -254,59 +236,33 @@ export function addTriggerPointsForPolygon(
 }
 
 export function removeTriggerPointsForPolygon(map: MapboxMap, polygonId: string) {
-  if (!map || !map.isStyleLoaded()) return; // Safety check for map readiness
-  
   const sourceId = `flight-triggers-source-${polygonId}`;
   const circleLayerId = `flight-triggers-layer-${polygonId}`;
   const labelLayerId = `flight-triggers-label-${polygonId}`;
   
-  try {
-    if (map.getLayer(circleLayerId)) map.removeLayer(circleLayerId);
-  } catch (e) {
-    console.warn(`Failed to remove circle layer ${circleLayerId}:`, e);
-  }
-  
-  try {
-    if (map.getLayer(labelLayerId)) map.removeLayer(labelLayerId);
-  } catch (e) {
-    console.warn(`Failed to remove label layer ${labelLayerId}:`, e);
-  }
-  
-  try {
-    if (map.getSource(sourceId)) map.removeSource(sourceId);
-  } catch (e) {
-    console.warn(`Failed to remove source ${sourceId}:`, e);
-  }
+  try { if (map.getLayer(circleLayerId)) map.removeLayer(circleLayerId); } catch {}
+  try { if (map.getLayer(labelLayerId)) map.removeLayer(labelLayerId); } catch {}
+  try { if (map.getSource(sourceId)) map.removeSource(sourceId); } catch {}
 }
 
 /**
  * Clear all flight lines from the map (for use when clearing all polygons)
  */
 export function clearAllFlightLines(map: MapboxMap) {
-  if (!map || !map.isStyleLoaded()) return;
-  
   const layers = map.getStyle().layers || [];
   const sources = map.getStyle().sources || {};
   
   // Remove all flight line layers
   for (const layer of layers) {
     if (layer.id.startsWith('flight-lines-layer-')) {
-      try {
-        map.removeLayer(layer.id);
-      } catch (e) {
-        console.warn(`Failed to remove flight line layer ${layer.id}:`, e);
-      }
+      try { map.removeLayer(layer.id); } catch {}
     }
   }
   
   // Remove all flight line sources
   for (const sourceId of Object.keys(sources)) {
     if (sourceId.startsWith('flight-lines-source-')) {
-      try {
-        map.removeSource(sourceId);
-      } catch (e) {
-        console.warn(`Failed to remove flight line source ${sourceId}:`, e);
-      }
+      try { map.removeSource(sourceId); } catch {}
     }
   }
 }
@@ -315,30 +271,20 @@ export function clearAllFlightLines(map: MapboxMap) {
  * Clear all trigger points from the map (for use when clearing all polygons)
  */
 export function clearAllTriggerPoints(map: MapboxMap) {
-  if (!map || !map.isStyleLoaded()) return;
-  
   const layers = map.getStyle().layers || [];
   const sources = map.getStyle().sources || {};
   
   // Remove all trigger point layers
   for (const layer of layers) {
     if (layer.id.startsWith('flight-triggers-')) {
-      try {
-        map.removeLayer(layer.id);
-      } catch (e) {
-        console.warn(`Failed to remove trigger layer ${layer.id}:`, e);
-      }
+      try { map.removeLayer(layer.id); } catch {}
     }
   }
   
   // Remove all trigger point sources
   for (const sourceId of Object.keys(sources)) {
     if (sourceId.startsWith('flight-triggers-source-')) {
-      try {
-        map.removeSource(sourceId);
-      } catch (e) {
-        console.warn(`Failed to remove trigger source ${sourceId}:`, e);
-      }
+      try { map.removeSource(sourceId); } catch {}
     }
   }
 }
