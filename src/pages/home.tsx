@@ -1,5 +1,6 @@
 import React, { useState, useRef, useCallback, useMemo } from 'react';
 import { MapFlightDirection } from '@/components/MapFlightDirection';
+import type { MapFlightDirectionAPI } from '@/components/MapFlightDirection/api';
 import { PolygonAnalysisResult } from '@/components/MapFlightDirection/types';
 import { Card, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -12,7 +13,7 @@ import type { PolygonParams } from '@/components/MapFlightDirection/types';
 
 export default function Home() {
   const isMobile = useIsMobile();
-  const mapRef = useRef<any>(null);
+  const mapRef = useRef<MapFlightDirectionAPI>(null);
 
   const [polygonResults, setPolygonResults] = useState<PolygonAnalysisResult[]>([]);
   const [analyzingPolygons, setAnalyzingPolygons] = useState<Set<string>>(new Set());

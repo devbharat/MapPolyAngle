@@ -21,15 +21,11 @@ import { update3DPathLayer, remove3DPathLayer, update3DCameraPointsLayer, remove
 import { build3DFlightPath, calculateFlightLineSpacing } from './utils/geometry';
 import { PolygonAnalysisResult, PolygonParams } from './types';
 import { parseKmlPolygons, calculateKmlBounds } from '@/utils/kml';
+import { SONY_RX1R2 } from '@/domain/camera';
+import type { MapFlightDirectionAPI } from './api';
 
 /** Default camera identical to the one in OverlapGSDPanel */
-const DEFAULT_CAMERA = {
-  f_m: 0.035,
-  sx_m: 4.88e-6,
-  sy_m: 4.88e-6,
-  w_px: 7952,
-  h_px: 5304
-};
+const DEFAULT_CAMERA = SONY_RX1R2;
 
 interface Props {
   mapboxToken: string;
@@ -48,31 +44,7 @@ interface Props {
   onClearGSD?: () => void;
 }
 
-export const MapFlightDirection = React.forwardRef<
-  {
-    clearAllDrawings: () => void;
-    clearPolygon: (polygonId: string) => void;
-    startPolygonDrawing: () => void;
-    getPolygonResults: () => PolygonAnalysisResult[];
-    getMap: () => MapboxMap | undefined;
-    getPolygons: () => [number,number][][];
-    getPolygonsWithIds: () => { id?: string; ring: [number, number][] }[];
-    /** Now includes altitudeAGL used for the 3D path. */
-    getFlightLines: () => Map<string, { flightLines: number[][][]; lineSpacing: number; altitudeAGL: number }>;
-    getPolygonTiles: () => Map<string, any[]>;
-    addCameraPoints: (polygonId: string, positions: [number, number, number][]) => void;
-    removeCameraPoints: (polygonId: string) => void;
-    /** Apply per‑polygon params → draw lines + 3D path and notify downstream. */
-    applyPolygonParams: (polygonId: string, params: PolygonParams) => void;
-    /** Expose current per‑polygon params map to other panels if needed. */
-    getPerPolygonParams: () => Record<string, PolygonParams>;
-    /** NEW: open a file picker to import one or more .kml files */
-    openKmlFilePicker: () => void;
-    /** NEW: programmatic KML import */
-    importKmlFromText: (kml: string) => Promise<{ added: number; total: number }>;
-  },
-  Props
->(
+export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>(
   (
     {
       mapboxToken,

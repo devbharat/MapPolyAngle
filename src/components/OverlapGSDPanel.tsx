@@ -4,28 +4,22 @@ import { OverlapWorker, fetchTerrainRGBA, tilesCoveringPolygon } from "@/overlap
 import { addOrUpdateTileOverlay, clearRunOverlays } from "@/overlap/overlay";
 import type { CameraModel, PoseMeters, PolygonLngLatWithId, GSDStats, PolygonTileStats } from "@/overlap/types";
 import { lngLatToMeters } from "@/overlap/mercator";
+import { metersToLngLat } from "@/services/Projection";
+import { SONY_RX1R2 } from "@/domain/camera";
 import { sampleCameraPositionsOnFlightPath, build3DFlightPath } from "@/components/MapFlightDirection/utils/geometry";
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { toast } from "@/hooks/use-toast";
+import type { MapFlightDirectionAPI } from "@/components/MapFlightDirection/api";
 
 type Props = {
-  mapRef: React.RefObject<any>;
+  mapRef: React.RefObject<MapFlightDirectionAPI>;
   mapboxToken: string;
   /** Provide per‑polygon params (altitude/front/side) so we can compute per‑polygon photoSpacing. */
   getPerPolygonParams?: () => Record<string, { altitudeAGL: number; frontOverlap: number; sideOverlap: number }>;
   onAutoRun?: (autoRunFn: (opts?: { polygonId?: string; reason?: 'lines'|'spacing'|'alt'|'manual' }) => void) => void;
   onClearExposed?: (clearFn: () => void) => void;
-};
-
-// Sony RX1R II camera specifications
-const sonyRX1R2Camera: CameraModel = {
-  f_m: 0.035,          // 35 mm fixed lens
-  sx_m: 4.88e-6,       // 4.88 µm pixel pitch (42.4MP full frame)
-  sy_m: 4.88e-6,
-  w_px: 7952,          // 7952 x 5304 pixels
-  h_px: 5304,
 };
 
 // Helper function to calculate polygon area in acres
@@ -54,7 +48,7 @@ function calculatePolygonAreaAcres(ring: [number, number][]): number {
 }
 
 export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAutoRun, onClearExposed }: Props) {
-  const [cameraText, setCameraText] = useState(JSON.stringify(sonyRX1R2Camera, null, 2));
+  const [cameraText, setCameraText] = useState(JSON.stringify(SONY_RX1R2, null, 2));
   const [altitude, setAltitude] = useState(100); // AGL in meters
   const [frontOverlap, setFrontOverlap] = useState(80); // percentage
   const [sideOverlap, setSideOverlap] = useState(70); // percentage
@@ -227,7 +221,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
     const poses: PoseMeters[] = [];
     let poseId = 0;
 
-    for (const [polygonId, { flightLines, lineSpacing, altitudeAGL }] of flightLinesMap) {
+    for (const [polygonId, { flightLines, lineSpacing, altitudeAGL }] of Array.from(flightLinesMap.entries())) {
       const tiles = tilesMap.get(polygonId) || [];
       if (flightLines.length === 0 || tiles.length === 0) continue;
 
@@ -455,13 +449,10 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
       if (showCameraPoints && poses.length > 0) {
         // Convert poses to 3D coordinates for Deck.gl
         const cameraPositions: [number, number, number][] = poses.map(pose => {
-          // Convert EPSG:3857 back to lng/lat for Deck.gl
-          const lng = (pose.x / 20037508.34) * 180;
-          const lat = (pose.y / 20037508.34) * 180;
-          const latRad = Math.atan(Math.exp(lat * (Math.PI / 180))) * 2 - Math.PI / 2;
-          const latDeg = latRad * (180 / Math.PI);
+          // Convert EPSG:3857 back to lng/lat using correct projection
+          const [lng, lat] = metersToLngLat(pose.x, pose.y);
           
-          return [lng, latDeg, pose.z];
+          return [lng, lat, pose.z];
         });
 
         // Use the new 3D camera point methods
@@ -489,7 +480,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
     const tiles = api?.getPolygonTiles?.();
     const haveLines = !!fl && (
       opts?.polygonId
-        ? !!fl.get(opts.polygonId) && fl.get(opts.polygonId).flightLines.length > 0
+        ? !!fl.get(opts.polygonId) && fl.get(opts.polygonId)!.flightLines.length > 0
         : Array.from(fl.values()).some((v: any) => v.flightLines.length > 0)
     );
     const haveTiles = !!tiles && (
