@@ -101,6 +101,17 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
 
     const [deckLayers, setDeckLayers] = useState<any[]>([]);
 
+    // Keep live copies so async callbacks always see current values (avoid stale closures)
+    const polygonParamsRef = React.useRef(polygonParams);
+    const bearingOverridesRef = React.useRef(bearingOverrides);
+    const polygonTilesRef = React.useRef(polygonTiles);
+    const polygonFlightLinesRef = React.useRef(polygonFlightLines);
+
+    React.useEffect(() => { polygonParamsRef.current = polygonParams; }, [polygonParams]);
+    React.useEffect(() => { bearingOverridesRef.current = bearingOverrides; }, [bearingOverrides]);
+    React.useEffect(() => { polygonTilesRef.current = polygonTiles; }, [polygonTiles]);
+    React.useEffect(() => { polygonFlightLinesRef.current = polygonFlightLines; }, [polygonFlightLines]);
+
     // ---------- helpers ----------
     const fitMapToRings = useCallback((rings: [number, number][][]) => {
       if (!mapRef.current || rings.length === 0) return;
@@ -146,8 +157,8 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         }
 
         // Decide which heading/spacing to use when drawing
-        const params = polygonParams.get(result.polygonId);
-        const override = bearingOverrides.get(result.polygonId);
+        const params = polygonParamsRef.current.get(result.polygonId);
+        const override = bearingOverridesRef.current.get(result.polygonId);
         
         if (!params) {
           // For imported polygons (with overrides), don't ask for params - they're already set
@@ -192,7 +203,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           update3DPathLayer(deckOverlayRef.current, result.polygonId, path3d, setDeckLayers);
         }
       },
-      [onAnalysisComplete, onFlightLinesUpdated, polygonParams, bearingOverrides, onRequestParams]
+      [onAnalysisComplete, onFlightLinesUpdated, onRequestParams]
     );
 
     const memoizedOnAnalysisStart = useCallback((polygonId: string) => {
@@ -499,9 +510,15 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           });
 
           // 3D path
-          const flEntry = polygonFlightLines.get(polygonId);
+          // Use the freshly computed batch, not the (asynchronously) updated state
+          const flEntry = flightLinesToUpdate.get(polygonId);
           const lineSpacing = flEntry?.lineSpacing ?? imported.items[idx]?.lineSpacingM ?? 25;
-          const altitudeAGL = polygonParams.get(polygonId)?.altitudeAGL ?? imported.items[idx]?.altitudeAGL ?? 100;
+
+          // We also have the fresh params in polygonsToUpdate
+          const altitudeAGL =
+            polygonsToUpdate.get(polygonId)?.params.altitudeAGL ??
+            imported.items[idx]?.altitudeAGL ??
+            100;
 
           if (deckOverlayRef.current && flEntry?.flightLines?.length) {
             const path3d = build3DFlightPath(flEntry.flightLines, tiles, lineSpacing, altitudeAGL);
@@ -729,9 +746,13 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         return next;
       });
 
-      // Clear existing flight lines
+      // Clear any old visuals for this polygon
       if (mapRef.current) {
         removeFlightLinesForPolygon(mapRef.current, polygonId);
+        removeTriggerPointsForPolygon(mapRef.current, polygonId);
+      }
+      if (deckOverlayRef.current) {
+        remove3DPathLayer(deckOverlayRef.current, polygonId, setDeckLayers);
       }
 
       // Trigger fresh analysis as if manually drawn
