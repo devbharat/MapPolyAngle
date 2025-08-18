@@ -26,10 +26,14 @@ export default function Home() {
   const [importedOriginals, setImportedOriginals] = useState<Record<string, { bearingDeg: number; lineSpacingM: number }>>({});
   const [overrides, setOverrides] = useState<Record<string, { bearingDeg: number; lineSpacingM?: number; source: 'wingtra' | 'user' }>>({});
   const [selectedPolygonId, setSelectedPolygonId] = useState<string | null>(null);
+  // NEW: track imported pose count
+  const [importedPoseCount, setImportedPoseCount] = useState(0);
 
   // Auto-run GSD analysis when flight lines are updated (already wired)
   const autoRunGSDRef = useRef<((opts?: { polygonId?: string; reason?: 'lines'|'spacing'|'alt'|'manual' }) => void) | null>(null);
   const clearGSDRef = useRef<(() => void) | null>(null);
+  // NEW: ref to open DJI camera JSON importer inside OverlapGSDPanel
+  const openDJIImporterRef = useRef<(() => void) | null>(null);
   
   const terrainZoom = 15; // This is now a fallback - actual zoom is calculated dynamically
   const sampleStep = 1;
@@ -87,10 +91,6 @@ export default function Home() {
 
   const handleCloseParams = useCallback(() => {
     setParamsDialog({ open: false, polygonId: null });
-  }, []);
-
-  const handleLineSpacingChange = useCallback((newLineSpacing: number) => {
-    // Remove old global line spacing handler - now per-polygon
   }, []);
 
   const handleFlightLinesUpdated = useCallback((which: string | '__all__') => {
@@ -186,6 +186,7 @@ export default function Home() {
   const hasResults = polygonResults.length > 0;
   const hasImportedPolygons = Object.keys(importedOriginals).length > 0;
   const hasPolygonsToAnalyze = hasResults || hasImportedPolygons;
+  const panelEnabled = hasPolygonsToAnalyze || importedPoseCount>0; // enable if poses-only
 
   return (
     <div className="h-screen flex flex-col bg-gray-50">
@@ -224,6 +225,17 @@ export default function Home() {
             >
               <Upload className="w-3 h-3 mr-1" />
               Import KML
+            </Button>
+            {/* NEW: Import DJI Camera JSON button */}
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-8 px-2 whitespace-nowrap"
+              onClick={() => openDJIImporterRef.current?.()}
+              title="Import DJI OPF input_cameras.json to run poses-only GSD analysis"
+            >
+              <Upload className="w-3 h-3 mr-1" />
+              Import DJI Camera JSON
             </Button>
             <Button
               size="sm"
@@ -486,13 +498,15 @@ export default function Home() {
           {/* Always mount the GSD Panel to ensure auto-run callback is registered */}
           <Card className="backdrop-blur-md bg-white/95 mt-4">
             <CardContent className="p-3">
-              <div className={hasPolygonsToAnalyze ? '' : 'opacity-50 pointer-events-none'}>
+              <div className={panelEnabled ? '' : 'opacity-50 pointer-events-none'}>
                 <OverlapGSDPanel 
                   mapRef={mapRef} 
                   mapboxToken={mapboxToken} 
                   getPerPolygonParams={() => paramsByPolygon}
                   onAutoRun={handleAutoRunReceived}
                   onClearExposed={handleClearReceived}
+                  onExposePoseImporter={(fn)=>{ openDJIImporterRef.current = fn; }}
+                  onPosesImported={(c)=> setImportedPoseCount(c)}
                 />
               </div>
             </CardContent>
