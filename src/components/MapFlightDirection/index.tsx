@@ -106,11 +106,21 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
     const bearingOverridesRef = React.useRef(bearingOverrides);
     const polygonTilesRef = React.useRef(polygonTiles);
     const polygonFlightLinesRef = React.useRef(polygonFlightLines);
+    const polygonResultsRef = React.useRef(polygonResults);
 
     React.useEffect(() => { polygonParamsRef.current = polygonParams; }, [polygonParams]);
     React.useEffect(() => { bearingOverridesRef.current = bearingOverrides; }, [bearingOverrides]);
     React.useEffect(() => { polygonTilesRef.current = polygonTiles; }, [polygonTiles]);
     React.useEffect(() => { polygonFlightLinesRef.current = polygonFlightLines; }, [polygonFlightLines]);
+    React.useEffect(() => { polygonResultsRef.current = polygonResults; }, [polygonResults]);
+
+    // Debounced callback to prevent React render conflicts when multiple analyses complete
+    const debouncedAnalysisComplete = useCallback(() => {
+      const timeoutId = setTimeout(() => {
+        onAnalysisComplete?.(Array.from(polygonResultsRef.current.values()));
+      }, 0);
+      return timeoutId;
+    }, [onAnalysisComplete]);
 
     // ---------- helpers ----------
     const fitMapToRings = useCallback((rings: [number, number][][]) => {
@@ -136,11 +146,11 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
     // ---------- analysis callbacks ----------
     const handleAnalysisResult = useCallback(
       (result: PolygonAnalysisResult, tiles: any[]) => {
-        // 1) Commit result and notify parent from inside the updater to avoid races
+        // 1) Commit result and defer parent notification to avoid React 18 render conflicts
         setPolygonResults((prev) => {
           const next = new Map(prev);
           next.set(result.polygonId, result);
-          onAnalysisComplete?.(Array.from(next.values()));
+          debouncedAnalysisComplete();
           return next;
         });
 
@@ -201,7 +211,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           update3DPathLayer(deckOverlayRef.current, result.polygonId, path3d, setDeckLayers);
         }
       },
-      [onAnalysisComplete, onFlightLinesUpdated, onRequestParams]
+      [debouncedAnalysisComplete, onFlightLinesUpdated, onRequestParams]
     );
 
     const memoizedOnAnalysisStart = useCallback((polygonId: string) => {
@@ -254,7 +264,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           setPolygonResults((prev) => {
             const next = new Map(prev);
             next.delete(polygonId);
-            onAnalysisComplete?.(Array.from(next.values()));
+            debouncedAnalysisComplete();
             return next;
           });
           setPolygonFlightLines((prev) => {
@@ -286,7 +296,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           onClearGSD?.();
         }
       });
-    }, [cancelAnalysis, onAnalysisComplete, onClearGSD]);
+    }, [cancelAnalysis, debouncedAnalysisComplete, onClearGSD]);
 
     // ---------- Map init ----------
     const onMapLoad = useCallback(
