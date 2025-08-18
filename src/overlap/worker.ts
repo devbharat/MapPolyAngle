@@ -74,30 +74,46 @@ function buildPolygonMasks(
 }
 
 /** O(n) stats & histogram for a subset of indices. */
-function calculateGSDStatsFast(gsdMin: Float32Array, activeIdxs: Uint32Array): GSDStats {
+function calculateGSDStatsFast(gsdMin: Float32Array, activeIdxs: Uint32Array, pixelArea: number): GSDStats {
   let count = 0, sum = 0;
   let min = Number.POSITIVE_INFINITY;
   let max = 0;
+  let totalAreaM2 = 0;
 
   for (let i = 0; i < activeIdxs.length; i++) {
     const gsd = gsdMin[ activeIdxs[i] ];
     if (gsd > 0 && isFinite(gsd)) {
-      count++; sum += gsd;
+      count++; sum += gsd; totalAreaM2 += pixelArea;
       if (gsd < min) min = gsd;
       if (gsd > max) max = gsd;
     }
   }
 
   if (count === 0 || !isFinite(min)) {
-    return { min: 0, max: 0, mean: 0, count: 0, histogram: [] };
+    return { min: 0, max: 0, mean: 0, count: 0, totalAreaM2: 0, histogram: [] } as any;
   }
 
   const mean = sum / count;
-  const numBins = 20;
-  const histogram = new Array<{ bin: number; count: number }>(numBins);
-  for (let b = 0; b < numBins; b++) histogram[b] = { bin: 0, count: 0 };
-
+  const MAX_BINS = 20;
+  const MIN_BIN_SIZE = 0.01; // meters (== 1 cm) – guarantee no finer resolution than this
   const span = max - min;
+
+  // Determine number of bins such that binSize >= MIN_BIN_SIZE (except when span < MIN_BIN_SIZE)
+  let numBins = MAX_BINS;
+  if (span > 0) {
+    const defaultBinSize = span / numBins;
+    if (defaultBinSize < MIN_BIN_SIZE) {
+      // Reduce bin count to keep each bin at least MIN_BIN_SIZE wide
+      numBins = Math.max(1, Math.floor(span / MIN_BIN_SIZE));
+      if (numBins === 0) numBins = 1; // safeguard
+    }
+  } else {
+    numBins = 1;
+  }
+
+  const histogram = new Array<{ bin: number; count: number; areaM2?: number }>(numBins);
+  for (let b = 0; b < numBins; b++) histogram[b] = { bin: 0, count: 0, areaM2: 0 };
+
   if (span <= 0) {
     histogram[0].count = count;
     histogram[0].bin = min;
@@ -109,12 +125,13 @@ function calculateGSDStatsFast(gsdMin: Float32Array, activeIdxs: Uint32Array): G
       let bi = Math.floor((v - min) / binSize);
       if (bi >= numBins) bi = numBins - 1;
       histogram[bi].count += 1;
+      histogram[bi].areaM2 = (histogram[bi].areaM2 || 0) + pixelArea;
     }
     for (let b = 0; b < numBins; b++) {
-      histogram[b].bin = min + (b + 0.5) * (span / numBins);
+      histogram[b].bin = min + (b + 0.5) * binSize;
     }
   }
-  return { min, max, mean, count, histogram };
+  return { min, max, mean, count, totalAreaM2, histogram } as any;
 }
 
 self.onmessage = (ev: MessageEvent<Msg>) => {
@@ -340,7 +357,7 @@ self.onmessage = (ev: MessageEvent<Msg>) => {
     for (let i = 0, w=0; i < mask.length; i++) {
       if (mask[i] && isFinite(gsdMin[i]) && gsdMin[i] > 0) activeP[w++] = i;
     }
-    const stats = calculateGSDStatsFast(gsdMin, activeP);
+    const stats = calculateGSDStatsFast(gsdMin, activeP, pix*pix);
     const hits = poseHitsPerPoly[p];
     const hitPoseIds = new Uint32Array(hits.size);
     let w = 0; 
@@ -355,7 +372,7 @@ self.onmessage = (ev: MessageEvent<Msg>) => {
   }
 
   // Tile‑level stats over union (kept for overlay legend if needed)
-  const gsdStatsUnion: GSDStats = calculateGSDStatsFast(gsdMin, activeIdxs);
+  const gsdStatsUnion: GSDStats = calculateGSDStatsFast(gsdMin, activeIdxs, pix*pix);
 
   const ret: Ret = { z, x, y, size, overlap, gsdMin, maxOverlap, minGsd, gsdStats: gsdStatsUnion, perPolygon };
   (self as any).postMessage(ret, [overlap.buffer, gsdMin.buffer]);

@@ -134,63 +134,63 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
 
   // Function to aggregate GSD statistics from multiple tiles
   const aggregateGSDStats = useCallback((tileStats: GSDStats[]): GSDStats => {
-    if (tileStats.length === 0) {
-      return { min: 0, max: 0, mean: 0, count: 0, histogram: [] };
+    // Filter valid tile stats
+    const valid = tileStats.filter(s => s && s.count > 0 && isFinite(s.min) && isFinite(s.max) && s.max > 0);
+    if (valid.length === 0) return { min:0, max:0, mean:0, count:0, totalAreaM2:0, histogram: [] } as any;
+
+    // Global min/max
+    let globalMin = +Infinity, globalMax = 0;
+    for (const s of valid) { if (s.min < globalMin) globalMin = s.min; if (s.max > globalMax) globalMax = s.max; }
+    if (!(globalMax > globalMin)) {
+      // Degenerate span -> single bin aggregation
+      let totalCount = 0; let totalArea = 0; let sum = 0;
+      for (const s of valid) { totalCount += s.count; totalArea += (s.totalAreaM2 || 0); sum += s.mean * s.count; }
+      return { min: globalMin, max: globalMax, mean: totalCount>0 ? sum/totalCount : 0, count: totalCount, totalAreaM2: totalArea, histogram: [{ bin: globalMin, count: totalCount, areaM2: totalArea }] } as any;
     }
 
-    // Filter out empty stats
-    const validStats = tileStats.filter(stat => stat.count > 0);
-    if (validStats.length === 0) {
-      return { min: 0, max: 0, mean: 0, count: 0, histogram: [] };
+    const MAX_BINS = 20; // keep UI stable
+    const MIN_BIN_SIZE = 0.01; // 1 cm
+    let span = globalMax - globalMin;
+    let numBins = MAX_BINS;
+    if (span / numBins < MIN_BIN_SIZE) {
+      numBins = Math.max(1, Math.floor(span / MIN_BIN_SIZE));
+      if (numBins < 1) numBins = 1;
     }
+    const binSize = span / numBins;
+    const bins = new Array<{ bin:number; count:number; areaM2:number }>(numBins);
+    for (let i=0;i<numBins;i++) bins[i] = { bin: globalMin + (i+0.5)*binSize, count:0, areaM2:0 };
 
-    // Calculate overall statistics
-    const allMins = validStats.map(s => s.min);
-    const allMaxs = validStats.map(s => s.max);
-    const totalMin = Math.min(...allMins);
-    const totalMax = Math.max(...allMaxs);
-    
-    // Calculate weighted mean
-    let totalSum = 0;
-    let totalCount = 0;
-    validStats.forEach(stat => {
-      totalSum += stat.mean * stat.count;
-      totalCount += stat.count;
-    });
-    const overallMean = totalCount > 0 ? totalSum / totalCount : 0;
+    let totalCount = 0; let totalArea = 0; let sum = 0;
 
-    // Improved histogram aggregation to avoid double-counting from overlapping bins
-    const numBins = 20;
-    const histogram: { bin: number; count: number }[] = Array.from({length: numBins}, (_, i) => ({
-      bin: totalMin + (i + 0.5) * (totalMax - totalMin) / numBins,
-      count: 0
-    }));
-
-    // Map each tile's histogram bins to the global binning scheme
-    for (const stat of validStats) {
-      if (stat.histogram.length === 0) continue;
-      
-      const tileRange = stat.max - stat.min || 1;
-      const tileBinWidth = tileRange / stat.histogram.length;
-      
-      for (const {bin, count} of stat.histogram) {
-        // Map this bin to the closest global bin
-        const globalIdx = Math.max(0, Math.min(
-          numBins - 1,
-          Math.floor((bin - totalMin) / (totalMax - totalMin) * numBins)
-        ));
-        histogram[globalIdx].count += count;
+    // Re-bin each tile's histogram into global layout
+    for (const s of valid) {
+      totalCount += s.count;
+      totalArea += (s.totalAreaM2 || 0);
+      sum += s.mean * s.count; // weighted sum for mean
+      if (!s.histogram || s.histogram.length === 0) continue;
+      for (const hb of s.histogram) {
+        if (hb.count === 0) continue;
+        const v = hb.bin;
+        let bi = Math.floor((v - globalMin) / binSize);
+        if (bi < 0) bi = 0; if (bi >= numBins) bi = numBins - 1;
+        bins[bi].count += hb.count;
+        bins[bi].areaM2 += (hb.areaM2 || 0);
       }
     }
 
-    return {
-      min: totalMin,
-      max: totalMax,
-      mean: overallMean,
-      count: totalCount,
-      histogram
-    };
+    // If some bins ended with zero area because tile histograms lacked areaM2 (shouldn't now), approximate using pixel size via proportional count * (mean bin area fraction)
+    // (Leave as 0 if unknown – UI will show 0)
+
+    return { min: globalMin, max: globalMax, mean: totalCount>0 ? sum/totalCount : 0, count: totalCount, totalAreaM2: totalArea, histogram: bins } as any;
   }, []);
+
+  // Convert histogram to area series (areaM2 already provided per bin)
+  const convertHistogramToArea = useCallback((stats: GSDStats): { bin: number; areaM2: number }[] => {
+    if (!stats || !stats.histogram.length) return [];
+    return stats.histogram.map(h => ({ bin: h.bin, areaM2: h.areaM2 || 0 }));
+  }, []);
+  
+  const ACRE_M2 = 4046.8564224;
 
   // Calculate flight parameters from overlap settings
   const calculateFlightParameters = useCallback(() => {
@@ -621,9 +621,10 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
                   {/* Histogram */}
                   <div className="h-48">
                     <ResponsiveContainer width="100%" height="100%">
-                      <BarChart data={stats.gsdStats.histogram.map(bin => ({
+                      <BarChart data={convertHistogramToArea(stats.gsdStats).map(bin => ({
                         gsd: (bin.bin * 100).toFixed(1),
-                        count: bin.count,
+                        areaM2: bin.areaM2,
+                        areaAcres: bin.areaM2 / ACRE_M2,
                         gsdValue: bin.bin
                       }))}>
                         <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
@@ -634,16 +635,21 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
                         />
                         <YAxis 
                           tick={{ fontSize: 10 }}
-                          label={{ value: 'Pixel Count', angle: -90, position: 'insideLeft', style: { fontSize: '10px' } }}
+                          tickFormatter={(v:number)=> (v/ACRE_M2).toFixed(2)}
+                          label={{ value: 'Area (acres)', angle: -90, position: 'insideLeft', style: { fontSize: '10px' } }}
                         />
                         <Tooltip 
-                          formatter={(value, name) => [value?.toLocaleString(), 'Pixels']}
+                          formatter={(value) => {
+                            const m2 = value as number;
+                            const acres = m2 / ACRE_M2;
+                            return [`${acres.toFixed(2)} acres (${m2.toFixed(0)} m²)`, 'Area'];
+                          }}
                           labelFormatter={(label) => `GSD: ${label} cm`}
                           labelStyle={{ fontSize: '11px' }}
                           contentStyle={{ fontSize: '11px' }}
                         />
                         <Bar 
-                          dataKey="count" 
+                          dataKey="areaM2" 
                           fill="#8b5cf6" 
                           stroke="#7c3aed"
                           strokeWidth={0.5}
@@ -688,9 +694,10 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
             {/* Histogram */}
             <div className="h-48">
               <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={gsdStats.histogram.map(bin => ({
+                <BarChart data={convertHistogramToArea(gsdStats).map(bin => ({
                   gsd: (bin.bin * 100).toFixed(1),
-                  count: bin.count,
+                  areaM2: bin.areaM2,
+                  areaAcres: bin.areaM2 / ACRE_M2,
                   gsdValue: bin.bin
                 }))}>
                   <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
@@ -701,16 +708,21 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
                   />
                   <YAxis 
                     tick={{ fontSize: 10 }}
-                    label={{ value: 'Pixel Count', angle: -90, position: 'insideLeft', style: { fontSize: '10px' } }}
+                    tickFormatter={(v:number)=> (v/ACRE_M2).toFixed(2)}
+                    label={{ value: 'Area (acres)', angle: -90, position: 'insideLeft', style: { fontSize: '10px' } }}
                   />
                   <Tooltip 
-                    formatter={(value, name) => [value?.toLocaleString(), 'Pixels']}
+                    formatter={(value) => {
+                      const m2 = value as number;
+                      const acres = m2 / ACRE_M2;
+                      return [`${acres.toFixed(2)} acres (${m2.toFixed(0)} m²)`, 'Area'];
+                    }}
                     labelFormatter={(label) => `GSD: ${label} cm`}
                     labelStyle={{ fontSize: '11px' }}
                     contentStyle={{ fontSize: '11px' }}
                   />
                   <Bar 
-                    dataKey="count" 
+                    dataKey="areaM2" 
                     fill="#3b82f6" 
                     stroke="#1e40af"
                     strokeWidth={0.5}

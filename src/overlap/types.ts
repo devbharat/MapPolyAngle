@@ -28,8 +28,9 @@ export type GSDStats = {
   min: number;
   max: number;
   mean: number;
-  count: number;
-  histogram: { bin: number; count: number }[];
+  count: number;            // number of DEM ground pixels contributing
+  totalAreaM2?: number;      // precise summed ground area (m^2)
+  histogram: { bin: number; count: number; areaM2?: number }[]; // per-bin area in m^2
 };
 
 export type PolygonLngLat = { ring: [number, number][] }; // single-ring polygon
