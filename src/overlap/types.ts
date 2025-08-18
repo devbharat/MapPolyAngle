@@ -67,6 +67,12 @@ export type WorkerIn = {
     maxOverlapNeeded?: number;
     /** Optional: spatial grid resolution for pose indexing per-tile. Default: 8 */
     gridSize?: number;
+    /**
+     * Optional: clip (erode) interior edge of polygon masks by this many meters BEFORE any per‑pixel computation.
+     * Applied as a morphological erosion on each polygon mask independently, then recombined into the union mask.
+     * Use to discard boundary pixels influenced by partial coverage / DEM edge artifacts.
+     */
+    clipInnerBufferM?: number;
   };
 };
 

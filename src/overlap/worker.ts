@@ -146,7 +146,39 @@ self.onmessage = (ev: MessageEvent<Msg>) => {
   const elev = decodeTerrainRGBToElev(data, size);
 
   // --- Polygon masks: per‑polygon + union (for overlay/hot loop)
-  const { tx, masks: polyMasks, unionMask: polyMask, ids: polyIds } = buildPolygonMasks(polygons, z, x, y, size);
+  const { tx, masks: polyMasksOriginal, unionMask: polyMaskOriginal, ids: polyIds } = buildPolygonMasks(polygons, z, x, y, size);
+
+  // Optional interior erosion (clipInnerBufferM in meters)
+  let polyMasks = polyMasksOriginal;
+  let polyMask = polyMaskOriginal;
+  const clipInnerBufferM = options?.clipInnerBufferM ?? 0;
+  if (clipInnerBufferM > 0) {
+    const pixelSizeM = (tileMetersBounds(z, x, y).maxX - tileMetersBounds(z, x, y).minX) / size; // width in meters / size
+    const radiusPx = Math.max(1, Math.floor(clipInnerBufferM / pixelSizeM));
+    if (radiusPx > 0) {
+      // Erode each polygon mask independently then rebuild union
+      const erodeOnce = (src: Uint8Array, size:number): Uint8Array => {
+        const dst = new Uint8Array(src.length);
+        for (let r=1; r<size-1; r++) {
+          const rowBase = r*size;
+            for (let c=1; c<size-1; c++) {
+              const idx = rowBase + c;
+              if (!src[idx]) continue;
+              if (src[idx - 1] && src[idx + 1] && src[idx - size] && src[idx + size]) dst[idx] = 1;
+            }
+        }
+        return dst;
+      };
+      const erode = (src: Uint8Array, k:number): Uint8Array => {
+        let cur = src;
+        for (let i=0; i<k; i++) cur = erodeOnce(cur, size);
+        return cur;
+      };
+      polyMasks = polyMasksOriginal.map(m => erode(m, radiusPx));
+      polyMask = new Uint8Array(size*size);
+      for (const m of polyMasks) for (let i=0;i<m.length;i++) if (m[i]) polyMask[i] = 1;
+    }
+  }
 
   // If nothing intersects this tile → early out
   let polyPixelCount = 0;

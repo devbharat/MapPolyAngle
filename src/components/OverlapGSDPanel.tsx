@@ -99,6 +99,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
   // Cache raw tile data (width, height, and cloned pixel data) to avoid ArrayBuffer transfer issues
   const tileCacheRef = useRef<Map<string, { width: number; height: number; data: Uint8ClampedArray }>>(new Map());
   const autoTriesRef = useRef(0);
+  const [clipInnerBufferM, setClipInnerBufferM] = useState(100);
 
   // Helper function to generate user-friendly polygon names
   const getPolygonDisplayName = useCallback((polygonId: string): { displayName: string; shortId: string } => {
@@ -378,7 +379,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
         const tile = { z:t.z, x:t.x, y:t.y, size: tileData.width, data: freshData };
         
         // Option B: Always pass ALL polygons so worker can credit hits to every polygon in overlapping tiles
-        const res = await worker.runTile({ tile, polygons: targetPolygons, poses, camera } as any);
+        const res = await worker.runTile({ tile, polygons: targetPolygons, poses, camera, options: { clipInnerBufferM } } as any);
 
         // Option B: Track per-polygon, per-tile stats for correct cross-crediting
         if (res.perPolygon) {
@@ -850,6 +851,10 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
           <label className="text-xs text-gray-600 block">
             DEM zoom (tile level)
             <input className="w-full border rounded px-2 py-1 text-xs" type="number" min={8} max={16} value={zoom} onChange={e=>setZoom(Math.max(8, Math.min(16, parseInt(e.target.value||'14'))))} />
+          </label>
+          <label className="text-xs text-gray-600 block">
+            Clip edge (m)
+            <input className="w-full border rounded px-2 py-1 text-xs" type="number" min={0} value={clipInnerBufferM} onChange={e=>setClipInnerBufferM(Math.max(0, parseFloat(e.target.value||'0')))} />
           </label>
           {autoGenerate && <div className="text-xs text-gray-500">{parsePosesMeters()?.length || 0} poses generated</div>}
         </div>
