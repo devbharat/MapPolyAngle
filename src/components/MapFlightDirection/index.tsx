@@ -107,6 +107,8 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
     const polygonTilesRef = React.useRef(polygonTiles);
     const polygonFlightLinesRef = React.useRef(polygonFlightLines);
     const polygonResultsRef = React.useRef(polygonResults);
+    // NEW: Suppress per‑polygon flight line update events during batched imports
+    const suppressFlightLineEventsRef = React.useRef(false);
 
     React.useEffect(() => { polygonParamsRef.current = polygonParams; }, [polygonParams]);
     React.useEffect(() => { bearingOverridesRef.current = bearingOverrides; }, [bearingOverrides]);
@@ -204,7 +206,9 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           return next;
         });
 
-        onFlightLinesUpdated?.(result.polygonId);
+        if (!suppressFlightLineEventsRef.current) {
+          onFlightLinesUpdated?.(result.polygonId);
+        }
 
         if (deckOverlayRef.current && lines.flightLines.length > 0) {
           const path3d = build3DFlightPath(lines.flightLines, tiles, lines.lineSpacing, params.altitudeAGL);
@@ -413,7 +417,9 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
 
         console.log(`📦 Found ${imported.items.length} areas in flightplan`);
         
+        // Suspend automatic per‑polygon side effects during batch
         suspendAutoAnalysisRef.current = true;
+        suppressFlightLineEventsRef.current = true;
         const newRings: [number, number][][] = [];
         const newIds: string[] = [];
         
@@ -428,7 +434,6 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           newIds.push(id);
           newRings.push(item.ring as [number, number][]);
 
-          // Store polygon state for batch update
           const polygonState = {
             params: {
               altitudeAGL: item.altitudeAGL,
@@ -440,7 +445,6 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           };
           polygonsToUpdate.set(id, polygonState);
 
-          // draw lines now with file heading/spacing
           const lines = addFlightLinesForPolygon(
             mapRef.current,
             id,
@@ -465,48 +469,34 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           });
         }
 
-        // Batch state updates
         setPolygonParams(prev => {
           const next = new Map(prev);
-          for (const [id, state] of Array.from(polygonsToUpdate.entries())) {
-            next.set(id, state.params);
-          }
+          for (const [id, state] of Array.from(polygonsToUpdate.entries())) next.set(id, state.params);
           return next;
         });
-
         setImportedOriginals(prev => {
           const next = new Map(prev);
-          for (const [id, state] of Array.from(polygonsToUpdate.entries())) {
-            next.set(id, state.original);
-          }
+          for (const [id, state] of Array.from(polygonsToUpdate.entries())) next.set(id, state.original);
           return next;
         });
-
         setBearingOverrides(prev => {
           const next = new Map(prev);
-          for (const [id, state] of Array.from(polygonsToUpdate.entries())) {
-            next.set(id, state.override);
-          }
+          for (const [id, state] of Array.from(polygonsToUpdate.entries())) next.set(id, state.override);
           return next;
         });
-
         setPolygonFlightLines(prev => {
           const next = new Map(prev);
-          for (const [id, lines] of Array.from(flightLinesToUpdate.entries())) {
-            next.set(id, lines);
-          }
+            for (const [id, lines] of Array.from(flightLinesToUpdate.entries())) next.set(id, lines);
           return next;
         });
 
         // 2) Fit map to imported rings
         fitMapToRings(newRings);
 
-        // 3) Fetch tiles + build 3D paths + tell GSD panel to run (via callback)
+        // 3) Fetch tiles + build 3D paths (still before analysis so we can build paths early)
         for (let idx = 0; idx < newIds.length; idx++) {
           const polygonId = newIds[idx];
           const ring = newRings[idx];
-
-          // terrain zoom heuristic, tiles, store
           const z = calculateOptimalTerrainZoom({ coordinates: ring as any });
           const tiles = await fetchTilesForPolygon({ coordinates: ring as any }, z, mapboxToken, new AbortController().signal);
           setPolygonTiles(prev => {
@@ -514,43 +504,38 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
             next.set(polygonId, tiles);
             return next;
           });
-
-          // 3D path
-          // Use the freshly computed batch, not the (asynchronously) updated state
           const flEntry = flightLinesToUpdate.get(polygonId);
           const lineSpacing = flEntry?.lineSpacing ?? imported.items[idx]?.lineSpacingM ?? 25;
-
-          // We also have the fresh params in polygonsToUpdate
-          const altitudeAGL =
-            polygonsToUpdate.get(polygonId)?.params.altitudeAGL ??
-            imported.items[idx]?.altitudeAGL ??
-            100;
-
+          const altitudeAGL = polygonsToUpdate.get(polygonId)?.params.altitudeAGL ?? imported.items[idx]?.altitudeAGL ?? 100;
           if (deckOverlayRef.current && flEntry?.flightLines?.length) {
             const path3d = build3DFlightPath(flEntry.flightLines, tiles, lineSpacing, altitudeAGL);
             update3DPathLayer(deckOverlayRef.current, polygonId, path3d, setDeckLayers);
           }
-
-          // Kick GSD auto-run path via parent callback
-          onFlightLinesUpdated?.(polygonId);
         }
 
-        // 👉 Re-enable auto-analysis before running explicit analysis to avoid race conditions
+        // 4) Re-enable auto-analysis and run analyses (collect promises)
         suspendAutoAnalysisRef.current = false;
-
-        // 👉 Run terrain analysis now so "Analysis Result" is available immediately.
-        // This does not rotate lines because the Wingtra override is still set.
+        const analysisPromises: Promise<any>[] = [];
         for (const polygonId of newIds) {
           const draw = drawRef.current as any;
-          const feature = draw?.get?.(polygonId);
-          if (feature?.geometry?.type === 'Polygon') {
-            analyzePolygon(polygonId, feature);
-          }
+            const feature = draw?.get?.(polygonId);
+            if (feature?.geometry?.type === 'Polygon') {
+              const p = analyzePolygon(polygonId, feature);
+              analysisPromises.push(p);
+            }
         }
+        console.log(`🧪 Launched ${analysisPromises.length} terrain analyses for imported areas (waiting to batch notify GSD)...`);
+        await Promise.allSettled(analysisPromises);
+        console.log(`🧪 All imported terrain analyses settled.`);
+
+        // 5) Allow per‑polygon events again & emit a single aggregate update
+        suppressFlightLineEventsRef.current = false;
+        onFlightLinesUpdated?.('__all__');
 
         console.log(`✅ Successfully imported ${newIds.length} areas with file bearings preserved. Use "Optimize" to get terrain-optimal directions.`);
         return { added: newIds.length, total: imported.items.length, areas: areasOut };
       } catch (e) {
+        suppressFlightLineEventsRef.current = false;
         onError?.(`Failed to import flightplan: ${e instanceof Error ? e.message : 'Unknown error'}`);
         suspendAutoAnalysisRef.current = false;
         return { added: 0, total: 0, areas: [] };
