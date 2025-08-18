@@ -152,6 +152,8 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         setPolygonResults((prev) => {
           const next = new Map(prev);
           next.set(result.polygonId, result);
+          // Keep ref in sync immediately so batch callbacks (import) can read it before effect runs
+            polygonResultsRef.current = next;
           debouncedAnalysisComplete();
           return next;
         });
@@ -527,6 +529,10 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         console.log(`🧪 Launched ${analysisPromises.length} terrain analyses for imported areas (waiting to batch notify GSD)...`);
         await Promise.allSettled(analysisPromises);
         console.log(`🧪 All imported terrain analyses settled.`);
+
+        // Ensure effects updating polygonResultsRef have flushed before emitting final results
+        await new Promise(r => setTimeout(r, 0));
+        onAnalysisComplete?.(Array.from(polygonResultsRef.current.values()));
 
         // 5) Allow per‑polygon events again & emit a single aggregate update
         suppressFlightLineEventsRef.current = false;
