@@ -266,13 +266,10 @@ export default function Home() {
           onClose={handleCloseParams}
           onSubmit={handleApplyParams}
           onSubmitAll={(params) => {
-            // Apply to current first (ensures it gets lines immediately)
-            if (paramsDialog.polygonId) {
-              mapRef.current?.applyPolygonParams?.(paramsDialog.polygonId, params);
-              setParamsByPolygon(prev => ({ ...prev, [paramsDialog.polygonId!]: params }));
-            }
-            // Bulk apply to remaining queued polygons
             mapRef.current?.applyParamsToAllPending?.(params as any);
+            // Refresh local cache from source of truth
+            const updated = mapRef.current?.getPerPolygonParams?.() || {};
+            setParamsByPolygon(updated as any);
             setParamsDialog({ open: false, polygonId: null });
           }}
           defaults={{
