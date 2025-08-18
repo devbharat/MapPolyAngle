@@ -110,9 +110,6 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
     // NEW: If user clicks "Apply All" while some polygons still analyzing, preset params
     const bulkPresetParamsRef = useRef<PolygonParams | null>(null);
 
-    // Track any scheduled param dialog timeouts so we can cancel after bulk apply
-    const paramDialogTimeoutsRef = useRef<number[]>([]);
-
     // Keep live copies so async callbacks always see current values (avoid stale closures)
     const polygonParamsRef = React.useRef(polygonParams);
     const bearingOverridesRef = React.useRef(bearingOverrides);
@@ -204,8 +201,6 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
             if (next.length === 1) {
               // defer to avoid render phase state update warning
               setTimeout(() => onRequestParams?.(result.polygonId, result.polygon.coordinates), 0);
-              const tid = window.setTimeout(() => onRequestParams?.(result.polygonId, result.polygon.coordinates), 0);
-              paramDialogTimeoutsRef.current.push(tid);
             }
             return next;
           });
@@ -685,7 +680,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
     }, [importKmlFromText, onError]);
 
     // ---------- Imperative API ----------
-    const applyPolygonParams = useCallback((polygonId: string, params: PolygonParams, opts?: { skipEvent?: boolean }) => {
+    const applyPolygonParams = useCallback((polygonId: string, params: PolygonParams, opts?: { skipEvent?: boolean; skipQueue?: boolean }) => {
       setPolygonParams((prev) => {
         const next = new Map(prev);
         next.set(polygonId, params);
@@ -725,6 +720,8 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         update3DPathLayer(deckOverlayRef.current, polygonId, path3d, setDeckLayers);
       }
 
+      if (opts?.skipQueue) return; // bulk path; do not touch queue
+
       setPendingParamPolygons(prev => {
         const rest = prev.filter(id => id !== polygonId);
         if (!bulkApplyRef.current && rest.length > 0) {
@@ -732,19 +729,14 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           const nextRes = polygonResultsRef.current.get(nextId);
           if (nextRes) {
             setTimeout(() => onRequestParams?.(nextId, nextRes.polygon.coordinates), 0);
-            const tid = window.setTimeout(() => onRequestParams?.(nextId, nextRes.polygon.coordinates), 0);
-            paramDialogTimeoutsRef.current.push(tid);
           } else {
             const draw = drawRef.current as any;
             const f = draw?.get?.(nextId);
             if (f?.geometry?.type === 'Polygon') setTimeout(() => onRequestParams?.(nextId, f.geometry.coordinates[0]), 0);
-            if (f?.geometry?.type === 'Polygon') {
-              const tid2 = window.setTimeout(() => onRequestParams?.(nextId, f.geometry.coordinates[0]), 0);
-              paramDialogTimeoutsRef.current.push(tid2);
-            }
           }
+        } else if (rest.length === 0) {
+          bulkPresetParamsRef.current = null;
         }
-        // Do NOT clear bulkPresetParamsRef here; keep it for late analyses
         return rest;
       });
     }, [polygonResults, polygonTiles, onFlightLinesUpdated]);
@@ -753,14 +745,10 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
     const applyParamsToAllPending = useCallback((params: PolygonParams) => {
       const queueSnapshot = [...pendingParamPolygons];
       if (queueSnapshot.length === 0) {
-        // even if queue empty, set preset so late polygons adopt
-        bulkPresetParamsRef.current = params;
+        bulkPresetParamsRef.current = params; // adopt for late arrivals
         return;
       }
       bulkApplyRef.current = true;
-      // Cancel any pending dialog-open timeouts to avoid reopen after close
-      paramDialogTimeoutsRef.current.forEach(id => clearTimeout(id));
-      paramDialogTimeoutsRef.current = [];
       bulkPresetParamsRef.current = params;
       setPolygonParams(prev => {
         const next = new Map(prev);
@@ -771,7 +759,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       suppressFlightLineEventsRef.current = true;
       for (const pid of queueSnapshot) {
         if (polygonResultsRef.current.has(pid)) {
-          applyPolygonParams(pid, params, { skipEvent: true });
+          applyPolygonParams(pid, params, { skipEvent: true, skipQueue: true });
         }
       }
       setPendingParamPolygons([]);
