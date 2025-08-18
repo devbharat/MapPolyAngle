@@ -13,6 +13,9 @@ import { Badge } from "@/components/ui/badge";
 import { toast } from "@/hooks/use-toast";
 import type { MapFlightDirectionAPI } from "@/components/MapFlightDirection/api";
 import { extractPoses, wgs84ToWebMercator, CameraPoseWGS84, extractCameraModel } from "@/utils/djiGeotags";
+// Turf types may be unresolved if TS can't find bundled types; cast as any.
+// @ts-ignore
+import * as turf from '@turf/turf';
 
 type Props = {
   mapRef: React.RefObject<MapFlightDirectionAPI>;
@@ -99,7 +102,8 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
   // Cache raw tile data (width, height, and cloned pixel data) to avoid ArrayBuffer transfer issues
   const tileCacheRef = useRef<Map<string, { width: number; height: number; data: Uint8ClampedArray }>>(new Map());
   const autoTriesRef = useRef(0);
-  const [clipInnerBufferM, setClipInnerBufferM] = useState(100);
+  const [clipInnerBufferM, setClipInnerBufferM] = useState(50);
+  const [maxTiltDeg, setMaxTiltDeg] = useState(10); // NEW: max allowable camera tilt (deg from vertical)
 
   // Helper function to generate user-friendly polygon names
   const getPolygonDisplayName = useCallback((polygonId: string): { displayName: string; shortId: string } => {
@@ -274,9 +278,15 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
   }, [getPerPolygonParams, mapRef, photoSpacingFor]);
 
   const parsePosesMeters = useCallback((): PoseMeters[] | null => {
-    if (autoGenerate) return generatePosesFromFlightLines();
-    return importedPoses.length ? importedPoses : [];
-  }, [autoGenerate, generatePosesFromFlightLines, importedPoses]);
+    const base = autoGenerate ? generatePosesFromFlightLines() : (importedPoses.length ? importedPoses : []);
+    if (!base) return [];
+    // NEW: filter poses by tilt (sqrt(omega^2 + phi^2) ~ small-angle off-nadir approximation)
+    const filtered = maxTiltDeg >= 0 ? base.filter(p => {
+      const tilt = Math.sqrt((p.omega_deg||0)*(p.omega_deg||0) + (p.phi_deg||0)*(p.phi_deg||0));
+      return tilt <= maxTiltDeg;
+    }) : base;
+    return filtered;
+  }, [autoGenerate, generatePosesFromFlightLines, importedPoses, maxTiltDeg]);
 
   const getPolygons = useCallback((): PolygonLngLatWithId[] => {
     const api = mapRef.current;
@@ -297,16 +307,30 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
       ? allPolygonsFromMap.filter(p => (p.id || 'unknown') === opts.polygonId)
       : allPolygonsFromMap;
 
-    // If no polygons but we have imported poses, synthesize a rectangle
-    if (targetPolygons.length === 0 && poses && poses.length > 0) {
-      const ring = poseAreaRingRef.current?.length ? poseAreaRingRef.current : (() => {
-        let minX=Infinity,minY=Infinity,maxX=-Infinity,maxY=-Infinity;
-        for (const p of poses) { if(p.x<minX)minX=p.x; if(p.x>maxX)maxX=p.x; if(p.y<minY)minY=p.y; if(p.y>maxY)maxY=p.y; }
-        if(!Number.isFinite(minX)) return [] as any;
-        return metersBoundsToLngLatRing(minX-500,minY-500,maxX+500,maxY+500);
-      })();
+    // If no polygons but we have imported poses, synthesize AOI from poses (concave hull + outward buffer)
+    if (targetPolygons.length === 0 && poses && poses.length > 0 && camera) {
+      const buildPosesAOIRing = (poses: PoseMeters[], camera: CameraModel, clipInnerBufferM: number): [number,number][] => {
+        if (!poses || poses.length < 3) return [];
+        const MAX_POINTS = 2000;
+        const step = Math.max(1, Math.floor(poses.length / MAX_POINTS));
+        const pts = poses.filter((_,i)=> i % step === 0).map(p=>{
+          const [lng, lat] = metersToLngLat(p.x, p.y);
+          return turf.point([lng, lat]);
+        });
+        const fc = turf.featureCollection(pts);
+        // Convex hull only (concave removed per request)
+        const hull = turf.convex(fc);
+        if (!hull) return [];
+        // Optional outward buffer disabled; keep placeholder for future tuning
+        const BUFFER_OUT = 0;
+        const poly = BUFFER_OUT > 0 ? turf.buffer(hull as any, BUFFER_OUT, { units: 'meters' }) : hull;
+        const geom: any = poly.geometry;
+        const ring: [number,number][] = geom.type === 'Polygon' ? geom.coordinates[0] : geom.coordinates[0][0];
+        return ring;
+      };
+      const ring = poseAreaRingRef.current?.length ? poseAreaRingRef.current : buildPosesAOIRing(poses, camera, clipInnerBufferM);
       poseAreaRingRef.current = ring;
-      if (ring.length>=4) targetPolygons = [{ id: '__POSES__', ring }];
+      if (ring.length >= 4) targetPolygons = [{ id: '__POSES__', ring }];
     }
 
     if (!camera || !poses || poses.length===0 || targetPolygons.length===0) {
@@ -490,7 +514,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
       worker.terminate();
       setRunning(false);
     }
-  }, [mapRef, mapboxToken, parseCamera, parsePosesMeters, getPolygons, zoom, opacity, showOverlap, showGsd, showCameraPoints]);
+  }, [mapRef, mapboxToken, parseCamera, parsePosesMeters, getPolygons, zoom, opacity, showOverlap, showGsd, showCameraPoints, clipInnerBufferM, altitude]);
 
   // Auto-run function that can be called externally
   const autoRun = useCallback(async (opts?: { polygonId?: string; reason?: 'lines'|'spacing'|'alt'|'manual' }) => {
@@ -575,23 +599,11 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
         }
         const posesMeters: PoseMeters[] = posesWgs.map((p, i) => {
           const { x, y } = wgs84ToWebMercator(p.lat, p.lon);
-          return {
-            id: p.id ?? `pose_${i}`,
-            x,
-            y,
-            z: p.alt ?? 0,
-            omega_deg: p.roll ?? 0,
-            phi_deg: p.pitch ?? 0,
-            kappa_deg: p.yaw ?? 0,
-          } as PoseMeters;
+          return { id: p.id ?? `pose_${i}`, x, y, z: p.alt ?? 0, omega_deg: p.roll ?? 0, phi_deg: p.pitch ?? 0, kappa_deg: p.yaw ?? 0 } as PoseMeters;
         });
         setImportedPoses(posesMeters);
         if (posesMeters.length) {
-          let minX=Infinity,minY=Infinity,maxX=-Infinity,maxY=-Infinity;
-          for (const p of posesMeters) { if(p.x<minX)minX=p.x; if(p.x>maxX)maxX=p.x; if(p.y<minY)minY=p.y; if(p.y>maxY)maxY=p.y; }
-          if (Number.isFinite(minX)) {
-            poseAreaRingRef.current = metersBoundsToLngLatRing(minX-500,minY-500,maxX+500,maxY+500);
-          }
+          poseAreaRingRef.current = [];// force rebuild in compute via AOI function
         }
         setAutoGenerate(false);
         setShowCameraPoints(true);
@@ -847,6 +859,10 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
           <label className="text-xs text-gray-600 block">
             Side overlap (%)
             <input className="w-full border rounded px-2 py-1 text-xs" type="number" min="0" max="95" value={sideOverlap} onChange={e=>setSideOverlap(parseInt(e.target.value||'70'))} />
+          </label>
+          <label className="text-xs text-gray-600 block">
+            Max tilt (deg)
+            <input className="w-full border rounded px-2 py-1 text-xs" type="number" min="0" max="90" value={maxTiltDeg} onChange={e=>setMaxTiltDeg(Math.max(0, Math.min(90, parseFloat(e.target.value||'10'))))} />
           </label>
           <label className="text-xs text-gray-600 block">
             DEM zoom (tile level)
