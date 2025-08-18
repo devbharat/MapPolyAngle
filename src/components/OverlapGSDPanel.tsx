@@ -52,7 +52,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
   const [altitude, setAltitude] = useState(100); // AGL in meters
   const [frontOverlap, setFrontOverlap] = useState(80); // percentage
   const [sideOverlap, setSideOverlap] = useState(70); // percentage
-  const [zoom, setZoom] = useState(15);
+  const [zoom, setZoom] = useState(14);
   const [opacity, setOpacity] = useState(0.85);
   const [showOverlap, setShowOverlap] = useState(false); // Changed default to false
   const [showGsd, setShowGsd] = useState(true);
@@ -759,6 +759,10 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
             Side overlap (%)
             <input className="w-full border rounded px-2 py-1 text-xs" type="number" 
                    min="0" max="95" value={sideOverlap} onChange={e=>setSideOverlap(parseInt(e.target.value||"70"))} />
+          </label>
+          <label className="text-xs text-gray-600 block">
+            DEM zoom (tile level)
+            <input className="w-full border rounded px-2 py-1 text-xs" type="number" min={8} max={16} value={zoom} onChange={e=>setZoom(Math.max(8, Math.min(16, parseInt(e.target.value||"14"))))} />
           </label>
           {/* Commented out for simplified UI
           <label className="text-xs text-gray-600 block">
