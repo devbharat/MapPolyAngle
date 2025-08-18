@@ -390,6 +390,16 @@ self.onmessage = (ev: MessageEvent<Msg>) => {
     }
   }
 
+  // NEW: enforce minimum overlap (e.g. 4) for GSD validity
+  const MIN_OVERLAP_FOR_GSD = 4;
+  for (let t = 0; t < activeIdxs.length; t++) {
+    const idx = activeIdxs[t];
+    if (overlap[idx] > 0 && overlap[idx] < MIN_OVERLAP_FOR_GSD) {
+      overlap[idx] = 0;               // treat as no coverage
+      gsdMin[idx] = Number.POSITIVE_INFINITY; // exclude from stats & histograms
+    }
+  }
+
   // --- Union summaries
   let maxOverlap = 0, minGsd = Number.POSITIVE_INFINITY;
   for (let t = 0; t < activeIdxs.length; t++) {

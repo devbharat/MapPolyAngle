@@ -102,7 +102,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
   // Cache raw tile data (width, height, and cloned pixel data) to avoid ArrayBuffer transfer issues
   const tileCacheRef = useRef<Map<string, { width: number; height: number; data: Uint8ClampedArray }>>(new Map());
   const autoTriesRef = useRef(0);
-  const [clipInnerBufferM, setClipInnerBufferM] = useState(50);
+  const [clipInnerBufferM, setClipInnerBufferM] = useState(0);
   const [maxTiltDeg, setMaxTiltDeg] = useState(10); // NEW: max allowable camera tilt (deg from vertical)
 
   // Helper function to generate user-friendly polygon names
