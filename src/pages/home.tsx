@@ -228,6 +228,26 @@ export default function Home() {
               size="sm"
               variant="outline"
               className="h-8 px-2 whitespace-nowrap"
+              onClick={() => {
+                const api = mapRef.current; if (!api?.exportWingtraFlightPlan) return;
+                const { json, blob } = api.exportWingtraFlightPlan();
+                const original = (mapRef.current as any)?.lastImportedFlightplanName; // not exposed; fallback below
+                const fn = (original && original.endsWith('.flightplan')) ? original.replace(/\.flightplan$/,'-exported.flightplan') : 'exported.flightplan';
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = fn;
+                document.body.appendChild(a); a.click();
+                setTimeout(()=>{ URL.revokeObjectURL(url); a.remove(); }, 1000);
+              }}
+              title="Export current polygons & parameters as Wingtra .flightplan JSON"
+            >
+              Export Plan
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-8 px-2 whitespace-nowrap"
               onClick={clearAllDrawings}
             >
               <Trash2 className="w-3 h-3 mr-1" />

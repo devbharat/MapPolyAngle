@@ -279,3 +279,16 @@ function cryptoRandomUuid(): string {
     return v.toString(16);
   });
 }
+
+export function areasFromState(polys: Array<{ring:[number,number][]; params:{ altitudeAGL:number; frontOverlap:number; sideOverlap:number }; bearingDeg:number; lineSpacingM?:number; triggerDistanceM?:number }>): Array<{ ring:[number,number][]; altitudeAGL:number; frontOverlap:number; sideOverlap:number; angleDeg:number; lineSpacingM?:number; triggerDistanceM?:number; terrainFollowing?:boolean }> {
+  return polys.map(p => ({
+    ring: p.ring,
+    altitudeAGL: p.params.altitudeAGL,
+    frontOverlap: p.params.frontOverlap,
+    sideOverlap: p.params.sideOverlap,
+    angleDeg: p.bearingDeg,
+    lineSpacingM: p.lineSpacingM,
+    triggerDistanceM: p.triggerDistanceM,
+    terrainFollowing: true,
+  }));
+}

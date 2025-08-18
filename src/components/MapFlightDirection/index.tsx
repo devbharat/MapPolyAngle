@@ -30,6 +30,7 @@ import { fetchTilesForPolygon } from './utils/terrain';
 
 // NEW: Wingtra import helpers
 import { importWingtraFlightPlan } from '@/interop/wingtra/convert';
+import { exportToWingtraFlightPlan, areasFromState } from '@/interop/wingtra/convert';
 
 const DEFAULT_CAMERA = SONY_RX1R2;
 
@@ -100,6 +101,10 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
     >(new Map());
 
     const [deckLayers, setDeckLayers] = useState<any[]>([]);
+
+    // NEW: Store last imported flightplan JSON and original filename for export fidelity.
+    const [lastImportedFlightplan, setLastImportedFlightplan] = useState<any|null>(null);
+    const [lastImportedFlightplanName, setLastImportedFlightplanName] = useState<string|undefined>(undefined);
 
     // Keep live copies so async callbacks always see current values (avoid stale closures)
     const polygonParamsRef = React.useRef(polygonParams);
@@ -409,6 +414,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       try {
         console.log(`📥 Importing Wingtra flightplan...`);
         const parsed = JSON.parse(json);
+        setLastImportedFlightplan(parsed);
         const imported = importWingtraFlightPlan(parsed, { angleConvention: 'northCW' }); // change if you need eastCW
         const areasOut: ImportedFlightplanArea[] = [];
 
@@ -549,19 +555,15 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
     }, [mapboxToken, addRingAsDrawFeature, polygonFlightLines, polygonParams, fitMapToRings, analyzePolygon, onFlightLinesUpdated, onError]);
 
     const handleFlightplanFileChange = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
-      const files = Array.from(e.target.files || []).filter(f =>
-        /\.flightplan$/i.test(f.name) || /\.json$/i.test(f.name)
-      );
-      if (files.length === 0) {
-        onError?.("Please select a valid Wingtra .flightplan (JSON) file");
-        return;
-      }
-      for (const file of files) {
+      const files = e.target.files;
+      if (!files) return;
+      for (const file of Array.from(files)) {
         try {
           const text = await file.text();
+          setLastImportedFlightplanName(file.name);
           await importWingtraFromText(text);
         } catch (err) {
-          onError?.(`Failed to read file ${file.name}: ${err instanceof Error ? err.message : 'Unknown error'}`);
+          onError?.(`Failed to read flightplan file ${file.name}: ${err instanceof Error ? err.message : 'Unknown error'}`);
         }
       }
       if (flightplanInputRef.current) flightplanInputRef.current.value = '';
@@ -857,9 +859,47 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       optimizePolygonDirection,
       revertPolygonToImportedDirection,
       runFullAnalysis,
-
+      
       getBearingOverrides: () => Object.fromEntries(bearingOverrides),
       getImportedOriginals: () => Object.fromEntries(importedOriginals),
+      exportWingtraFlightPlan: () => {
+        // Build area list from current state
+        const polys: Array<{ ring:[number,number][]; params: { altitudeAGL:number; frontOverlap:number; sideOverlap:number }; bearingDeg:number; lineSpacingM?:number; triggerDistanceM?:number }> = [];
+        polygonParams.forEach((params, pid) => {
+          const res = polygonResults.get(pid);
+          const collection = drawRef.current?.getAll();
+          const feature = collection?.features.find(f=>f.id===pid && f.geometry?.type==='Polygon');
+          const ring = res?.polygon.coordinates || (feature?.geometry as any)?.coordinates?.[0];
+          if (!ring) return;
+          const override = bearingOverrides.get(pid);
+          const bearingDeg = override ? override.bearingDeg : (res?.result.contourDirDeg ?? 0);
+          const lineSpacingM = override?.lineSpacingM || (polygonFlightLines.get(pid)?.lineSpacing);
+          polys.push({ ring: ring as any, params: { altitudeAGL: params.altitudeAGL, frontOverlap: params.frontOverlap, sideOverlap: params.sideOverlap }, bearingDeg, lineSpacingM, triggerDistanceM: undefined });
+        });
+        const areas = areasFromState(polys);
+        let fp;
+        if (lastImportedFlightplan) {
+          // Deep clone original
+            fp = JSON.parse(JSON.stringify(lastImportedFlightplan));
+          // Replace flightPlan.items only (preserve metadata/stats; some tools may recalc them)
+          fp.flightPlan.items = exportToWingtraFlightPlan(areas, {}).flightPlan.items;
+          // Optionally update payload fields if camera changed (skipped for now)
+          // Reset derived stats that may be stale
+          fp.flightPlan.numberOfImages = 0;
+          fp.flightPlan.totalArea = 0;
+          fp.flightPlan.activeTotalArea = 0;
+          fp.flightPlan.activeNumberOfImages = 0;
+          fp.flightPlan.flownPercentage = 0;
+          fp.flightPlan.resumeMissionIndex = 0;
+          fp.flightPlan.resumeGridPointIndex = -1;
+          fp.flightPlan.lastModifiedTime = Date.now();
+        } else {
+          fp = exportToWingtraFlightPlan(areas, {});
+        }
+        const json = JSON.stringify(fp, null, 2);
+        const blob = new Blob([json], { type: 'application/json' });
+        return { json, blob };
+      },
     }), [
       polygonResults, polygonFlightLines, polygonTiles, polygonParams,
       cancelAllAnalyses, applyPolygonParams,
