@@ -103,6 +103,8 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
     >(new Map());
 
     const [deckLayers, setDeckLayers] = useState<any[]>([]);
+    // Latch for bulk Apply All: auto-apply same params to late-finishing analyses (expires)
+    const autoApplyAllRef = useRef<{ params: PolygonParams; timeout: number } | null>(null);
 
     // NEW: Store last imported flightplan JSON and original filename for export fidelity.
     const [lastImportedFlightplan, setLastImportedFlightplan] = useState<any|null>(null);
@@ -177,13 +179,19 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         const override = bearingOverridesRef.current.get(result.polygonId);
         
         if (!params) {
+          // Late polygon after Apply All: silently auto-apply bulk params
+          if (autoApplyAllRef.current) {
+            applyPolygonParams(result.polygonId, autoApplyAllRef.current.params);
+            return;
+          }
+          // Imported with file override already has lines
           if (override) {
             console.log(`Skipping params dialog for imported polygon ${result.polygonId}`);
             return;
           }
-          // Queue this polygon for parameter input; first in queue triggers dialog.
+          // Normal flow: queue for manual setup
           setPendingParamPolygons(prev => {
-            if (prev.includes(result.polygonId)) return prev; // already queued
+            if (prev.includes(result.polygonId)) return prev;
             const next = [...prev, result.polygonId];
             if (next.length === 1) {
               onRequestParams?.(result.polygonId, result.polygon.coordinates);
@@ -367,11 +375,12 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
     const importKmlFromText = useCallback(async (kmlText: string) => {
       try {
         const polygons = parseKmlPolygons(kmlText);
-        let added = 0;
-
+        let added = 0; const newIds: string[] = [];
+        suspendAutoAnalysisRef.current = true;
         for (const p of polygons) {
           if (p.ring?.length >= 4) {
-            addRingAsDrawFeature(p.ring, p.name);
+            const id = addRingAsDrawFeature(p.ring, p.name, { source: 'kml' });
+            if (id) newIds.push(id);
             added++;
           }
         }
@@ -392,11 +401,20 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           onError?.("No valid polygons found in KML file");
         }
 
+        // Run analyses after all added
+        suspendAutoAnalysisRef.current = false;
+        for (const pid of newIds) {
+          const draw = drawRef.current as any;
+            const f = draw?.get?.(pid);
+            if (f?.geometry?.type === 'Polygon') analyzePolygon(pid, f);
+        }
         return { added, total: polygons.length };
       } catch (error) {
         const message = error instanceof Error ? error.message : "Failed to parse KML file";
         onError?.(message);
         return { added: 0, total: 0 };
+      } finally {
+        suspendAutoAnalysisRef.current = false;
       }
     }, [addRingAsDrawFeature, onError]);
 
@@ -724,39 +742,19 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
     const applyParamsToAllPending = useCallback((params: PolygonParams) => {
       const queueSnapshot = [...pendingParamPolygons];
       if (queueSnapshot.length === 0) return;
-      // Temporarily silence per-polygon events to batch one notification
+      // Arm auto-apply latch (30s TTL)
+      if (autoApplyAllRef.current?.timeout) clearTimeout(autoApplyAllRef.current.timeout);
+      const timeout = window.setTimeout(() => { autoApplyAllRef.current = null; }, 30000);
+      autoApplyAllRef.current = { params, timeout };
       const prevSuppress = suppressFlightLineEventsRef.current;
       suppressFlightLineEventsRef.current = true;
-
       for (const pid of queueSnapshot) {
-        // Directly set params without queue popping side-effect then apply
-        setPolygonParams(prev => { const next = new Map(prev); next.set(pid, params); return next; });
-        const res = polygonResultsRef.current.get(pid);
-        if (!res || !mapRef.current) continue;
-        const override = bearingOverridesRef.current.get(pid);
-        const bearingDeg = override ? override.bearingDeg : res.result.contourDirDeg;
-        const spacing = override?.lineSpacingM ?? calculateFlightLineSpacing(DEFAULT_CAMERA, params.altitudeAGL, params.sideOverlap);
-        removeFlightLinesForPolygon(mapRef.current, pid);
-        const fl = addFlightLinesForPolygon(
-          mapRef.current,
-          pid,
-          res.polygon.coordinates,
-          bearingDeg,
-          spacing,
-          res.result.fitQuality
-        );
-        setPolygonFlightLines(prev => { const next = new Map(prev); next.set(pid, { ...fl, altitudeAGL: params.altitudeAGL }); return next; });
-        const tiles = polygonTilesRef.current.get(pid) || [];
-        if (deckOverlayRef.current && fl.flightLines.length > 0) {
-          const path3d = build3DFlightPath(fl.flightLines, tiles, fl.lineSpacing, params.altitudeAGL);
-          update3DPathLayer(deckOverlayRef.current, pid, path3d, setDeckLayers);
-        }
+        applyPolygonParams(pid, params); // reuse single apply (will remove from queue progressively)
       }
-      // Clear entire queue WITHOUT triggering next dialog
       setPendingParamPolygons([]);
       suppressFlightLineEventsRef.current = prevSuppress;
       onFlightLinesUpdated?.('__all__');
-    }, [pendingParamPolygons, onFlightLinesUpdated]);
+    }, [pendingParamPolygons, onFlightLinesUpdated, applyPolygonParams]);
 
     // RESTORED: optimizePolygonDirection (terrain-optimal)
     const optimizePolygonDirection = useCallback((polygonId: string) => {
