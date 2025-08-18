@@ -25,6 +25,7 @@ export default function Home() {
   // Imported/or override state (queried from Map component)
   const [importedOriginals, setImportedOriginals] = useState<Record<string, { bearingDeg: number; lineSpacingM: number }>>({});
   const [overrides, setOverrides] = useState<Record<string, { bearingDeg: number; lineSpacingM?: number; source: 'wingtra' | 'user' }>>({});
+  const [selectedPolygonId, setSelectedPolygonId] = useState<string | null>(null);
 
   // Auto-run GSD analysis when flight lines are updated (already wired)
   const autoRunGSDRef = useRef<((opts?: { polygonId?: string; reason?: 'lines'|'spacing'|'alt'|'manual' }) => void) | null>(null);
@@ -264,6 +265,16 @@ export default function Home() {
           polygonId={paramsDialog.polygonId}
           onClose={handleCloseParams}
           onSubmit={handleApplyParams}
+          onSubmitAll={(params) => {
+            // Apply to current first (ensures it gets lines immediately)
+            if (paramsDialog.polygonId) {
+              mapRef.current?.applyPolygonParams?.(paramsDialog.polygonId, params);
+              setParamsByPolygon(prev => ({ ...prev, [paramsDialog.polygonId!]: params }));
+            }
+            // Bulk apply to remaining queued polygons
+            mapRef.current?.applyParamsToAllPending?.(params as any);
+            setParamsDialog({ open: false, polygonId: null });
+          }}
           defaults={{
             altitudeAGL: paramsByPolygon[paramsDialog.polygonId || ""]?.altitudeAGL ?? 100,
             frontOverlap: paramsByPolygon[paramsDialog.polygonId || ""]?.frontOverlap ?? 80,
@@ -310,7 +321,7 @@ export default function Home() {
                     const hasOverride = !!overrides[polygonId]; // currently using file heading
                     
                     return (
-                      <div key={polygonId} className="border rounded-lg p-3 bg-white">
+                      <div key={polygonId} className={`border rounded-lg p-3 bg-white ${selectedPolygonId===polygonId ? 'ring-2 ring-blue-400' : ''}`} onClick={()=>setSelectedPolygonId(polygonId)}>
                         {/* Polygon Header */}
                         <div className="flex items-center justify-between mb-2">
                           <div className="flex items-center space-x-2">
@@ -358,21 +369,21 @@ export default function Home() {
                           <div className="flex gap-2 mb-2">
                             {hasOverride ? (
                               <Button size="sm" className="h-7 px-2 text-xs"
-                                      onClick={() => mapRef.current?.optimizePolygonDirection?.(polygonId)}
+                                      onClick={(e) => { e.stopPropagation(); mapRef.current?.optimizePolygonDirection?.(polygonId); }}
                                       title="Drop file override and use terrain-optimal direction">
-                                🎯 Optimize direction
+                                🎯 Optimize
                               </Button>
                             ) : (
                               <Button size="sm" variant="outline" className="h-7 px-2 text-xs"
-                                      onClick={() => mapRef.current?.revertPolygonToImportedDirection?.(polygonId)}
+                                      onClick={(e) => { e.stopPropagation(); mapRef.current?.revertPolygonToImportedDirection?.(polygonId); }}
                                       title="Restore Wingtra file bearing/spacing">
-                                📁 Use file direction
+                                📁 File dir
                               </Button>
                             )}
                             <Button size="sm" variant="outline" className="h-7 px-2 text-xs"
-                                    onClick={() => mapRef.current?.runFullAnalysis?.(polygonId)}
+                                    onClick={(e) => { e.stopPropagation(); mapRef.current?.runFullAnalysis?.(polygonId); }}
                                     title="Clear overrides, run fresh analysis, and ask for new params">
-                              🔄 Full Analysis
+                              🔄 Full
                             </Button>
                           </div>
                         )}
@@ -445,7 +456,7 @@ export default function Home() {
 
               {/* Summary for multiple polygons */}
               {hasResults && polygonResults.length > 1 && (
-                <div className="border-t pt-2 mt-3">
+                <div className="border-t pt-2 mt-3 space-y-2">
                   <div className="flex items-center justify-between text-xs">
                     <div className="flex items-center space-x-2 text-green-600">
                       <CheckCircle className="w-3 h-3" />
@@ -456,6 +467,20 @@ export default function Home() {
                       <span>3D Plane Fitting</span>
                     </div>
                   </div>
+                  <div className="flex gap-2">
+                    <Button size="sm" variant="outline" className="h-7 px-2 text-xs flex-1"
+                            onClick={()=>{ if(paramsDialog.polygonId){ /* nothing */ }}}
+                            disabled={!!paramsDialog.open}>Queue Active</Button>
+                  </div>
+                  {selectedPolygonId && (
+                    <div className="flex gap-2">
+                      <Button size="sm" className="h-7 px-2 text-xs flex-1"
+                              onClick={()=> mapRef.current?.optimizePolygonDirection?.(selectedPolygonId)}
+                              title="Optimize selected polygon direction">
+                        🎯 Optimize Selected
+                      </Button>
+                    </div>
+                  )}
                 </div>
               )}
             </CardContent>

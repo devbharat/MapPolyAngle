@@ -112,3 +112,16 @@ export function parseKmlPolygons(kmlText: string): ParsedKmlPolygon[] {
 
   return out;
 }
+
+/** Extract first KML file from a KMZ (ZIP) archive given as ArrayBuffer. */
+export async function extractKmlFromKmz(arrayBuffer: ArrayBuffer): Promise<string> {
+  // Lazy-load JSZip to keep initial bundle smaller if KMZ is not used
+  const { default: JSZip } = await import('jszip');
+  const zip = await JSZip.loadAsync(arrayBuffer);
+  // Find first .kml file (common path doc.kml, but be flexible)
+  const kmlFile = Object.keys(zip.files).find(name => name.toLowerCase().endsWith('.kml'));
+  if (!kmlFile) throw new Error('KMZ archive does not contain a .kml file');
+  const file = zip.files[kmlFile];
+  const text = await file.async('text');
+  return text;
+}

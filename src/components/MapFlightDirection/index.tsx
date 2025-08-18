@@ -23,7 +23,7 @@ import {
 import { update3DPathLayer, remove3DPathLayer, update3DCameraPointsLayer, remove3DCameraPointsLayer } from './utils/deckgl-layers';
 import { build3DFlightPath, calculateFlightLineSpacing, calculateOptimalTerrainZoom } from './utils/geometry';
 import { PolygonAnalysisResult, PolygonParams } from './types';
-import { parseKmlPolygons, calculateKmlBounds } from '@/utils/kml';
+import { parseKmlPolygons, calculateKmlBounds, extractKmlFromKmz } from '@/utils/kml';
 import { SONY_RX1R2 } from '@/domain/camera';
 import type { MapFlightDirectionAPI, ImportedFlightplanArea } from './api';
 import { fetchTilesForPolygon } from './utils/terrain';
@@ -89,6 +89,8 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
 
     // Per‑polygon parameters provided by user (or by importer).
     const [polygonParams, setPolygonParams] = useState<Map<string, PolygonParams>>(new Map());
+    // NEW: Queue of polygons awaiting parameter input (so multiple imports show dialogs sequentially)
+    const [pendingParamPolygons, setPendingParamPolygons] = useState<string[]>([]);
 
     // Overrides: force a heading/spacing (e.g., from Wingtra file)
     const [bearingOverrides, setBearingOverrides] = useState<
@@ -175,13 +177,21 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         const override = bearingOverridesRef.current.get(result.polygonId);
         
         if (!params) {
-          // For imported polygons (with overrides), don't ask for params - they're already set
           if (override) {
             console.log(`Skipping params dialog for imported polygon ${result.polygonId}`);
             return;
           }
-          // Ask parent to prompt user for this polygon (for manually drawn ones only)
-          onRequestParams?.(result.polygonId, result.polygon.coordinates);
+          // Queue this polygon for parameter input; first in queue triggers dialog.
+          setPendingParamPolygons(prev => {
+            if (prev.includes(result.polygonId)) return prev; // already queued
+            const next = [...prev, result.polygonId];
+            if (next.length === 1) {
+              onRequestParams?.(result.polygonId, result.polygon.coordinates);
+            } else {
+              console.log(`Queued polygon ${result.polygonId} for Flight Setup (position ${next.length})`);
+            }
+            return next;
+          });
           return;
         }
 
@@ -391,17 +401,30 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
     }, [addRingAsDrawFeature, onError]);
 
     const handleKmlFileChange = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
-      const files = Array.from(e.target.files || []).filter(f => /\.kml$/i.test(f.name));
+      const files = Array.from(e.target.files || []).filter(f => /\.(kml|kmz)$/i.test(f.name));
       if (files.length === 0) {
-        onError?.("Please select valid .kml files");
+        onError?.("Please select valid .kml or .kmz files");
         return;
       }
       let totalAdded = 0;
       for (const file of files) {
         try {
-          const text = await file.text();
-          const result = await importKmlFromText(text);
-          totalAdded += result.added;
+          let kmlText: string | null = null;
+          if (/\.kmz$/i.test(file.name)) {
+            const buf = await file.arrayBuffer();
+            try {
+              kmlText = await extractKmlFromKmz(buf);
+            } catch (err) {
+              onError?.(`Failed to extract KMZ ${file.name}: ${err instanceof Error ? err.message : 'Unknown error'}`);
+              continue;
+            }
+          } else { // .kml
+            kmlText = await file.text();
+          }
+          if (kmlText) {
+            const result = await importKmlFromText(kmlText);
+            totalAdded += result.added;
+          }
         } catch (error) {
           onError?.(`Failed to read file ${file.name}: ${error instanceof Error ? error.message : 'Unknown error'}`);
         }
@@ -577,7 +600,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       const onDragOver = (e: DragEvent) => {
         if (e.dataTransfer) {
           const hasKml = Array.from(e.dataTransfer.items || []).some((it) =>
-            it.kind === 'file' && /\.kml$/i.test(it.type || it.getAsFile()?.name || '')
+            it.kind === 'file' && /\.(kml|kmz)$/i.test(it.type || it.getAsFile()?.name || '')
           );
           if (hasKml) {
             e.preventDefault();
@@ -593,18 +616,31 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         e.preventDefault();
         setIsDraggingKml(false);
 
-        const files = Array.from(e.dataTransfer?.files || []).filter(f => /\.kml$/i.test(f.name));
+        const files = Array.from(e.dataTransfer?.files || []).filter(f => /\.(kml|kmz)$/i.test(f.name));
         if (files.length === 0) {
-          onError?.("No valid .kml files found in drop");
+          onError?.("No valid .kml or .kmz files found in drop");
           return;
         }
 
         let totalAdded = 0;
         for (const f of files) {
           try {
-            const text = await f.text();
-            const result = await importKmlFromText(text);
-            totalAdded += result.added;
+            let kmlText: string | null = null;
+            if (/\.kmz$/i.test(f.name)) {
+              const buf = await f.arrayBuffer();
+              try {
+                kmlText = await extractKmlFromKmz(buf);
+              } catch (err) {
+                onError?.(`Failed to extract KMZ ${f.name}: ${err instanceof Error ? err.message : 'Unknown error'}`);
+                continue;
+              }
+            } else {
+              kmlText = await f.text();
+            }
+            if (kmlText) {
+              const result = await importKmlFromText(kmlText);
+              totalAdded += result.added;
+            }
           } catch (error) {
             onError?.(`Failed to read file ${f.name}: ${error instanceof Error ? error.message : 'Unknown error'}`);
           }
@@ -661,12 +697,70 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         const path3d = build3DFlightPath(fl.flightLines, tiles, fl.lineSpacing, params.altitudeAGL);
         update3DPathLayer(deckOverlayRef.current, polygonId, path3d, setDeckLayers);
       }
+
+      // After applying params for this polygon, pop it from queue and trigger next (if any)
+      setPendingParamPolygons(prev => {
+        if (prev[0] !== polygonId) return prev.filter(id => id !== polygonId); // if user applied out of order, just remove it
+        const [, ...rest] = prev;
+        if (rest.length > 0) {
+          const nextId = rest[0];
+          const nextRes = polygonResultsRef.current.get(nextId);
+          if (nextRes) {
+            onRequestParams?.(nextId, nextRes.polygon.coordinates);
+          } else {
+            // Fallback: try draw feature
+            const draw = drawRef.current as any;
+            const f = draw?.get?.(nextId);
+            if (f?.geometry?.type === 'Polygon') {
+              onRequestParams?.(nextId, f.geometry.coordinates[0]);
+            }
+          }
+        }
+        return rest;
+      });
     }, [polygonResults, polygonTiles, onFlightLinesUpdated]);
 
+    // NEW: Apply same params to all queued polygons (bulk "Apply All")
+    const applyParamsToAllPending = useCallback((params: PolygonParams) => {
+      const queueSnapshot = [...pendingParamPolygons];
+      if (queueSnapshot.length === 0) return;
+      // Temporarily silence per-polygon events to batch one notification
+      const prevSuppress = suppressFlightLineEventsRef.current;
+      suppressFlightLineEventsRef.current = true;
+
+      for (const pid of queueSnapshot) {
+        // Directly set params without queue popping side-effect then apply
+        setPolygonParams(prev => { const next = new Map(prev); next.set(pid, params); return next; });
+        const res = polygonResultsRef.current.get(pid);
+        if (!res || !mapRef.current) continue;
+        const override = bearingOverridesRef.current.get(pid);
+        const bearingDeg = override ? override.bearingDeg : res.result.contourDirDeg;
+        const spacing = override?.lineSpacingM ?? calculateFlightLineSpacing(DEFAULT_CAMERA, params.altitudeAGL, params.sideOverlap);
+        removeFlightLinesForPolygon(mapRef.current, pid);
+        const fl = addFlightLinesForPolygon(
+          mapRef.current,
+          pid,
+          res.polygon.coordinates,
+          bearingDeg,
+          spacing,
+          res.result.fitQuality
+        );
+        setPolygonFlightLines(prev => { const next = new Map(prev); next.set(pid, { ...fl, altitudeAGL: params.altitudeAGL }); return next; });
+        const tiles = polygonTilesRef.current.get(pid) || [];
+        if (deckOverlayRef.current && fl.flightLines.length > 0) {
+          const path3d = build3DFlightPath(fl.flightLines, tiles, fl.lineSpacing, params.altitudeAGL);
+          update3DPathLayer(deckOverlayRef.current, pid, path3d, setDeckLayers);
+        }
+      }
+      // Clear entire queue WITHOUT triggering next dialog
+      setPendingParamPolygons([]);
+      suppressFlightLineEventsRef.current = prevSuppress;
+      onFlightLinesUpdated?.('__all__');
+    }, [pendingParamPolygons, onFlightLinesUpdated]);
+
+    // RESTORED: optimizePolygonDirection (terrain-optimal)
     const optimizePolygonDirection = useCallback((polygonId: string) => {
       console.log(`🎯 Optimizing direction for polygon ${polygonId} - switching to terrain-optimal bearing`);
-
-      // 1) Drop override in both state and ref so apply() sees latest immediately.
       setBearingOverrides((prev) => {
         const next = new Map(prev);
         next.delete(polygonId);
@@ -674,8 +768,6 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       });
       bearingOverridesRef.current = new Map(bearingOverridesRef.current);
       bearingOverridesRef.current.delete(polygonId);
-
-      // 2) Ensure we have terrain analysis; if not, run it first.
       const hasResults = polygonResults.has(polygonId);
       if (!hasResults) {
         console.log(`⚡ No terrain analysis yet for polygon ${polygonId}, running analysis first...`);
@@ -684,33 +776,25 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         if (f?.geometry?.type === 'Polygon') analyzePolygon(polygonId, f);
         return;
       }
-
-      // 3) Re-apply params; apply() will now use res.result.contourDirDeg.
-      const params =
-        polygonParamsRef.current.get(polygonId) ?? { altitudeAGL: 100, frontOverlap: 80, sideOverlap: 70 };
+      const params = polygonParamsRef.current.get(polygonId) ?? { altitudeAGL: 100, frontOverlap: 80, sideOverlap: 70 };
       console.log(`✅ Applying terrain-optimal direction for polygon ${polygonId}`);
       applyPolygonParams(polygonId, params);
     }, [polygonResults, applyPolygonParams, analyzePolygon]);
 
+    // RESTORED: revertPolygonToImportedDirection
     const revertPolygonToImportedDirection = useCallback((polygonId: string) => {
       console.log(`📁 Reverting polygon ${polygonId} to file direction (Wingtra bearing/spacing)`);
-      
       const original = importedOriginals.get(polygonId);
       const res = polygonResults.get(polygonId);
       if (!original || !res || !mapRef.current) return;
-
-      // restore override to file bearing/spacing
       setBearingOverrides((prev) => {
         const next = new Map(prev);
         next.set(polygonId, { bearingDeg: original.bearingDeg, lineSpacingM: original.lineSpacingM, source: 'wingtra' });
         return next;
       });
-      // Also update ref for immediate visibility to any subsequent calls
       bearingOverridesRef.current = new Map(bearingOverridesRef.current);
       bearingOverridesRef.current.set(polygonId, { bearingDeg: original.bearingDeg, lineSpacingM: original.lineSpacingM, source: 'wingtra' });
-
       const params = polygonParams.get(polygonId) ?? { altitudeAGL: 100, frontOverlap: 80, sideOverlap: 70 };
-
       removeFlightLinesForPolygon(mapRef.current, polygonId);
       const fl = addFlightLinesForPolygon(
         mapRef.current,
@@ -720,47 +804,38 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         original.lineSpacingM,
         res.result.fitQuality
       );
-
       setPolygonFlightLines((prev) => {
         const next = new Map(prev);
         next.set(polygonId, { ...fl, altitudeAGL: params.altitudeAGL });
         return next;
       });
-
       const tiles = polygonTiles.get(polygonId) || [];
       if (deckOverlayRef.current && fl.flightLines.length > 0) {
         const path3d = build3DFlightPath(fl.flightLines, tiles, fl.lineSpacing, params.altitudeAGL);
         update3DPathLayer(deckOverlayRef.current, polygonId, path3d, setDeckLayers);
       }
-
       console.log(`✅ Restored file direction: ${original.bearingDeg}° bearing, ${original.lineSpacingM}m spacing`);
       onFlightLinesUpdated?.(polygonId);
     }, [importedOriginals, polygonResults, polygonParams, polygonTiles, onFlightLinesUpdated]);
 
+    // RESTORED: runFullAnalysis
     const runFullAnalysis = useCallback((polygonId: string) => {
       console.log(`🔄 Running full analysis for polygon ${polygonId} - clearing overrides and requesting fresh params`);
-      
-      // Clear any overrides and remove existing results to force fresh analysis
       setBearingOverrides((prev) => {
         const next = new Map(prev);
         next.delete(polygonId);
         return next;
       });
-
-      // Clear existing results
       setPolygonResults((prev) => {
         const next = new Map(prev);
         next.delete(polygonId);
         return next;
       });
-
       setPolygonParams((prev) => {
         const next = new Map(prev);
         next.delete(polygonId);
         return next;
       });
-
-      // Clear any old visuals for this polygon
       if (mapRef.current) {
         removeFlightLinesForPolygon(mapRef.current, polygonId);
         removeTriggerPointsForPolygon(mapRef.current, polygonId);
@@ -768,10 +843,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       if (deckOverlayRef.current) {
         remove3DPathLayer(deckOverlayRef.current, polygonId, setDeckLayers);
       }
-
       console.log(`⚡ Starting fresh terrain analysis for polygon ${polygonId}...`);
-
-      // Trigger fresh analysis as if manually drawn
       const draw = drawRef.current as any;
       const f = draw?.get?.(polygonId);
       if (f?.geometry?.type === 'Polygon') {
@@ -779,7 +851,22 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       }
     }, [analyzePolygon]);
 
-    useImperativeHandle(ref, () => ({
+    // ---------- Map render ----------
+    // Note: using `any` for now due to complex nested types from Mapbox GL and Deck.gl
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const mapRenderProps: any = {
+      ref: mapRef,
+      style: { width: '100%', height: '100%' },
+      mapboxApiAccessToken: mapboxToken,
+      onError: memoizedOnError,
+      // Pass-through props
+      center,
+      zoom,
+      terrainZoom,
+      sampleStep,
+    };
+
+    React.useImperativeHandle(ref, () => ({
       clearAllDrawings: () => {
         if (drawRef.current) drawRef.current.deleteAll();
         if (deckOverlayRef.current) {
@@ -844,6 +931,8 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         if (deckOverlayRef.current) remove3DCameraPointsLayer(deckOverlayRef.current, polygonId, setDeckLayers);
       },
       applyPolygonParams,
+      // expose bulk apply helper
+      applyParamsToAllPending,
       getPerPolygonParams: () => Object.fromEntries(polygonParams),
 
       openKmlFilePicker: () => {
@@ -917,7 +1006,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         <input
           ref={kmlInputRef}
           type="file"
-          accept=".kml,application/vnd.google-earth.kml+xml"
+          accept=".kml,.kmz,application/vnd.google-earth.kml+xml,application/vnd.google-earth.kmz"
           multiple
           onChange={handleKmlFileChange}
           style={{ display: 'none' }}
@@ -947,7 +1036,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
                 boxShadow: '0 1px 3px rgba(0,0,0,0.15)', fontSize: 12, color: '#1f2937',
               }}
             >
-              Drop <strong>.kml</strong> file(s) to import areas
+              Drop <strong>.kml</strong>/<strong>.kmz</strong> file(s) to import areas
             </div>
           </div>
         )}

@@ -7,6 +7,7 @@ type Props = {
   polygonId: string | null;
   onClose: () => void;
   onSubmit: (params: { altitudeAGL: number; frontOverlap: number; sideOverlap: number }) => void;
+  onSubmitAll?: (params: { altitudeAGL: number; frontOverlap: number; sideOverlap: number }) => void; // bulk apply
   defaults?: { altitudeAGL?: number; frontOverlap?: number; sideOverlap?: number };
 };
 
@@ -15,6 +16,7 @@ export default function PolygonParamsDialog({
   polygonId,
   onClose,
   onSubmit,
+  onSubmitAll,
   defaults
 }: Props) {
   const [altitudeAGL, setAltitudeAGL] = React.useState<number>(defaults?.altitudeAGL ?? 100);
@@ -65,6 +67,17 @@ export default function PolygonParamsDialog({
               onClick={() => onSubmit({ altitudeAGL, frontOverlap, sideOverlap })}>
               Apply
             </Button>
+            {onSubmitAll && (
+              <Button
+                size="sm"
+                variant="secondary"
+                className="h-8 px-2 text-xs whitespace-nowrap"
+                onClick={() => onSubmitAll({ altitudeAGL, frontOverlap, sideOverlap })}
+                title="Apply these parameters to all remaining polygons awaiting setup"
+              >
+                Apply All
+              </Button>
+            )}
             <Button
               size="sm"
               variant="outline"
@@ -75,7 +88,7 @@ export default function PolygonParamsDialog({
             </Button>
           </div>
           <p className="text-[11px] text-gray-500">
-            After applying, flight lines and GSD will run for this polygon only.
+            {onSubmitAll ? 'Use Apply All to apply these parameters to every remaining polygon in this import batch.' : 'After applying, flight lines and GSD will run for this polygon only.'}
           </p>
         </CardContent>
       </Card>
