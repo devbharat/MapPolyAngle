@@ -646,20 +646,35 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
         const text = evt.target?.result as string;
         const posesWgs = extractPoses(text);
         const djiCam = extractCameraModel(text);
+        let matchedRegistryKey: string | null = null;
         if (djiCam) {
-          setCameraText(JSON.stringify(djiCam, null, 2));
+          // Try to match against known cameras (same dimensions + ~5% focal length tolerance)
+          for (const [key, cam] of Object.entries(CAMERA_REGISTRY)) {
+            if (cam.w_px === djiCam.w_px && cam.h_px === djiCam.h_px) {
+              const relErr = Math.abs(cam.f_m - djiCam.f_m) / cam.f_m;
+              if (relErr < 0.05) { matchedRegistryKey = key; break; }
+            }
+          }
+          if (matchedRegistryKey) {
+            console.log(`Matched DJI camera to registry key: ${matchedRegistryKey}`);
+            setCameraText(JSON.stringify(CAMERA_REGISTRY[matchedRegistryKey], null, 2));
+          } else {
+            setCameraText(JSON.stringify(djiCam, null, 2));
+          }
+          // Auto‑enable override so imported intrinsics are actually used
+          setUseOverrideCamera(true);
         }
         const posesMeters: PoseMeters[] = posesWgs.map((p, i) => {
           const { x, y } = wgs84ToWebMercator(p.lat, p.lon);
-          return { id: p.id ?? `pose_${i}`, x, y, z: p.alt ?? 0, omega_deg: p.roll ?? 0, phi_deg: p.pitch ?? 0, kappa_deg: p.yaw ?? 0 } as PoseMeters;
+            return { id: p.id ?? `pose_${i}`, x, y, z: p.alt ?? 0, omega_deg: p.roll ?? 0, phi_deg: p.pitch ?? 0, kappa_deg: p.yaw ?? 0 } as PoseMeters;
         });
         setImportedPoses(posesMeters);
         if (posesMeters.length) {
-          poseAreaRingRef.current = [];// force rebuild in compute via AOI function
+          poseAreaRingRef.current = []; // force rebuild in compute via AOI function
         }
         setAutoGenerate(false);
         setShowCameraPoints(true);
-        toast({ title: "Imported poses", description: `${posesMeters.length} camera poses loaded${djiCam ? ' with camera intrinsics.' : '.'}` });
+        toast({ title: "Imported poses", description: `${posesMeters.length} camera poses loaded${djiCam ? (matchedRegistryKey ? ` using ${matchedRegistryKey} camera.` : ' with camera intrinsics.') : '.'}` });
         onPosesImported?.(posesMeters.length);
         setTimeout(()=>{ if (poseAreaRingRef.current.length>=4) { const api = mapRef.current; const map = api?.getMap?.(); if(map){ const ring=poseAreaRingRef.current; const lngs=ring.map(c=>c[0]); const lats=ring.map(c=>c[1]); map.fitBounds([[Math.min(...lngs), Math.min(...lats)],[Math.max(...lngs), Math.max(...lats)]], { padding:50, duration:800, maxZoom:16 }); } } }, 30);
       } catch (error) {
@@ -668,7 +683,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
       }
     };
     reader.readAsText(file);
-  }, [mapRef, onPosesImported]);
+  }, [mapRef, onPosesImported, CAMERA_REGISTRY]);
 
   React.useEffect(()=>{
     if (onExposePoseImporter) {
@@ -676,7 +691,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
     }
   }, [onExposePoseImporter]);
 
-  // NEW: auto-compute when imported poses arrive (poses-only mode)
+  // Auto-compute when imported poses arrive (poses-only mode)
   React.useEffect(()=>{
     if (!autoGenerate && importedPoses.length>0) {
       const attempt = () => {
@@ -698,98 +713,39 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
           <input type="checkbox" checked={showGsd} onChange={e=>setShowGsd(e.target.checked)} className="mr-2" />
           <span className="font-medium">Show GSD (Primary)</span>
         </label>
-        {/* Commented out for simplified UI
-        <label className="text-xs col-span-1">
-          <input type="checkbox" checked={showOverlap} onChange={e=>setShowOverlap(e.target.checked)} className="mr-2" />
-          Show overlap count
-        </label>
-        <label className="text-xs col-span-2">
-          <input type="checkbox" checked={showCameraPoints} onChange={e=>setShowCameraPoints(e.target.checked)} className="mr-2" />
-          Show camera positions
-        </label>
-        */}
       </div>
 
-      {/* GSD Statistics and Histogram */}
       {/* Per-Polygon Statistics */}
       {perPolygonStats.size > 0 && (
         <div className="space-y-2">
           {Array.from(perPolygonStats.entries()).map(([polygonId, stats]) => {
             const { displayName, shortId } = getPolygonDisplayName(polygonId);
-            
             return (
-              <Card 
-                key={polygonId} 
-                className="mt-2 cursor-pointer hover:shadow-md transition-shadow border-l-4 border-l-blue-500" 
-                onClick={() => highlightPolygon(polygonId)}
-              >
+              <Card key={polygonId} className="mt-2 cursor-pointer hover:shadow-md transition-shadow border-l-4 border-l-blue-500" onClick={() => highlightPolygon(polygonId)}>
                 <CardHeader className="pb-3">
                   <CardTitle className="text-sm flex items-center gap-2">
                     <span>{displayName}</span>
-                    <Badge variant="secondary" className="text-xs font-mono">
-                      #{shortId}
-                    </Badge>
+                    <Badge variant="secondary" className="text-xs font-mono">#{shortId}</Badge>
                   </CardTitle>
                   <CardDescription className="text-xs">
-                    Area: {stats.areaAcres.toFixed(2)} acres • Images: {stats.imageCount} • Pixels: {stats.gsdStats.count.toLocaleString()}
-                    <br />
+                    Area: {stats.areaAcres.toFixed(2)} acres • Images: {stats.imageCount} • Pixels: {stats.gsdStats.count.toLocaleString()}<br />
                     <span className="text-blue-600">Click to view on map</span>
                   </CardDescription>
                 </CardHeader>
                 <CardContent className="space-y-4">
-                  {/* Summary Statistics */}
                   <div className="grid grid-cols-3 gap-4 text-xs">
-                    <div className="text-center">
-                      <div className="font-medium text-green-600">{(stats.gsdStats.min * 100).toFixed(1)} cm</div>
-                      <div className="text-gray-500">Min GSD</div>
-                    </div>
-                    <div className="text-center">
-                      <div className="font-medium text-blue-600">{(stats.gsdStats.mean * 100).toFixed(1)} cm</div>
-                      <div className="text-gray-500">Mean GSD</div>
-                    </div>
-                    <div className="text-center">
-                      <div className="font-medium text-red-600">{(stats.gsdStats.max * 100).toFixed(1)} cm</div>
-                      <div className="text-gray-500">Max GSD</div>
-                    </div>
+                    <div className="text-center"><div className="font-medium text-green-600">{(stats.gsdStats.min * 100).toFixed(1)} cm</div><div className="text-gray-500">Min GSD</div></div>
+                    <div className="text-center"><div className="font-medium text-blue-600">{(stats.gsdStats.mean * 100).toFixed(1)} cm</div><div className="text-gray-500">Mean GSD</div></div>
+                    <div className="text-center"><div className="font-medium text-red-600">{(stats.gsdStats.max * 100).toFixed(1)} cm</div><div className="text-gray-500">Max GSD</div></div>
                   </div>
-
-                  {/* Histogram */}
                   <div className="h-48">
                     <ResponsiveContainer width="100%" height="100%">
-                      <BarChart data={convertHistogramToArea(stats.gsdStats).map(bin => ({
-                        gsd: (bin.bin * 100).toFixed(1),
-                        areaM2: bin.areaM2,
-                        areaAcres: bin.areaM2 / ACRE_M2,
-                        gsdValue: bin.bin
-                      }))}>
+                      <BarChart data={convertHistogramToArea(stats.gsdStats).map(bin => ({ gsd: (bin.bin * 100).toFixed(1), areaM2: bin.areaM2, areaAcres: bin.areaM2 / ACRE_M2 }))}>
                         <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
-                        <XAxis 
-                          dataKey="gsd" 
-                          tick={{ fontSize: 10 }}
-                          label={{ value: 'GSD (cm)', position: 'insideBottom', offset: -5, style: { fontSize: '10px' } }}
-                        />
-                        <YAxis 
-                          tick={{ fontSize: 10 }}
-                          tickFormatter={(v:number)=> (v/ACRE_M2).toFixed(2)}
-                          label={{ value: 'Area (acres)', angle: -90, position: 'insideLeft', style: { fontSize: '10px' } }}
-                        />
-                        <Tooltip 
-                          formatter={(value) => {
-                            const m2 = value as number;
-                            const acres = m2 / ACRE_M2;
-                            return [`${acres.toFixed(2)} acres (${m2.toFixed(0)} m²)`, 'Area'];
-                          }}
-                          labelFormatter={(label) => `GSD: ${label} cm`}
-                          labelStyle={{ fontSize: '11px' }}
-                          contentStyle={{ fontSize: '11px' }}
-                        />
-                        <Bar 
-                          dataKey="areaM2" 
-                          fill="#8b5cf6" 
-                          stroke="#7c3aed"
-                          strokeWidth={0.5}
-                          radius={[1, 1, 0, 0]}
-                        />
+                        <XAxis dataKey="gsd" tick={{ fontSize: 10 }} label={{ value: 'GSD (cm)', position: 'insideBottom', offset: -5, style: { fontSize: '10px' } }} />
+                        <YAxis tick={{ fontSize: 10 }} tickFormatter={(v:number)=> (v/ACRE_M2).toFixed(2)} label={{ value: 'Area (acres)', angle: -90, position: 'insideLeft', style: { fontSize: '10px' } }} />
+                        <Tooltip formatter={(value)=>{ const m2=value as number; const acres=m2/ACRE_M2; return [`${acres.toFixed(2)} acres (${m2.toFixed(0)} m²)`, 'Area']; }} labelFormatter={(label)=>`GSD: ${label} cm`} labelStyle={{ fontSize: '11px' }} contentStyle={{ fontSize: '11px' }} />
+                        <Bar dataKey="areaM2" fill="#8b5cf6" stroke="#7c3aed" strokeWidth={0.5} radius={[1,1,0,0]} />
                       </BarChart>
                     </ResponsiveContainer>
                   </div>
@@ -800,69 +756,26 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
         </div>
       )}
 
-      {/* Overall GSD Statistics */}
       {gsdStats && gsdStats.count > 0 && (
         <Card className="mt-2">
           <CardHeader className="pb-3">
             <CardTitle className="text-sm">Overall GSD Analysis</CardTitle>
-            <CardDescription className="text-xs">
-              Cumulative Ground Sample Distance statistics for {gsdStats.count.toLocaleString()} pixels
-            </CardDescription>
+            <CardDescription className="text-xs">Cumulative Ground Sample Distance statistics for {gsdStats.count.toLocaleString()} pixels</CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
-            {/* Summary Statistics */}
             <div className="grid grid-cols-3 gap-4 text-xs">
-              <div className="text-center">
-                <div className="font-medium text-green-600">{(gsdStats.min * 100).toFixed(1)} cm</div>
-                <div className="text-gray-500">Min GSD</div>
-              </div>
-              <div className="text-center">
-                <div className="font-medium text-blue-600">{(gsdStats.mean * 100).toFixed(1)} cm</div>
-                <div className="text-gray-500">Mean GSD</div>
-              </div>
-              <div className="text-center">
-                <div className="font-medium text-red-600">{(gsdStats.max * 100).toFixed(1)} cm</div>
-                <div className="text-gray-500">Max GSD</div>
-              </div>
+              <div className="text-center"><div className="font-medium text-green-600">{(gsdStats.min * 100).toFixed(1)} cm</div><div className="text-gray-500">Min GSD</div></div>
+              <div className="text-center"><div className="font-medium text-blue-600">{(gsdStats.mean * 100).toFixed(1)} cm</div><div className="text-gray-500">Mean GSD</div></div>
+              <div className="text-center"><div className="font-medium text-red-600">{(gsdStats.max * 100).toFixed(1)} cm</div><div className="text-gray-500">Max GSD</div></div>
             </div>
-
-            {/* Histogram */}
             <div className="h-48">
               <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={convertHistogramToArea(gsdStats).map(bin => ({
-                  gsd: (bin.bin * 100).toFixed(1),
-                  areaM2: bin.areaM2,
-                  areaAcres: bin.areaM2 / ACRE_M2,
-                  gsdValue: bin.bin
-                }))}>
+                <BarChart data={convertHistogramToArea(gsdStats).map(bin => ({ gsd: (bin.bin * 100).toFixed(1), areaM2: bin.areaM2, areaAcres: bin.areaM2 / ACRE_M2 }))}>
                   <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
-                  <XAxis 
-                    dataKey="gsd" 
-                    tick={{ fontSize: 10 }}
-                    label={{ value: 'GSD (cm)', position: 'insideBottom', offset: -5, style: { fontSize: '10px' } }}
-                  />
-                  <YAxis 
-                    tick={{ fontSize: 10 }}
-                    tickFormatter={(v:number)=> (v/ACRE_M2).toFixed(2)}
-                    label={{ value: 'Area (acres)', angle: -90, position: 'insideLeft', style: { fontSize: '10px' } }}
-                  />
-                  <Tooltip 
-                    formatter={(value) => {
-                      const m2 = value as number;
-                      const acres = m2 / ACRE_M2;
-                      return [`${acres.toFixed(2)} acres (${m2.toFixed(0)} m²)`, 'Area'];
-                    }}
-                    labelFormatter={(label) => `GSD: ${label} cm`}
-                    labelStyle={{ fontSize: '11px' }}
-                    contentStyle={{ fontSize: '11px' }}
-                  />
-                  <Bar 
-                    dataKey="areaM2" 
-                    fill="#3b82f6" 
-                    stroke="#1e40af"
-                    strokeWidth={0.5}
-                    radius={[1, 1, 0, 0]}
-                  />
+                  <XAxis dataKey="gsd" tick={{ fontSize: 10 }} label={{ value: 'GSD (cm)', position: 'insideBottom', offset: -5, style: { fontSize: '10px' } }} />
+                  <YAxis tick={{ fontSize: 10 }} tickFormatter={(v:number)=> (v/ACRE_M2).toFixed(2)} label={{ value: 'Area (acres)', angle: -90, position: 'insideLeft', style: { fontSize: '10px' } }} />
+                  <Tooltip formatter={(value)=>{ const m2=value as number; const acres=m2/ACRE_M2; return [`${acres.toFixed(2)} acres (${m2.toFixed(0)} m²)`, 'Area']; }} labelFormatter={(label)=>`GSD: ${label} cm`} labelStyle={{ fontSize: '11px' }} contentStyle={{ fontSize: '11px' }} />
+                  <Bar dataKey="areaM2" fill="#3b82f6" stroke="#1e40af" strokeWidth={0.5} radius={[1,1,0,0]} />
                 </BarChart>
               </ResponsiveContainer>
             </div>
@@ -871,82 +784,33 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
       )}
 
       <div className="grid grid-cols-1 gap-2">
-        {/* Poses import + auto mode toggle */}
         <div className="space-y-2">
           <div className="text-xs font-medium">Poses (optional)</div>
           <div className="flex items-center gap-2">
-            <button
-              className="h-8 px-2 rounded border text-xs"
-              onClick={()=>poseFileRef.current?.click()}
-              title="Import camera poses from JSON"
-              id="poses-json-input-proxy"
-            >Import poses (JSON)</button>
-            <input
-              ref={poseFileRef}
-              type="file"
-              accept=".json,application/json"
-              onChange={(e)=>{ handlePoseFileChange(e); }}
-              style={{ display:'none' }}
-            />
-            <label className="text-xs flex items-center gap-1">
-              <input type="checkbox" checked={autoGenerate} onChange={e=>setAutoGenerate(e.target.checked)} />
-              Auto-generate
-            </label>
+            <button className="h-8 px-2 rounded border text-xs" onClick={()=>poseFileRef.current?.click()} title="Import camera poses from JSON" id="poses-json-input-proxy">Import poses (JSON)</button>
+            <input ref={poseFileRef} type="file" accept=".json,application/json" onChange={(e)=>{ handlePoseFileChange(e); }} style={{ display:'none' }} />
+            <label className="text-xs flex items-center gap-1"><input type="checkbox" checked={autoGenerate} onChange={e=>setAutoGenerate(e.target.checked)} />Auto-generate</label>
           </div>
-          {!autoGenerate && (
-            <div className="text-[11px] text-gray-600">{importedPoses.length ? `${importedPoses.length.toLocaleString()} poses imported` : 'No poses imported yet'}</div>
-          )}
+          {!autoGenerate && (<div className="text-[11px] text-gray-600">{importedPoses.length ? `${importedPoses.length.toLocaleString()} poses imported` : 'No poses imported yet'}</div>)}
         </div>
-        {/* Flight Parameters */}
         <div className="space-y-2">
           <div className="text-xs font-medium mb-1">Flight Parameters</div>
-          <label className="text-xs text-gray-600 block">
-            Altitude AGL (m)
-            <input className="w-full border rounded px-2 py-1 text-xs" type="number" value={altitude} onChange={e=>setAltitude(parseInt(e.target.value||'100'))} />
-          </label>
-          <label className="text-xs text-gray-600 block">
-            Front overlap (%)
-            <input className="w-full border rounded px-2 py-1 text-xs" type="number" min="0" max="95" value={frontOverlap} onChange={e=>setFrontOverlap(parseInt(e.target.value||'80'))} />
-          </label>
-          <label className="text-xs text-gray-600 block">
-            Side overlap (%)
-            <input className="w-full border rounded px-2 py-1 text-xs" type="number" min="0" max="95" value={sideOverlap} onChange={e=>setSideOverlap(parseInt(e.target.value||'70'))} />
-          </label>
-          <label className="text-xs text-gray-600 block">
-            Max tilt (deg)
-            <input className="w-full border rounded px-2 py-1 text-xs" type="number" min="0" max="90" value={maxTiltDeg} onChange={e=>setMaxTiltDeg(Math.max(0, Math.min(90, parseFloat(e.target.value||'10'))))} />
-          </label>
-          <label className="text-xs text-gray-600 block">
-            DEM zoom (tile level)
-            <input className="w-full border rounded px-2 py-1 text-xs" type="number" min={8} max={16} value={zoom} onChange={e=>setZoom(Math.max(8, Math.min(16, parseInt(e.target.value||'14'))))} />
-          </label>
-          <label className="text-xs text-gray-600 block">
-            Clip edge (m)
-            <input className="w-full border rounded px-2 py-1 text-xs" type="number" min={0} value={clipInnerBufferM} onChange={e=>setClipInnerBufferM(Math.max(0, parseFloat(e.target.value||'0')))} />
-          </label>
+          <label className="text-xs text-gray-600 block">Altitude AGL (m)<input className="w-full border rounded px-2 py-1 text-xs" type="number" value={altitude} onChange={e=>setAltitude(parseInt(e.target.value||'100'))} /></label>
+          <label className="text-xs text-gray-600 block">Front overlap (%)<input className="w-full border rounded px-2 py-1 text-xs" type="number" min={0} max={95} value={frontOverlap} onChange={e=>setFrontOverlap(parseInt(e.target.value||'80'))} /></label>
+            <label className="text-xs text-gray-600 block">Side overlap (%)<input className="w-full border rounded px-2 py-1 text-xs" type="number" min={0} max={95} value={sideOverlap} onChange={e=>setSideOverlap(parseInt(e.target.value||'70'))} /></label>
+          <label className="text-xs text-gray-600 block">Max tilt (deg)<input className="w-full border rounded px-2 py-1 text-xs" type="number" min={0} max={90} value={maxTiltDeg} onChange={e=>setMaxTiltDeg(Math.max(0, Math.min(90, parseFloat(e.target.value||'10'))))} /></label>
+          <label className="text-xs text-gray-600 block">DEM zoom (tile level)<input className="w-full border rounded px-2 py-1 text-xs" type="number" min={8} max={16} value={zoom} onChange={e=>setZoom(Math.max(8, Math.min(16, parseInt(e.target.value||'14'))))} /></label>
+          <label className="text-xs text-gray-600 block">Clip edge (m)<input className="w-full border rounded px-2 py-1 text-xs" type="number" min={0} value={clipInnerBufferM} onChange={e=>setClipInnerBufferM(Math.max(0, parseFloat(e.target.value||'0')))} /></label>
           {autoGenerate && <div className="text-xs text-gray-500">{parsePosesMeters()?.length || 0} poses generated</div>}
         </div>
       </div>
 
       <div className="flex gap-2 items-center">
-        <button
-          onClick={() => compute()}
-          disabled={running}
-          className="h-8 px-2 rounded bg-blue-600 text-white text-xs disabled:opacity-50"
-        >
-          {running ? "Computing…" : "Manual Compute"}
-        </button>
-        <button
-          onClick={clear}
-          className="h-8 px-2 rounded border text-xs"
-        >
-          Clear overlay
-        </button>
+        <button onClick={() => compute()} disabled={running} className="h-8 px-2 rounded bg-blue-600 text-white text-xs disabled:opacity-50">{running ? 'Computing…' : 'Manual Compute'}</button>
+        <button onClick={clear} className="h-8 px-2 rounded border text-xs">Clear overlay</button>
       </div>
 
-      <p className="text-[11px] text-gray-500">
-        Automatic GSD analysis runs when polygons are created or flight parameters change.
-      </p>
+      <p className="text-[11px] text-gray-500">Automatic GSD analysis runs when polygons are created or flight parameters change.</p>
     </div>
   );
 }
