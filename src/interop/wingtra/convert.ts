@@ -1,7 +1,7 @@
 // src/interop/wingtra/convert.ts
 
 import type { CameraModel, FlightParams, LngLat } from "@/domain/types";
-import { forwardSpacing, lineSpacing as computeLineSpacing, calculateGSD, SONY_RX1R2 } from "@/domain/camera";
+import { forwardSpacing, lineSpacing as computeLineSpacing, calculateGSD, SONY_RX1R2, ILX_LR1_INSPECT_85MM, MAP61_17MM, RGB61_24MM, DJI_ZENMUSE_P1_24MM } from "@/domain/camera";
 import type {
   WingtraAngleConvention,
   WingtraAreaItem,
@@ -31,7 +31,7 @@ export function wingtraAngleToBearing(
 }
 
 /**
- * Convert our "bearing° clockwise from North" to Wingtra "grid.angle".
+ * Convert our "bearing° clockwise from North
  */
 export function bearingToWingtraAngle(
   bearingDeg: number,
@@ -42,12 +42,28 @@ export function bearingToWingtraAngle(
 
 /** Try to map Wingtra payload to a camera. Extend as needed. */
 export function resolveCameraFromWingtra(payloadName?: string, payloadKey?: string): CameraModel {
-  const key = (payloadKey || payloadName || "").toLowerCase();
-  if (key.includes("rx1r2") || key.includes("rx1rii") || key.includes("42mp")) {
-    return SONY_RX1R2;
+  return resolveCameraInfoFromWingtra(payloadName, payloadKey).camera;
+}
+
+// Simplified resolver: uses names arrays for exact matching
+const CAMERA_LIST: Array<{ key:string; model: CameraModel }> = [
+  { key: 'SONY_RX1R2', model: SONY_RX1R2 },
+  { key: 'ILX_LR1_INSPECT_85MM', model: ILX_LR1_INSPECT_85MM },
+  { key: 'MAP61_17MM', model: MAP61_17MM },
+  { key: 'RGB61_24MM', model: RGB61_24MM },
+  { key: 'DJI_ZENMUSE_P1_24MM', model: DJI_ZENMUSE_P1_24MM },
+];
+
+export function resolveCameraInfoFromWingtra(payloadName?: string, payloadKey?: string): { camera: CameraModel; key: string } {
+  const candidates = Array.from(new Set([payloadName, payloadKey].filter(Boolean))) as string[];
+  for (const c of candidates) {
+    for (const { key, model } of CAMERA_LIST) {
+      if (model.names?.includes(c)) {
+        return { camera: model, key };
+      }
+    }
   }
-  // Fallback to SONY_RX1R2 unless you add more mappings
-  return SONY_RX1R2;
+  return { camera: SONY_RX1R2, key: 'SONY_RX1R2' };
 }
 
 /** Deduce overlaps/spacing from an item and/or recompute from camera if needed. */
@@ -83,7 +99,8 @@ export function importWingtraFlightPlan(
   const angleConv = opts?.angleConvention ?? "northCW";
   const payloadName = fp.flightPlan.payload;
   const payloadKey  = (fp.flightPlan as any).payloadUniqueString as string | undefined;
-  const cam = resolveCameraFromWingtra(payloadName, payloadKey);
+  const camInfo = resolveCameraInfoFromWingtra(payloadName, payloadKey);
+  const cam = camInfo.camera;
 
   const items: ImportedArea[] = [];
   let idx = 0;
@@ -109,6 +126,7 @@ export function importWingtraFlightPlan(
       triggerDistanceM: params.triggerDistanceM,
       angleDeg,
       terrainFollowing: !!area.terrainFollowing,
+      cameraKey: camInfo.key,
       wingtraRaw: area,
     });
   }
@@ -117,6 +135,7 @@ export function importWingtraFlightPlan(
     items,
     payloadName,
     payloadKey,
+    payloadCameraKey: camInfo.key,
     meta: {
       version: fp.version,
       fileType: fp.fileType,

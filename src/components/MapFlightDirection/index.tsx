@@ -500,7 +500,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
               altitudeAGL: item.altitudeAGL,
               frontOverlap: item.frontOverlap,
               sideOverlap: item.sideOverlap,
-              cameraKey: 'SONY_RX1R2', // default camera mapping for imported plan (extend mapping if needed)
+              cameraKey: item.cameraKey || imported.payloadCameraKey || 'SONY_RX1R2', // use resolved camera from import
             },
             original: { bearingDeg: item.angleDeg, lineSpacingM: item.lineSpacingM },
             override: { bearingDeg: item.angleDeg, lineSpacingM: item.lineSpacingM, source: 'wingtra' as const }
@@ -526,6 +526,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
               angleDeg: item.angleDeg,
               lineSpacingM: item.lineSpacingM,
               triggerDistanceM: item.triggerDistanceM,
+              cameraKey: item.cameraKey || imported.payloadCameraKey || 'SONY_RX1R2',
               source: 'wingtra'
             }
           });

@@ -27,13 +27,13 @@ export default function PolygonParamsDialog({
   const [cameraKey, setCameraKey] = React.useState<string>("SONY_RX1R2");
 
   // map keys to models (could be lifted up later if needed)
-  const cameraOptions: Record<string, { label: string; model: any }> = {
-    SONY_RX1R2: { label: "RX1RII 35mm", model: SONY_RX1R2 },
-    DJI_ZENMUSE_P1_24MM: { label: "DJI Zenmuse P1 24mm", model: DJI_ZENMUSE_P1_24MM },
-    ILX_LR1_INSPECT_85MM: { label: "INSPECT 85mm", model: ILX_LR1_INSPECT_85MM },
-    MAP61_17MM: { label: "MAP61 17mm", model: MAP61_17MM },
-    RGB61_24MM: { label: "RGB61 24mm", model: RGB61_24MM },
-  };
+  const cameraOptions: Array<{ key:string; model:any; label:string }> = [
+    { key:'SONY_RX1R2', model: SONY_RX1R2, label: SONY_RX1R2.names?.[0] || 'RX1RII 35mm' },
+    { key:'DJI_ZENMUSE_P1_24MM', model: DJI_ZENMUSE_P1_24MM, label: DJI_ZENMUSE_P1_24MM.names?.[0] || 'DJI Zenmuse P1 24mm' },
+    { key:'ILX_LR1_INSPECT_85MM', model: ILX_LR1_INSPECT_85MM, label: ILX_LR1_INSPECT_85MM.names?.[0] || 'INSPECT 85mm' },
+    { key:'MAP61_17MM', model: MAP61_17MM, label: MAP61_17MM.names?.[0] || 'MAP61 17mm' },
+    { key:'RGB61_24MM', model: RGB61_24MM, label: RGB61_24MM.names?.[0] || 'RGB61 24mm' },
+  ];
 
   React.useEffect(() => {
     if (open) {
@@ -60,9 +60,9 @@ export default function PolygonParamsDialog({
                 <SelectValue placeholder="Select camera" />
               </SelectTrigger>
               <SelectContent>
-                {Object.entries(cameraOptions).map(([key, info]) => (
-                  <SelectItem value={key} key={key} className="text-xs">
-                    {info.label}
+                {cameraOptions.map(c => (
+                  <SelectItem value={c.key} key={c.key} className="text-xs">
+                    {c.label}
                   </SelectItem>
                 ))}
               </SelectContent>

@@ -11,6 +11,7 @@ export const SONY_RX1R2: CameraModel = {
   sy_m: 4.88e-6,
   w_px: 7952,          // 7952 x 5304 pixels
   h_px: 5304,
+  names: [ 'RX1RII 42MP', 'RX1RII', 'RX1R2', 'SONY_RX1R2' ],
 };
 
 // DJI Zenmuse P1 24mm (8192 x 5460, 4.27246 µm pixels, ~24 mm focal length)
@@ -22,6 +23,7 @@ export const DJI_ZENMUSE_P1_24MM: CameraModel = {
   h_px: 5460,
   cx_px: 4075.470103874583, // provided principal point
   cy_px: 2747.220102704297,
+  names: [ 'DJI Zenmuse P1 24mm', 'Zenmuse P1 24mm', 'P1 24mm', 'ZENMUSE_P1_24MM' ],
 };
 
 // INSPECT, 85mm configuration (9504 x 6336)
@@ -32,6 +34,7 @@ export const ILX_LR1_INSPECT_85MM: CameraModel = {
   sy_m: 23.8e-3 / 6336, // ≈3.756 µm
   w_px: 9504,
   h_px: 6336,
+  names: [ 'INSPECT', 'ILX-LR1 85mm', 'ILX_LR1_INSPECT_85MM', 'MAPSTARHighRes_v4' ],
 };
 
 // MAP61 17mm
@@ -41,6 +44,7 @@ export const MAP61_17MM: CameraModel = {
   sy_m: 23.8e-3 / 6336,
   w_px: 9504,
   h_px: 6336,
+  names: [ 'MAP61', 'MAP61 17mm', 'MAP61_17MM', 'MAPSTAROblique_v4' ],
 };
 
 // RGB61 24mm (36.0 x 24.0 mm sensor, 9504 x 6336, 24 mm lens)
@@ -51,6 +55,7 @@ export const RGB61_24MM: CameraModel = {
   sy_m: 24.0e-3 / 6336,
   w_px: 9504,
   h_px: 6336,
+  names: [ 'RGB61', 'RGB61 24mm', 'RGB61_24MM', 'RGB61_v4' ],
 };
 
 /**

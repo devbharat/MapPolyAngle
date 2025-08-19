@@ -70,6 +70,7 @@ export interface ImportedArea {
   triggerDistanceM: number;   // meters
   angleDeg: number;           // direction of flight, 0..360
   terrainFollowing: boolean;
+  cameraKey?: string;         // internal camera registry key (e.g. SONY_RX1R2, MAP61_17MM)
   // carry through metadata that could be useful
   wingtraRaw?: WingtraAreaItem;
 }
@@ -78,6 +79,7 @@ export interface ImportedWingtraPlan {
   items: ImportedArea[];
   payloadName?: string;
   payloadKey?: string;      // payloadUniqueString
+  payloadCameraKey?: string; // resolved internal camera key
   meta: {
     version: number;
     fileType: "Plan";

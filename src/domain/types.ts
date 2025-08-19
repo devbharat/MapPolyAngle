@@ -18,6 +18,7 @@ export interface CameraModel {
   h_px: number;        // image height in pixels
   cx_px?: number;      // principal point x (optional, defaults to w_px/2)
   cy_px?: number;      // principal point y (optional, defaults to h_px/2)
+  names?: string[];    // canonical & alias names (exact matches to Wingtra payload strings)
 }
 
 export interface FlightParams {
