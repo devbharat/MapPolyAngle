@@ -24,7 +24,7 @@ import { update3DPathLayer, remove3DPathLayer, update3DCameraPointsLayer, remove
 import { build3DFlightPath, calculateFlightLineSpacing, calculateOptimalTerrainZoom } from './utils/geometry';
 import { PolygonAnalysisResult, PolygonParams } from './types';
 import { parseKmlPolygons, calculateKmlBounds, extractKmlFromKmz } from '@/utils/kml';
-import { SONY_RX1R2 } from '@/domain/camera';
+import { SONY_RX1R2, DJI_ZENMUSE_P1_24MM, ILX_LR1_INSPECT_85MM, MAP61_17MM, RGB61_24MM, forwardSpacing } from '@/domain/camera';
 import type { MapFlightDirectionAPI, ImportedFlightplanArea } from './api';
 import { fetchTilesForPolygon } from './utils/terrain';
 
@@ -32,6 +32,13 @@ import { fetchTilesForPolygon } from './utils/terrain';
 import { importWingtraFlightPlan } from '@/interop/wingtra/convert';
 import { exportToWingtraFlightPlan, areasFromState } from '@/interop/wingtra/convert';
 
+const CAMERA_REGISTRY: Record<string, any> = {
+  SONY_RX1R2,
+  DJI_ZENMUSE_P1_24MM,
+  ILX_LR1_INSPECT_85MM,
+  MAP61_17MM,
+  RGB61_24MM,
+};
 const DEFAULT_CAMERA = SONY_RX1R2;
 
 interface Props {
@@ -213,9 +220,10 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         const bearingDeg = override ? override.bearingDeg : result.result.contourDirDeg;
 
         // Spacing: keep override spacing if present, otherwise recompute from params
+        const cameraForPoly = params?.cameraKey ? (CAMERA_REGISTRY as any)[params.cameraKey] || DEFAULT_CAMERA : DEFAULT_CAMERA;
         const spacing =
           override?.lineSpacingM ??
-          calculateFlightLineSpacing(DEFAULT_CAMERA, params.altitudeAGL, params.sideOverlap);
+          calculateFlightLineSpacing(cameraForPoly, params.altitudeAGL, params.sideOverlap);
 
         // Remove existing flight lines first to avoid Mapbox layer conflicts
         removeFlightLinesForPolygon(mapRef.current, result.polygonId);
@@ -491,7 +499,8 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
             params: {
               altitudeAGL: item.altitudeAGL,
               frontOverlap: item.frontOverlap,
-              sideOverlap: item.sideOverlap
+              sideOverlap: item.sideOverlap,
+              cameraKey: 'SONY_RX1R2', // default camera mapping for imported plan (extend mapping if needed)
             },
             original: { bearingDeg: item.angleDeg, lineSpacingM: item.lineSpacingM },
             override: { bearingDeg: item.angleDeg, lineSpacingM: item.lineSpacingM, source: 'wingtra' as const }
@@ -693,7 +702,8 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
 
       const override = bearingOverridesRef.current.get(polygonId);
       const bearingDeg = override ? override.bearingDeg : res.result.contourDirDeg;
-      const spacing = override?.lineSpacingM ?? calculateFlightLineSpacing(DEFAULT_CAMERA, params.altitudeAGL, params.sideOverlap);
+      const camera = (params as any).cameraKey ? CAMERA_REGISTRY[(params as any).cameraKey] || DEFAULT_CAMERA : DEFAULT_CAMERA;
+      const spacing = override?.lineSpacingM ?? calculateFlightLineSpacing(camera, params.altitudeAGL, params.sideOverlap);
 
       removeFlightLinesForPolygon(mapRef.current, polygonId);
       const fl = addFlightLinesForPolygon(

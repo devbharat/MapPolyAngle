@@ -1,6 +1,8 @@
 import React from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
+import { Select, SelectTrigger, SelectContent, SelectItem, SelectValue } from "@/components/ui/select";
+import { SONY_RX1R2, DJI_ZENMUSE_P1_24MM, ILX_LR1_INSPECT_85MM, MAP61_17MM, RGB61_24MM } from "@/domain/camera";
 
 type Props = {
   open: boolean;
@@ -22,13 +24,23 @@ export default function PolygonParamsDialog({
   const [altitudeAGL, setAltitudeAGL] = React.useState<number>(defaults?.altitudeAGL ?? 100);
   const [frontOverlap, setFrontOverlap] = React.useState<number>(defaults?.frontOverlap ?? 80);
   const [sideOverlap, setSideOverlap] = React.useState<number>(defaults?.sideOverlap ?? 70);
+  const [cameraKey, setCameraKey] = React.useState<string>("SONY_RX1R2");
+
+  // map keys to models (could be lifted up later if needed)
+  const cameraOptions: Record<string, { label: string; model: any }> = {
+    SONY_RX1R2: { label: "RX1RII 35mm", model: SONY_RX1R2 },
+    DJI_ZENMUSE_P1_24MM: { label: "DJI Zenmuse P1 24mm", model: DJI_ZENMUSE_P1_24MM },
+    ILX_LR1_INSPECT_85MM: { label: "INSPECT 85mm", model: ILX_LR1_INSPECT_85MM },
+    MAP61_17MM: { label: "MAP61 17mm", model: MAP61_17MM },
+    RGB61_24MM: { label: "RGB61 24mm", model: RGB61_24MM },
+  };
 
   React.useEffect(() => {
-    // reset when a new polygon is requested
     if (open) {
       setAltitudeAGL(defaults?.altitudeAGL ?? 100);
       setFrontOverlap(defaults?.frontOverlap ?? 80);
       setSideOverlap(defaults?.sideOverlap ?? 70);
+      setCameraKey("SONY_RX1R2");
     }
   }, [open, defaults?.altitudeAGL, defaults?.frontOverlap, defaults?.sideOverlap]);
 
@@ -41,6 +53,21 @@ export default function PolygonParamsDialog({
           <CardTitle className="text-sm">Flight setup for <span className="font-mono">#{polygonId.slice(0,8)}</span></CardTitle>
         </CardHeader>
         <CardContent className="space-y-2">
+          <label className="text-xs text-gray-600 block">
+            Camera
+            <Select value={cameraKey} onValueChange={setCameraKey}>
+              <SelectTrigger className="h-8 text-xs mt-1">
+                <SelectValue placeholder="Select camera" />
+              </SelectTrigger>
+              <SelectContent>
+                {Object.entries(cameraOptions).map(([key, info]) => (
+                  <SelectItem value={key} key={key} className="text-xs">
+                    {info.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </label>
           <label className="text-xs text-gray-600 block">
             Altitude AGL (m)
             <input className="w-full border rounded px-2 py-1 text-xs" type="number"
@@ -64,7 +91,7 @@ export default function PolygonParamsDialog({
             <Button
               size="sm"
               className="flex-1 min-w-0 h-8 px-2 text-xs"
-              onClick={() => onSubmit({ altitudeAGL, frontOverlap, sideOverlap })}>
+              onClick={() => onSubmit({ altitudeAGL, frontOverlap, sideOverlap, cameraKey } as any)}>
               Apply
             </Button>
             {onSubmitAll && (
@@ -72,7 +99,7 @@ export default function PolygonParamsDialog({
                 size="sm"
                 variant="secondary"
                 className="h-8 px-2 text-xs whitespace-nowrap"
-                onClick={() => onSubmitAll({ altitudeAGL, frontOverlap, sideOverlap })}
+                onClick={() => onSubmitAll({ altitudeAGL, frontOverlap, sideOverlap, cameraKey } as any)}
                 title="Apply these parameters to all remaining polygons awaiting setup"
               >
                 Apply All

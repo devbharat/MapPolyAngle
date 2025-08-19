@@ -21,4 +21,5 @@ export interface PolygonParams {
   altitudeAGL: number;   // meters above ground
   frontOverlap: number;  // percent 0–95
   sideOverlap: number;   // percent 0–95
+  cameraKey?: string;    // optional camera identifier
 }

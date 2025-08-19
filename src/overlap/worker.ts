@@ -1,6 +1,6 @@
-/* Faster drop-in worker: identical functionality + per‑polygon stats */
+/* Faster drop-in worker: identical functionality + per‑polygon stats + multi-camera support */
 
-import type { WorkerIn, WorkerOut, PoseMeters, GSDStats, PolygonLngLatWithId, PolygonTileStats } from "./types";
+import type { WorkerIn, WorkerOut, PoseMeters, GSDStats, PolygonLngLatWithId, PolygonTileStats, CameraModel } from "./types";
 import { tileMetersBounds, worldToPixel } from "./mercator";
 import { decodeTerrainRGBToElev } from "./terrain";
 import { rotMat, camRayToPixel, normalFromDEM } from "./math3d";
@@ -46,8 +46,7 @@ function cropCenter(src: Uint8Array, sizePad: number, size: number, pad: number)
   return out;
 }
 
-// --- Faster drop-in worker code ---
-
+// --- Types (reuse WorkerIn/Out) ---
 type Msg = WorkerIn;
 type Ret = WorkerOut;
 
@@ -55,20 +54,8 @@ type PreparedPose = PoseMeters & {
   RT: Float64Array;
   radius: number;
   radiusSq: number;
+  camIndex: number; // index into cameras array
 };
-
-function preparePoses(poses: PoseMeters[], zMin: number, diagTan: number): PreparedPose[] {
-  const out: PreparedPose[] = new Array(poses.length);
-  for (let i = 0; i < poses.length; i++) {
-    const p = poses[i];
-    const R = rotMat(p.omega_deg, p.phi_deg, p.kappa_deg);
-    const RT = new Float64Array([R[0],R[3],R[6], R[1],R[4],R[7], R[2],R[5],R[8]]);
-    const H = Math.max(1.0, p.z - zMin);
-    const radius = H * diagTan * 1.25;
-    out[i] = { ...p, RT, radius, radiusSq: radius * radius };
-  }
-  return out;
-}
 
 function ringsToPixelsWithTx(polygons: PolygonLngLatWithId[], tx: any) {
   const ringsPerPoly: Array<Array<[number, number]>> = [];
@@ -187,267 +174,167 @@ function calculateGSDStatsFast(
 }
 
 self.onmessage = (ev: MessageEvent<Msg>) => {
-  const { tile, polygons, poses, camera, options } = ev.data;
+  const { tile, polygons, poses, camera, cameras, poseCameraIndices, options } = ev.data;
   const { z, x, y, size, data } = tile;
 
+  // Determine camera mode
+  let multi = Array.isArray(cameras) && cameras.length > 0 && poseCameraIndices instanceof Uint16Array && poseCameraIndices.length === poses.length;
+  const camModels: CameraModel[] = multi ? (cameras as CameraModel[]) : (camera ? [camera] : []);
+  const poseCamIdx: Uint16Array = multi ? (poseCameraIndices as Uint16Array) : new Uint16Array(poses.length); // all zeros if single
+  if (camModels.length === 0) {
+    const ret: Ret = { z, x, y, size, overlap: new Uint16Array(size*size), gsdMin: new Float32Array(size*size).fill(Number.POSITIVE_INFINITY), maxOverlap:0, minGsd:Number.POSITIVE_INFINITY, perPolygon: [] } as any;
+    (self as any).postMessage(ret, [ret.overlap.buffer, ret.gsdMin.buffer]);
+    return;
+  }
+
+  // Decode elevation
   const elev = decodeTerrainRGBToElev(data, size);
 
-  // Compute pixel radius for interior clip (round for symmetry across tiles)
+  // Clip / erosion radius
   const clipM = Math.max(0, options?.clipInnerBufferM ?? 0);
   const tileBounds = tileMetersBounds(z, x, y);
   const pixM = (tileBounds.maxX - tileBounds.minX) / size;
   const radiusPx = clipM > 0 ? Math.max(1, Math.round(clipM / pixM)) : 0;
 
-  // Build (optionally eroded) polygon masks with halo cropping back to tile
   const { tx, masks: polyMasks, unionMask: polyMask, ids: polyIds } = buildPolygonMasks(polygons, z, x, y, size, radiusPx);
 
-  // If nothing intersects this tile → early out
-  let polyPixelCount = 0;
-  for (let i = 0; i < polyMask.length; i++) polyPixelCount += polyMask[i];
+  // Early out if no intersection
+  let polyPixelCount = 0; for (let i=0;i<polyMask.length;i++) polyPixelCount += polyMask[i];
   if (polyPixelCount === 0) {
-    const ret: Ret = {
-      z, x, y, size,
-      overlap: new Uint16Array(size * size),
-      gsdMin: new Float32Array(size * size).fill(Number.POSITIVE_INFINITY),
-      maxOverlap: 0,
-      minGsd: Number.POSITIVE_INFINITY,
-      perPolygon: []
-    };
+    const ret: Ret = { z, x, y, size, overlap: new Uint16Array(size*size), gsdMin: new Float32Array(size*size).fill(Number.POSITIVE_INFINITY), maxOverlap:0, minGsd:Number.POSITIVE_INFINITY, perPolygon: [] } as any;
     (self as any).postMessage(ret, [ret.overlap.buffer, ret.gsdMin.buffer]);
     return;
   }
 
-  // --- z min (for footprint radius)
-  let zMin = +Infinity;
-  for (let i = 0; i < elev.length; i++) { const ez = elev[i]; if (ez < zMin) zMin = ez; }
+  // zMin
+  let zMin = +Infinity; for (let i=0;i<elev.length;i++){ const ez=elev[i]; if (ez < zMin) zMin = ez; }
 
-  // --- Precompute world coords
+  // Precompute projection helpers
   tx.pixelSize = (tx.maxX - tx.minX) / size;
-  const xwCol = new Float64Array(size);
-  const ywRow = new Float64Array(size);
+  const xwCol = new Float64Array(size); const ywRow = new Float64Array(size);
   const minX = tx.minX, maxY = tx.maxY, pixSize = tx.pixelSize;
-  for (let c = 0; c < size; c++) xwCol[c] = minX + (c + 0.5) * pixSize;
-  for (let r = 0; r < size; r++) ywRow[r] = maxY - (r + 0.5) * pixSize;
-  const Rm = 6378137;
-  const cosLatPerRow = new Float64Array(size);
-  for (let r = 0; r < size; r++) {
-    const latRad = Math.atan(Math.sinh(ywRow[r] / Rm));
-    cosLatPerRow[r] = Math.cos(latRad);
-  }
+  for (let c=0;c<size;c++) xwCol[c] = minX + (c+0.5)*pixSize;
+  for (let r=0;r<size;r++) ywRow[r] = maxY - (r+0.5)*pixSize;
+  const Rm = 6378137; const cosLatPerRow = new Float64Array(size);
+  for (let r=0;r<size;r++){ const latRad=Math.atan(Math.sinh(ywRow[r]/Rm)); cosLatPerRow[r]=Math.cos(latRad);}  
 
-  // --- Precompute normals & active index list
-  const normals = new Float32Array(size * size * 3);
+  // Precompute normals & active indices
+  const normals = new Float32Array(size*size*3);
   const activeIdxs = new Uint32Array(polyPixelCount);
-  {
-    let w = 0;
-    for (let idx = 0; idx < elev.length; idx++) {
-      if (polyMask[idx] === 0) continue;
-      const row = (idx / size) | 0;
-      const col = idx - row * size;
-      const n = normalFromDEM(elev, size, row, col, pixSize);
-      const base = idx * 3;
-      normals[base] = n[0];
-      normals[base + 1] = n[1];
-      normals[base + 2] = n[2];
-      activeIdxs[w++] = idx;
-    }
+  { let w=0; for (let idx=0; idx<elev.length; idx++){ if (!polyMask[idx]) continue; const row=(idx/size)|0; const col=idx-row*size; const n=normalFromDEM(elev,size,row,col,pixSize); const base=idx*3; normals[base]=n[0]; normals[base+1]=n[1]; normals[base+2]=n[2]; activeIdxs[w++]=idx; } }
+
+  // Per-camera precompute (diag tan + s/f)
+  const camDiagTan: number[] = new Array(camModels.length);
+  const cam_s_over_f: number[] = new Array(camModels.length);
+  for (let ci=0; ci<camModels.length; ci++) {
+    const c = camModels[ci];
+    const sensorW = c.w_px * c.sx_m;
+    const sensorH = c.h_px * c.sy_m;
+    const diagFovHalf = Math.atan(0.5 * Math.hypot(sensorW, sensorH) / c.f_m);
+    camDiagTan[ci] = Math.tan(diagFovHalf);
+    cam_s_over_f[ci] = c.sx_m / c.f_m;
   }
 
-  // --- Camera optics constants
-  const sensorW = camera.w_px * camera.sx_m;
-  const sensorH = camera.h_px * camera.sy_m;
-  const diagFovHalf = Math.atan(0.5 * Math.hypot(sensorW, sensorH) / camera.f_m);
-  const diagTan = Math.tan(diagFovHalf);
-  const s_over_f = camera.sx_m / camera.f_m;
-  const cosIncMin = 1e-3;
+  // Prepare poses (per-pose radius based on its camera)
+  const prepared: PreparedPose[] = new Array(poses.length);
+  for (let i=0;i<poses.length;i++) {
+    const p = poses[i];
+    const idxVal = poseCamIdx[i];
+    const camIdx = idxVal < camModels.length ? idxVal : 0;
+    const R = rotMat(p.omega_deg, p.phi_deg, p.kappa_deg);
+    const RT = new Float64Array([R[0],R[3],R[6], R[1],R[4],R[7], R[2],R[5],R[8]]);
+    const H = Math.max(1.0, p.z - zMin);
+    const diagTan = camDiagTan[camIdx];
+    const radius = H * diagTan * 1.25;
+    prepared[i] = { ...p, RT, radius, radiusSq: radius*radius, camIndex: camIdx };
+  }
 
-  // --- Prepared poses
-  const P = preparePoses(poses, zMin, diagTan);
-
-  // --- Stage-1 pose culling vs tile box
+  // Stage-1 coarse cull vs tile box
   const rectMinX = tx.minX, rectMaxX = tx.maxX, rectMinY = tx.minY, rectMaxY = tx.maxY;
   const candidateIdxs: number[] = [];
-  for (let i = 0; i < P.length; i++) {
-    const p = P[i];
+  for (let i=0;i<prepared.length;i++) {
+    const p = prepared[i];
     const dx = (p.x < rectMinX) ? (rectMinX - p.x) : (p.x > rectMaxX) ? (p.x - rectMaxX) : 0;
     const dy = (p.y < rectMinY) ? (rectMinY - p.y) : (p.y > rectMaxY) ? (p.y - rectMaxY) : 0;
     if (dx*dx + dy*dy <= p.radiusSq) candidateIdxs.push(i);
   }
-  const useIdxs = (polyPixelCount > 0 && candidateIdxs.length === 0) ? P.map((_, i) => i) : candidateIdxs;
+  const useIdxs = (polyPixelCount > 0 && candidateIdxs.length === 0) ? prepared.map((_,i)=>i) : candidateIdxs;
 
-  // --- Stage-2: spatial grid of candidate poses
+  // Spatial grid of candidate poses
   const gridSize = Math.max(2, Math.min(32, options?.gridSize ?? 8));
-  const cellW = (tx.maxX - tx.minX) / gridSize;
-  const cellH = (tx.maxY - tx.minY) / gridSize;
-  const grid: number[][] = new Array(gridSize * gridSize); for (let i = 0; i < grid.length; i++) grid[i] = [];
-
-  for (let j = 0; j < useIdxs.length; j++) {
-    const i = useIdxs[j];
-    const p = P[i];
-    const minXb = Math.max(tx.minX, p.x - p.radius);
-    const maxXb = Math.min(tx.maxX, p.x + p.radius);
-    const minYb = Math.max(tx.minY, p.y - p.radius);
-    const maxYb = Math.min(tx.maxY, p.y + p.radius);
+  const cellW = (tx.maxX - tx.minX) / gridSize; const cellH = (tx.maxY - tx.minY) / gridSize;
+  const grid: number[][] = new Array(gridSize*gridSize); for (let i=0;i<grid.length;i++) grid[i]=[];
+  for (let j=0;j<useIdxs.length;j++) {
+    const i = useIdxs[j]; const p = prepared[i];
+    const minXb = Math.max(tx.minX, p.x - p.radius); const maxXb = Math.min(tx.maxX, p.x + p.radius);
+    const minYb = Math.max(tx.minY, p.y - p.radius); const maxYb = Math.min(tx.maxY, p.y + p.radius);
     if (minXb > maxXb || minYb > maxYb) continue;
     const x0 = Math.max(0, Math.floor((minXb - tx.minX) / cellW));
     const x1 = Math.min(gridSize - 1, Math.floor((maxXb - tx.minX) / cellW));
     const y0 = Math.max(0, Math.floor((tx.maxY - maxYb) / cellH));
     const y1 = Math.min(gridSize - 1, Math.floor((tx.maxY - minYb) / cellH));
-    for (let gy = y0; gy <= y1; gy++) {
-      const rowBase = gy * gridSize;
-      for (let gx = x0; gx <= x1; gx++) {
-        grid[rowBase + gx].push(j); // compact index j
-      }
+    for (let gy=y0; gy<=y1; gy++) {
+      const rowBase = gy*gridSize;
+      for (let gx=x0; gx<=x1; gx++) grid[rowBase+gx].push(j);
     }
   }
 
-  // --- Precompute pixel->cell lookups
-  const col2cellX = new Uint16Array(size);
-  const row2cellY = new Uint16Array(size);
-  for (let c = 0; c < size; c++) col2cellX[c] = Math.min(gridSize - 1, (c * gridSize / size) | 0);
-  for (let r = 0; r < size; r++) row2cellY[r] = Math.min(gridSize - 1, (r * gridSize / size) | 0);
+  // Pixel->cell lookup
+  const col2cellX = new Uint16Array(size); const row2cellY = new Uint16Array(size);
+  for (let c=0;c<size;c++) col2cellX[c] = Math.min(gridSize-1, (c*gridSize/size)|0);
+  for (let r=0;r<size;r++) row2cellY[r] = Math.min(gridSize-1, (r*gridSize/size)|0);
 
-  // --- Flatten candidate pose fields
-  const nCand = useIdxs.length;
-  const pX = new Float64Array(nCand);
-  const pY = new Float64Array(nCand);
-  const pZ = new Float64Array(nCand);
-  const pRadSq = new Float64Array(nCand);
-  const pRTs: Float64Array[] = new Array(nCand);
-  for (let k = 0; k < nCand; k++) {
-    const p = P[useIdxs[k]];
-    pX[k] = p.x; pY[k] = p.y; pZ[k] = p.z; pRadSq[k] = p.radiusSq; pRTs[k] = p.RT;
-  }
-
-  // --- Outputs (union)
-  const N = size * size;
-  const overlap = new Uint16Array(N);
-  const gsdMin = new Float32Array(N);
-  gsdMin.fill(Number.POSITIVE_INFINITY);
-
+  // Outputs
+  const N = size*size; const overlap = new Uint16Array(N); const gsdMin = new Float32Array(N); gsdMin.fill(Number.POSITIVE_INFINITY);
   const maxOverlapNeeded = Number.isFinite(options?.maxOverlapNeeded!) ? (options!.maxOverlapNeeded as number) : Infinity;
+  const poseHitsPerPoly: Array<Set<number>> = polyIds.map(()=> new Set<number>());
 
-  // --- Per‑polygon pose-hit sets (use global pose indices – stable across tiles)
-  const poseHitsPerPoly: Array<Set<number>> = polyIds.map(() => new Set<number>());
-
-  // --- Main loop over active pixels only
-  for (let t = 0; t < activeIdxs.length; t++) {
+  const cosIncMin = 1e-3;
+  // Active pixel loop
+  for (let t=0; t<activeIdxs.length; t++) {
     const idx = activeIdxs[t];
+    const row = (idx/size)|0; const col = idx - row*size; const xw = xwCol[col]; const yw = ywRow[row]; const zw = elev[idx];
+    const polysHere: number[] = []; for (let p=0;p<polyMasks.length;p++) if (polyMasks[p][idx]) polysHere.push(p); if (polysHere.length===0) continue;
+    const nb = idx*3; const nx = normals[nb], ny = normals[nb+1], nz = normals[nb+2];
 
-    const row = (idx / size) | 0;
-    const col = idx - row*size;
-    const xw = xwCol[col];
-    const yw = ywRow[row];
-    const zw = elev[idx];
+    let localOverlap = 0; let localMinG = Number.POSITIVE_INFINITY;
+    const cellIdx = (row2cellY[row]*gridSize + col2cellX[col])|0; const cellList = grid[cellIdx]; if (cellList.length===0) continue;
 
-    // Find which polygons include this pixel (can be multiple; normally 1)
-    const polysHere: number[] = [];
-    for (let p = 0; p < polyMasks.length; p++) if (polyMasks[p][idx]) polysHere.push(p);
-    if (polysHere.length === 0) continue;
-
-    const nb = idx * 3;
-    const nx = normals[nb], ny = normals[nb + 1], nz = normals[nb + 2];
-
-    let localOverlap = 0;
-    let localMinG = Number.POSITIVE_INFINITY;
-
-    const cellIdx = (row2cellY[row] * gridSize + col2cellX[col]) | 0;
-    const cellList = grid[cellIdx];
-    if (cellList.length === 0) continue;
-
-    for (let u = 0; u < cellList.length; u++) {
-      const k = cellList[u];
-      const dx2 = xw - pX[k], dy2 = yw - pY[k];
-      if (dx2*dx2 + dy2*dy2 > pRadSq[k]) continue;
-
-      const camHit = camRayToPixel(camera, pRTs[k], pX[k], pY[k], pZ[k], xw, yw, zw);
-      if (!camHit) continue;
-
-      // angle/gsd
-      const vz = (zw - pZ[k]);
-      const L = Math.hypot(dx2, dy2, vz);
-      const invL = 1 / L;
-      const rx = dx2*invL, ry = dy2*invL, rz = vz*invL;
-      const cosInc = -(nx*rx + ny*ry + nz*rz);
-      if (cosInc <= cosIncMin) continue;
-
-      const gsd = (L * s_over_f) * (1 / cosInc);
-
-      // Mark pose hit for *all* polygons covering this pixel
-      const globalPoseIndex = useIdxs[k]; // index in original 'poses' array
-      for (let pi = 0; pi < polysHere.length; pi++) {
-        poseHitsPerPoly[polysHere[pi]].add(globalPoseIndex);
-      }
-
-      localOverlap++;
-      if (gsd < localMinG) localMinG = gsd;
-      if (localOverlap >= maxOverlapNeeded) break;
+    for (let u=0; u<cellList.length; u++) {
+      const k = cellList[u]; const poseIdx = useIdxs[k]; const p = prepared[poseIdx];
+      const dx2 = xw - p.x, dy2 = yw - p.y; if (dx2*dx2 + dy2*dy2 > p.radiusSq) continue;
+      const camIdx = p.camIndex; const cam = camModels[camIdx];
+      const camHit = camRayToPixel(cam, p.RT, p.x, p.y, p.z, xw, yw, zw); if (!camHit) continue;
+      const vz = (zw - p.z); const L = Math.hypot(dx2, dy2, vz); const invL = 1 / L;
+      const rx = dx2*invL, ry = dy2*invL, rz = vz*invL; const cosInc = -(nx*rx + ny*ry + nz*rz); if (cosInc <= cosIncMin) continue;
+      const gsd = (L * cam_s_over_f[camIdx]) * (1 / cosInc);
+      const globalPoseIndex = poseIdx; for (let pi=0; pi<polysHere.length; pi++) poseHitsPerPoly[polysHere[pi]].add(globalPoseIndex);
+      localOverlap++; if (gsd < localMinG) localMinG = gsd; if (localOverlap >= maxOverlapNeeded) break;
     }
 
-    if (localOverlap > 0) {
-      overlap[idx] = localOverlap;
-      gsdMin[idx] = localMinG;
-    }
+    if (localOverlap > 0) { overlap[idx] = localOverlap; gsdMin[idx] = localMinG; }
   }
 
-  // NEW: enforce minimum overlap (e.g. 4) for GSD validity
+  // Enforce minimum overlap for GSD validity
   const MIN_OVERLAP_FOR_GSD = 4;
-  for (let t = 0; t < activeIdxs.length; t++) {
-    const idx = activeIdxs[t];
-    if (overlap[idx] > 0 && overlap[idx] < MIN_OVERLAP_FOR_GSD) {
-      overlap[idx] = 0;               // treat as no coverage
-      gsdMin[idx] = Number.POSITIVE_INFINITY; // exclude from stats & histograms
-    }
-  }
+  for (let t=0;t<activeIdxs.length;t++){ const idx=activeIdxs[t]; if (overlap[idx]>0 && overlap[idx] < MIN_OVERLAP_FOR_GSD){ overlap[idx]=0; gsdMin[idx]=Number.POSITIVE_INFINITY; } }
 
-  // --- Union summaries
+  // Union summaries
   let maxOverlap = 0, minGsd = Number.POSITIVE_INFINITY;
-  for (let t = 0; t < activeIdxs.length; t++) {
-    const idx = activeIdxs[t];
-    const ov = overlap[idx];
-    if (ov > maxOverlap) maxOverlap = ov;
-    const g = gsdMin[idx];
-    if (g > 0 && isFinite(g) && g < minGsd) minGsd = g;
-  }
+  for (let t=0;t<activeIdxs.length;t++){ const idx=activeIdxs[t]; const ov = overlap[idx]; if (ov>maxOverlap) maxOverlap=ov; const g=gsdMin[idx]; if (g>0 && isFinite(g) && g<minGsd) minGsd=g; }
 
-  // --- Per‑polygon stats: build index lists from masks and compute per‑polygon GSD stats
+  // Per-polygon stats
   const perPolygon: PolygonTileStats[] = [];
-  for (let p = 0; p < polyMasks.length; p++) {
-    // count active pixels for this polygon
-    let cnt = 0;
-    const mask = polyMasks[p];
-    for (let i = 0; i < mask.length; i++) if (mask[i] && isFinite(gsdMin[i]) && gsdMin[i] > 0) cnt++;
-    if (cnt === 0) {
-      perPolygon.push({
-        polygonId: polyIds[p],
-        activePixelCount: 0,
-        gsdStats: { min:0, max:0, mean:0, count:0, histogram: [] },
-        hitPoseIds: new Uint32Array(0),
-      });
-      continue;
-    }
-    // build active idxs for this polygon
-    const activeP = new Uint32Array(cnt);
-    for (let i = 0, w=0; i < mask.length; i++) {
-      if (mask[i] && isFinite(gsdMin[i]) && gsdMin[i] > 0) activeP[w++] = i;
-    }
+  for (let p=0;p<polyMasks.length;p++) {
+    let cnt=0; const mask=polyMasks[p]; for (let i=0;i<mask.length;i++) if (mask[i] && isFinite(gsdMin[i]) && gsdMin[i] > 0) cnt++;
+    if (cnt===0){ perPolygon.push({ polygonId: polyIds[p], activePixelCount:0, gsdStats:{min:0,max:0,mean:0,count:0,histogram:[]}, hitPoseIds:new Uint32Array(0)}); continue; }
+    const activeP = new Uint32Array(cnt); for (let i=0,w=0;i<mask.length;i++) if (mask[i] && isFinite(gsdMin[i]) && gsdMin[i] > 0) activeP[w++]=i;
     const stats = calculateGSDStatsFast(gsdMin, activeP, pixSize*pixSize, size, cosLatPerRow);
-    const hits = poseHitsPerPoly[p];
-    const hitPoseIds = new Uint32Array(hits.size);
-    let w = 0; 
-    hits.forEach(id => { hitPoseIds[w++] = id; });
-
-    perPolygon.push({
-      polygonId: polyIds[p],
-      activePixelCount: stats.count,
-      gsdStats: stats,
-      hitPoseIds
-    });
+    const hits = poseHitsPerPoly[p]; const hitPoseIds = new Uint32Array(hits.size); let w=0; hits.forEach(id=>{ hitPoseIds[w++]=id; });
+    perPolygon.push({ polygonId: polyIds[p], activePixelCount: stats.count, gsdStats: stats, hitPoseIds });
   }
 
-  // Tile‑level stats over union (kept for overlay legend if needed)
   const gsdStatsUnion: GSDStats = calculateGSDStatsFast(gsdMin, activeIdxs, pixSize*pixSize, size, cosLatPerRow);
-
   const ret: Ret = { z, x, y, size, overlap, gsdMin, maxOverlap, minGsd, gsdStats: gsdStatsUnion, perPolygon };
   (self as any).postMessage(ret, [overlap.buffer, gsdMin.buffer]);
 };

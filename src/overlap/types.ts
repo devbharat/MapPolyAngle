@@ -16,6 +16,8 @@ export type PoseMeters = {
   omega_deg: number;
   phi_deg: number;
   kappa_deg: number;
+  // OPTIONAL: source polygon association (enables per‑polygon camera selection)
+  polygonId?: string;
 };
 
 export type TileRGBA = {
@@ -60,7 +62,12 @@ export type WorkerIn = {
   tile: TileRGBA;
   polygons: PolygonLngLatWithId[];  // mask to these polygons
   poses: PoseMeters[];        // pre-converted to EPSG:3857 meters
-  camera: CameraModel;
+  /** Legacy single-camera (still honored if multi-camera arrays not provided). */
+  camera?: CameraModel;
+  /** Optional multi-camera support: list of unique cameras. */
+  cameras?: CameraModel[];
+  /** For each pose, index into `cameras` (same length as poses). */
+  poseCameraIndices?: Uint16Array;
   options?: {
     gsdMaxForPalette?: number; // meters per pixel for visualization clamp
     /** Optional: stop counting once overlap reaches this number (per pixel). Default: Infinity */

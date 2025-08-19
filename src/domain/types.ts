@@ -24,6 +24,7 @@ export interface FlightParams {
   altitudeAGL: number;  // altitude above ground level in meters
   frontOverlap: number; // front overlap percentage (0–95)
   sideOverlap: number;  // side overlap percentage (0–95)
+  cameraKey?: string;   // optional camera identifier (maps to models in domain/camera)
 }
 
 export interface TerrainTile {

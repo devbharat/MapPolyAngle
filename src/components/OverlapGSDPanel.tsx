@@ -5,7 +5,7 @@ import { addOrUpdateTileOverlay, clearRunOverlays } from "@/overlap/overlay";
 import type { CameraModel, PoseMeters, PolygonLngLatWithId, GSDStats, PolygonTileStats } from "@/overlap/types";
 import { lngLatToMeters } from "@/overlap/mercator";
 import { metersToLngLat } from "@/services/Projection";
-import { SONY_RX1R2 } from "@/domain/camera";
+import { SONY_RX1R2, DJI_ZENMUSE_P1_24MM, ILX_LR1_INSPECT_85MM, MAP61_17MM, RGB61_24MM } from "@/domain/camera";
 import { sampleCameraPositionsOnFlightPath, build3DFlightPath } from "@/components/MapFlightDirection/utils/geometry";
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -21,7 +21,7 @@ type Props = {
   mapRef: React.RefObject<MapFlightDirectionAPI>;
   mapboxToken: string;
   /** Provide per‑polygon params (altitude/front/side) so we can compute per‑polygon photoSpacing. */
-  getPerPolygonParams?: () => Record<string, { altitudeAGL: number; frontOverlap: number; sideOverlap: number }>;
+  getPerPolygonParams?: () => Record<string, { altitudeAGL: number; frontOverlap: number; sideOverlap: number; cameraKey?: string }> ;
   onAutoRun?: (autoRunFn: (opts?: { polygonId?: string; reason?: 'lines'|'spacing'|'alt'|'manual' }) => void) => void;
   onClearExposed?: (clearFn: () => void) => void;
   // NEW: expose a method so parent (header) can trigger DJI pose JSON import
@@ -71,7 +71,17 @@ function metersBoundsToLngLatRing(minX:number,minY:number,maxX:number,maxY:numbe
 }
 
 export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAutoRun, onClearExposed, onExposePoseImporter, onPosesImported }: Props) {
+  const CAMERA_REGISTRY: Record<string, CameraModel> = useMemo(()=>({
+    SONY_RX1R2,
+    DJI_ZENMUSE_P1_24MM,
+    ILX_LR1_INSPECT_85MM,
+    MAP61_17MM,
+    RGB61_24MM,
+  }),[]);
+
+  // Global camera override JSON (optional). If blank, we'll use per‑polygon camera selections.
   const [cameraText, setCameraText] = useState(JSON.stringify(SONY_RX1R2, null, 2));
+  const [useOverrideCamera, setUseOverrideCamera] = useState(false);
   const [altitude, setAltitude] = useState(100); // AGL in meters
   const [frontOverlap, setFrontOverlap] = useState(80); // percentage
   const [sideOverlap, setSideOverlap] = useState(70); // percentage
@@ -143,17 +153,25 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
     }
   }, [mapRef]);
 
-  const parseCamera = useCallback((): CameraModel | null => {
-    try { return JSON.parse(cameraText); } catch { return null; }
-  }, [cameraText]);
+  const parseCameraOverride = useCallback((): CameraModel | null => {
+    if (!useOverrideCamera) return null;
+    try { const obj = JSON.parse(cameraText); return obj as CameraModel; } catch { return null; }
+  }, [cameraText, useOverrideCamera]);
 
-  // Helper: per‑polygon spacing from camera + altitude/front
-  const photoSpacingFor = useCallback((altitudeAGL: number, frontOverlap: number): number => {
-    const camera = parseCamera();
-    if (!camera) return 60;
-    const groundHeight = (camera.h_px * camera.sy_m * altitudeAGL) / camera.f_m;
+  const effectiveCameraForPolygon = useCallback((polygonId: string, paramsMap: any): CameraModel => {
+    const override = parseCameraOverride();
+    if (override) return override;
+    const p = paramsMap[polygonId];
+    if (p?.cameraKey && CAMERA_REGISTRY[p.cameraKey]) return CAMERA_REGISTRY[p.cameraKey];
+    return SONY_RX1R2; // fallback
+  }, [parseCameraOverride, CAMERA_REGISTRY]);
+
+  // Helper: per‑polygon spacing using that polygon's selected camera
+  const photoSpacingFor = useCallback((polygonId: string, altitudeAGL: number, frontOverlap: number, paramsMap: any): number => {
+    const cam = effectiveCameraForPolygon(polygonId, paramsMap);
+    const groundHeight = (cam.h_px * cam.sy_m * altitudeAGL) / cam.f_m;
     return groundHeight * (1 - frontOverlap / 100);
-  }, [parseCamera]);
+  }, [effectiveCameraForPolygon]);
 
   // Function to aggregate GSD statistics from multiple tiles
   const aggregateGSDStats = useCallback((tileStats: GSDStats[]): GSDStats => {
@@ -217,19 +235,14 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
 
   // Calculate flight parameters from overlap settings
   const calculateFlightParameters = useCallback(() => {
-    const camera = parseCamera();
-    if (!camera) return { photoSpacing: 60, lineSpacing: 100 };
-
-    // Calculate ground footprint at specified altitude
-    const groundWidth = (camera.w_px * camera.sx_m * altitude) / camera.f_m;
-    const groundHeight = (camera.h_px * camera.sy_m * altitude) / camera.f_m;
-
-    // Calculate spacing based on overlap percentages
-    const photoSpacing = groundHeight * (1 - frontOverlap / 100); // Forward direction
-    const lineSpacing = groundWidth * (1 - sideOverlap / 100);    // Side direction
-
-    return { photoSpacing, lineSpacing };
-  }, [parseCamera, altitude, frontOverlap, sideOverlap]);
+    const override = parseCameraOverride();
+    const cam = override || SONY_RX1R2;
+    const groundWidth = (cam.w_px * cam.sx_m * altitude) / cam.f_m;
+    const groundHeight = (cam.h_px * cam.sy_m * altitude) / cam.f_m;
+    const photoSpacing = groundHeight * (1 - frontOverlap / 100);
+    const lineSpacing = groundWidth * (1 - sideOverlap / 100);
+    return { photoSpacing, lineSpacing, camLabel: useOverrideCamera ? 'Override' : 'Default' };
+  }, [parseCameraOverride, altitude, frontOverlap, sideOverlap, useOverrideCamera]);
 
   const { photoSpacing, lineSpacing } = calculateFlightParameters();
 
@@ -254,7 +267,8 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
 
       const p = (paramsMap as any)[polygonId];
       const altForThisPoly = p?.altitudeAGL ?? altitudeAGL ?? 100;
-      const photoSpacing = photoSpacingFor(altForThisPoly, p?.frontOverlap ?? 80);
+      const front = p?.frontOverlap ?? 80;
+      const spacingForward = photoSpacingFor(polygonId, altForThisPoly, front, paramsMap);
 
       const path3D = build3DFlightPath(
         flightLines,
@@ -263,7 +277,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
         altForThisPoly
       );
 
-      const cameraPositions = sampleCameraPositionsOnFlightPath(path3D, photoSpacing);
+      const cameraPositions = sampleCameraPositionsOnFlightPath(path3D, spacingForward);
 
       cameraPositions.forEach(([lng, lat, altMSL, yawDeg]) => {
         const [x, y] = lngLatToMeters(lng, lat);
@@ -272,7 +286,8 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
           x, y, z: altMSL,
           omega_deg: 0,
           phi_deg: 0,
-          kappa_deg: yawDeg
+          kappa_deg: yawDeg,
+          polygonId // tag pose with polygon for per‑camera assignment
         });
       });
     }
@@ -302,34 +317,57 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
    *  - all polygons (default)
    */
   const compute = useCallback(async (opts?: { polygonId?: string }) => {
-    const camera = parseCamera();
+    const api = mapRef.current;
+    const internalParams = api?.getPerPolygonParams?.() ?? {};
+    const externalParams = getPerPolygonParams?.() ?? {};
+    const paramsMap = { ...internalParams, ...externalParams };
+    const overrideCam = parseCameraOverride();
+    // Build per-polygon camera mapping
+    const perPolyCam: Record<string, CameraModel> = {};
+    Object.entries(paramsMap).forEach(([pid, p]: any) => {
+      if (p?.cameraKey && CAMERA_REGISTRY[p.cameraKey]) perPolyCam[pid] = CAMERA_REGISTRY[p.cameraKey];
+    });
     const poses = parsePosesMeters();
-    // All polygons currently on the map (may be empty)
+    // Derive cameras + indices for worker
+    let camerasArr: CameraModel[] | undefined; let poseIdxArr: Uint16Array | undefined;
+    if (poses && poses.length) {
+      const camObjToIndex = new Map<CameraModel, number>();
+      const cams: CameraModel[] = [];
+      const indices = new Uint16Array(poses.length);
+      for (let i=0;i<poses.length;i++) {
+        const pose = poses[i];
+        let cam: CameraModel | undefined = undefined;
+        if (overrideCam && typeof overrideCam === 'object' && 'f_m' in overrideCam) {
+          cam = overrideCam as CameraModel;
+        } else if (pose.polygonId && perPolyCam[pose.polygonId]) {
+          cam = perPolyCam[pose.polygonId];
+        }
+        if (!cam) cam = SONY_RX1R2;
+        if (!camObjToIndex.has(cam)) { camObjToIndex.set(cam, cams.length); cams.push(cam); }
+        indices[i] = camObjToIndex.get(cam)!;
+      }
+      if (overrideCam && typeof overrideCam === 'object' && 'f_m' in overrideCam) {
+        camerasArr = [cams[0]]; // override forces single camera
+        poseIdxArr = new Uint16Array(poses.length); // zeros
+      } else if (cams.length > 1) {
+        camerasArr = cams; poseIdxArr = indices; // multi-camera
+      } else {
+        camerasArr = [cams[0]]; poseIdxArr = new Uint16Array(poses.length);
+      }
+    }
+    // All polygons currently on the map
     let allPolygons = getPolygons();
-    // Polygons whose extent determines which tiles we (re)compute this run
-    let tilesSourcePolygons: PolygonLngLatWithId[] = opts?.polygonId
-      ? allPolygons.filter(p => (p.id || 'unknown') === opts.polygonId)
-      : allPolygons;
-
-    // If no drawn polygons but we have poses, synthesize AOI (poses-only mode)
-    if (tilesSourcePolygons.length === 0 && poses && poses.length > 0 && camera) {
-      const buildPosesAOIRing = (poses: PoseMeters[], camera: CameraModel, clipInnerBufferM: number): [number,number][] => {
+    let tilesSourcePolygons: PolygonLngLatWithId[] = opts?.polygonId ? allPolygons.filter(p => (p.id || 'unknown') === opts.polygonId) : allPolygons;
+    if (tilesSourcePolygons.length === 0 && poses && poses.length > 0) {
+      const buildPosesAOIRing = (poses: PoseMeters[]): [number,number][] => {
         if (!poses || poses.length < 3) return [];
         const MAX_POINTS = 2000;
         const step = Math.max(1, Math.floor(poses.length / MAX_POINTS));
-        const pts = poses.filter((_,i)=> i % step === 0).map(p=>{
-          const [lng, lat] = metersToLngLat(p.x, p.y);
-            return turf.point([lng, lat]);
-        });
-        const fc = turf.featureCollection(pts);
-        const hull = turf.convex(fc); // convex hull only
-        if (!hull) return [];
-        const poly = hull; // placeholder for potential outward buffer
-        const geom: any = (poly as any).geometry;
-        const ring: [number,number][] = geom.type === 'Polygon' ? geom.coordinates[0] : geom.coordinates[0][0];
-        return ring;
+        const pts = poses.filter((_,i)=> i % step === 0).map(p=>{ const [lng, lat] = metersToLngLat(p.x, p.y); return turf.point([lng, lat]); });
+        const fc = turf.featureCollection(pts); const hull = turf.convex(fc); if (!hull) return [];
+        const geom: any = (hull as any).geometry; return geom.type === 'Polygon' ? geom.coordinates[0] : geom.coordinates[0][0];
       };
-      const ring = poseAreaRingRef.current?.length ? poseAreaRingRef.current : buildPosesAOIRing(poses, camera, clipInnerBufferM);
+      const ring = poseAreaRingRef.current?.length ? poseAreaRingRef.current : buildPosesAOIRing(poses);
       poseAreaRingRef.current = ring;
       if (ring.length >= 4) {
         const synth = { id: '__POSES__', ring } as PolygonLngLatWithId;
@@ -341,8 +379,8 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
     // Polygons used inside worker for union mask + per‑polygon stats (ALWAYS all current polygons)
     const polygonsForWorker: PolygonLngLatWithId[] = allPolygons;
 
-    if (!camera || !poses || poses.length===0 || polygonsForWorker.length===0) {
-      toast({ variant: "destructive", title: "Missing inputs", description: "Provide camera + poses (or draw/import an area)." });
+    if (!poses || poses.length===0 || allPolygons.length===0) {
+      toast({ variant: 'destructive', title: 'Missing inputs', description: 'Provide poses (or draw/import an area).' });
       return;
     }
 
@@ -413,7 +451,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
         const tile = { z:t.z, x:t.x, y:t.y, size: tileData.width, data: freshData };
 
         // Always pass ALL polygons so each tile overlay is the union of all current areas
-        const res = await worker.runTile({ tile, polygons: polygonsForWorker, poses, camera, options: { clipInnerBufferM } } as any);
+        const res = await worker.runTile({ tile, polygons: polygonsForWorker, poses, cameras: camerasArr, poseCameraIndices: poseIdxArr, camera: (!camerasArr || camerasArr.length===0)? undefined : undefined, options: { clipInnerBufferM } } as any);
 
         if (res.perPolygon) {
           for (const polyStats of res.perPolygon) {
@@ -528,7 +566,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
       worker.terminate();
       setRunning(false);
     }
-  }, [mapRef, mapboxToken, parseCamera, parsePosesMeters, getPolygons, zoom, opacity, showOverlap, showGsd, showCameraPoints, clipInnerBufferM, altitude]);
+  }, [mapRef, getPerPolygonParams, parseCameraOverride, parsePosesMeters, getPolygons, zoom, opacity, showOverlap, showGsd, showCameraPoints, clipInnerBufferM, altitude]);
 
   // Auto-run function that can be called externally
   const autoRun = useCallback(async (opts?: { polygonId?: string; reason?: 'lines'|'spacing'|'alt'|'manual' }) => {
