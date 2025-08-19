@@ -297,7 +297,7 @@ export default function Home() {
 
         {/* Right Side Panel - Combined Controls and Instructions - Hidden on mobile */}
         {!isMobile && (
-          <div className="absolute top-2 right-2 z-40 w-80 max-h-[calc(100vh-120px)] overflow-y-auto">
+          <div className="absolute top-2 right-2 z-40 w-[500px] max-w-[90vw] max-h-[calc(100vh-120px)] overflow-y-auto">
 
           {/* Analysis Results */}
           <Card className="backdrop-blur-md bg-white/95">
