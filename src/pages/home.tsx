@@ -6,10 +6,11 @@ import { Card, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { LoadingSpinner } from '@/components/ui/loading-spinner';
 import { useIsMobile } from '@/hooks/use-mobile';
-import { Map, Trash2, CheckCircle, AlertCircle, TrendingUp, Target, X, Upload } from 'lucide-react';
+import { Map, Trash2, CheckCircle, AlertCircle, TrendingUp, Target, X, Upload, Download } from 'lucide-react';
 import OverlapGSDPanel from "@/components/OverlapGSDPanel";
 import PolygonParamsDialog from "@/components/PolygonParamsDialog";
 import type { PolygonParams } from '@/components/MapFlightDirection/types';
+import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator } from '@/components/ui/dropdown-menu';
 
 export default function Home() {
   const isMobile = useIsMobile();
@@ -188,6 +189,18 @@ export default function Home() {
   const hasPolygonsToAnalyze = hasResults || hasImportedPolygons;
   const panelEnabled = hasPolygonsToAnalyze || importedPoseCount>0; // enable if poses-only
 
+  // helper to export Wingtra flight plan
+  const handleExportWingtra = useCallback(() => {
+    const api = mapRef.current; if (!api?.exportWingtraFlightPlan) return;
+    const { json, blob } = api.exportWingtraFlightPlan();
+    const original = (mapRef.current as any)?.lastImportedFlightplanName;
+    const fn = (original && /\.flightplan$/.test(original)) ? original.replace(/\.flightplan$/, '-exported.flightplan') : 'exported.flightplan';
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = fn; document.body.appendChild(a); a.click();
+    setTimeout(()=>{ URL.revokeObjectURL(url); a.remove(); }, 1000);
+  }, []);
+
   return (
     <div className="h-screen flex flex-col bg-gray-50">
       {/* Header (compact) */}
@@ -207,56 +220,47 @@ export default function Home() {
             </div>
           </div>
           <div className="flex items-center gap-2">
-            <Button
-              size="sm"
-              variant="outline"
-              className="h-8 px-2 whitespace-nowrap"
-              onClick={() => mapRef.current?.openFlightplanFilePicker?.()}
-              title="Import Wingtra .flightplan - preserves file bearings, use 'Optimize' button for terrain-optimal directions"
-            >
-              <Upload className="w-3 h-3 mr-1" />
-              Import Flightplan
-            </Button>
-            <Button
-              size="sm"
-              variant="outline"
-              className="h-8 px-2 whitespace-nowrap"
-              onClick={() => mapRef.current?.openKmlFilePicker?.()}
-            >
-              <Upload className="w-3 h-3 mr-1" />
-              Import KML
-            </Button>
-            {/* NEW: Import DJI Camera JSON button */}
-            <Button
-              size="sm"
-              variant="outline"
-              className="h-8 px-2 whitespace-nowrap"
-              onClick={() => openDJIImporterRef.current?.()}
-              title="Import DJI OPF input_cameras.json to run poses-only GSD analysis"
-            >
-              <Upload className="w-3 h-3 mr-1" />
-              Import DJI Camera JSON
-            </Button>
-            <Button
-              size="sm"
-              variant="outline"
-              className="h-8 px-2 whitespace-nowrap"
-              onClick={() => {
-                const api = mapRef.current; if (!api?.exportWingtraFlightPlan) return;
-                const { json, blob } = api.exportWingtraFlightPlan();
-                const original = (mapRef.current as any)?.lastImportedFlightplanName; // not exposed; fallback below
-                const fn = (original && original.endsWith('.flightplan')) ? original.replace(/\.flightplan$/,'-exported.flightplan') : 'exported.flightplan';
-                const url = URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.href = url;
-                a.download = fn;
-                document.body.appendChild(a); a.click();
-                setTimeout(()=>{ URL.revokeObjectURL(url); a.remove(); }, 1000);
-              }}
-              title="Export current polygons & parameters as Wingtra .flightplan JSON"
-            >
-              Export Plan
-            </Button>
+            {/* Consolidated Import dropdown */}
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button size="sm" variant="outline" className="h-8 px-2 whitespace-nowrap">
+                  <Upload className="w-3 h-3 mr-1" /> Import ▾
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="w-48">
+                <DropdownMenuLabel>Import</DropdownMenuLabel>
+                <DropdownMenuItem onSelect={() => mapRef.current?.openFlightplanFilePicker?.()}>
+                  Wingtra Flightplan (.flightplan)
+                </DropdownMenuItem>
+                <DropdownMenuItem onSelect={() => mapRef.current?.openKmlFilePicker?.()}>
+                  KML Polygons (.kml)
+                </DropdownMenuItem>
+                <DropdownMenuItem onSelect={() => openDJIImporterRef.current?.()}>
+                  DJI Camera JSON (input_cameras.json)
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+
+            {/* Consolidated Export dropdown */}
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button size="sm" variant="outline" className="h-8 px-2 whitespace-nowrap" title="Export data">
+                  <Download className="w-3 h-3 mr-1" /> Export ▾
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="w-48">
+                <DropdownMenuLabel>Export</DropdownMenuLabel>
+                <DropdownMenuItem onSelect={handleExportWingtra}>
+                  Wingtra Flightplan
+                </DropdownMenuItem>
+                {/* Future export targets */}
+                <DropdownMenuSeparator />
+                <DropdownMenuItem disabled>
+                  CSV Report (soon)
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+
             <Button
               size="sm"
               variant="outline"
