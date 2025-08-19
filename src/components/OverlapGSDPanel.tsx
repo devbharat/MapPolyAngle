@@ -94,6 +94,8 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
   const poseFileRef = useRef<HTMLInputElement>(null);
   const [importedPoses, setImportedPoses] = useState<PoseMeters[]>([]);
   const poseAreaRingRef = useRef<[number,number][]>([]);
+  // Remember previous polygon rings so we can re-render tiles a moved polygon USED to cover
+  const prevPolygonRingsRef = useRef<Map<string, [number, number][]>>(new Map());
   
   // Single global runId to avoid stacked overlays - Option B improvement
   const globalRunIdRef = useRef<string | null>(null);
@@ -302,38 +304,44 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
   const compute = useCallback(async (opts?: { polygonId?: string }) => {
     const camera = parseCamera();
     const poses = parsePosesMeters();
-    const allPolygonsFromMap = getPolygons();
-    let targetPolygons: PolygonLngLatWithId[] = opts?.polygonId
-      ? allPolygonsFromMap.filter(p => (p.id || 'unknown') === opts.polygonId)
-      : allPolygonsFromMap;
+    // All polygons currently on the map (may be empty)
+    let allPolygons = getPolygons();
+    // Polygons whose extent determines which tiles we (re)compute this run
+    let tilesSourcePolygons: PolygonLngLatWithId[] = opts?.polygonId
+      ? allPolygons.filter(p => (p.id || 'unknown') === opts.polygonId)
+      : allPolygons;
 
-    // If no polygons but we have imported poses, synthesize AOI from poses (concave hull + outward buffer)
-    if (targetPolygons.length === 0 && poses && poses.length > 0 && camera) {
+    // If no drawn polygons but we have poses, synthesize AOI (poses-only mode)
+    if (tilesSourcePolygons.length === 0 && poses && poses.length > 0 && camera) {
       const buildPosesAOIRing = (poses: PoseMeters[], camera: CameraModel, clipInnerBufferM: number): [number,number][] => {
         if (!poses || poses.length < 3) return [];
         const MAX_POINTS = 2000;
         const step = Math.max(1, Math.floor(poses.length / MAX_POINTS));
         const pts = poses.filter((_,i)=> i % step === 0).map(p=>{
           const [lng, lat] = metersToLngLat(p.x, p.y);
-          return turf.point([lng, lat]);
+            return turf.point([lng, lat]);
         });
         const fc = turf.featureCollection(pts);
-        // Convex hull only (concave removed per request)
-        const hull = turf.convex(fc);
+        const hull = turf.convex(fc); // convex hull only
         if (!hull) return [];
-        // Optional outward buffer disabled; keep placeholder for future tuning
-        const BUFFER_OUT = 0;
-        const poly = BUFFER_OUT > 0 ? turf.buffer(hull as any, BUFFER_OUT, { units: 'meters' }) : hull;
-        const geom: any = poly.geometry;
+        const poly = hull; // placeholder for potential outward buffer
+        const geom: any = (poly as any).geometry;
         const ring: [number,number][] = geom.type === 'Polygon' ? geom.coordinates[0] : geom.coordinates[0][0];
         return ring;
       };
       const ring = poseAreaRingRef.current?.length ? poseAreaRingRef.current : buildPosesAOIRing(poses, camera, clipInnerBufferM);
       poseAreaRingRef.current = ring;
-      if (ring.length >= 4) targetPolygons = [{ id: '__POSES__', ring }];
+      if (ring.length >= 4) {
+        const synth = { id: '__POSES__', ring } as PolygonLngLatWithId;
+        allPolygons = [synth];
+        tilesSourcePolygons = [synth];
+      }
     }
 
-    if (!camera || !poses || poses.length===0 || targetPolygons.length===0) {
+    // Polygons used inside worker for union mask + per‑polygon stats (ALWAYS all current polygons)
+    const polygonsForWorker: PolygonLngLatWithId[] = allPolygons;
+
+    if (!camera || !poses || poses.length===0 || polygonsForWorker.length===0) {
       toast({ variant: "destructive", title: "Missing inputs", description: "Provide camera + poses (or draw/import an area)." });
       return;
     }
@@ -363,16 +371,25 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
 
     const worker = new OverlapWorker();
     try {
-      // Collect tiles only for target polygons (dedup)
+      // Collect tiles only for tilesSourcePolygons (dedup by z/x/y)
       const seen = new Set<string>();
       const tiles: {z:number;x:number;y:number}[] = [];
-      for (const poly of targetPolygons) {
+      for (const poly of tilesSourcePolygons) {
         for (const t of tilesCoveringPolygon(poly, zoom)) {
-          const key = `${t.x}/${t.y}`; if (seen.has(key)) continue; seen.add(key); tiles.push({z: zoom, x: t.x, y: t.y});
+          const key = `${zoom}/${t.x}/${t.y}`; if (seen.has(key)) continue; seen.add(key); tiles.push({z: zoom, x: t.x, y: t.y});
         }
       }
-
-      // Process tiles and collect per-polygon statistics (only for target polygons)
+      // Also include tiles from the PREVIOUS ring of this polygon (if this is a targeted edit)
+      if (opts?.polygonId) {
+        const prevRing = prevPolygonRingsRef.current.get(opts.polygonId);
+        if (prevRing && prevRing.length >= 4) {
+          const prevPoly = { id: opts.polygonId, ring: prevRing } as PolygonLngLatWithId;
+            for (const t of tilesCoveringPolygon(prevPoly, zoom)) {
+              const key = `${zoom}/${t.x}/${t.y}`; if (seen.has(key)) continue; seen.add(key); tiles.push({ z: zoom, x: t.x, y: t.y });
+            }
+        }
+      }
+      // Process tiles and collect per-polygon statistics
       const perPolygonResults = new Map<string, PolygonTileStats[]>();
 
       for (const t of tiles) {
@@ -387,25 +404,17 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
             data: new Uint8ClampedArray(imgData.data)
           };
           tileCacheRef.current.set(cacheKey, tileData);
-          
-          // Simple LRU: limit cache size to prevent unbounded memory growth
-          const MAX_TILES = 256;
+          const MAX_TILES = 256; // simple LRU trim
           if (tileCacheRef.current.size > MAX_TILES) {
-            const firstKey = tileCacheRef.current.keys().next().value;
-            if (firstKey) {
-              tileCacheRef.current.delete(firstKey);
-            }
+            const firstKey = tileCacheRef.current.keys().next().value; if (firstKey) tileCacheRef.current.delete(firstKey);
           }
         }
-        
-        // Create a fresh copy for the worker (since ArrayBuffers get transferred/detached)
         const freshData = new Uint8ClampedArray(tileData.data);
         const tile = { z:t.z, x:t.x, y:t.y, size: tileData.width, data: freshData };
-        
-        // Option B: Always pass ALL polygons so worker can credit hits to every polygon in overlapping tiles
-        const res = await worker.runTile({ tile, polygons: targetPolygons, poses, camera, options: { clipInnerBufferM } } as any);
 
-        // Option B: Track per-polygon, per-tile stats for correct cross-crediting
+        // Always pass ALL polygons so each tile overlay is the union of all current areas
+        const res = await worker.runTile({ tile, polygons: polygonsForWorker, poses, camera, options: { clipInnerBufferM } } as any);
+
         if (res.perPolygon) {
           for (const polyStats of res.perPolygon) {
             if (!perPolyTileStatsRef.current.has(polyStats.polygonId)) {
@@ -413,10 +422,6 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
             }
             perPolyTileStatsRef.current.get(polyStats.polygonId)!.set(cacheKey, polyStats);
           }
-        }
-
-        // Group results by polygon ID (for legacy aggregation logic)
-        if (res.perPolygon) {
           for (const polyStats of res.perPolygon) {
             if (!perPolygonResults.has(polyStats.polygonId)) {
               perPolygonResults.set(polyStats.polygonId, []);
@@ -425,11 +430,54 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
           }
         }
 
-        // Use single global runId for overlays
         if (showOverlap) addOrUpdateTileOverlay(map, res, { kind: "overlap", runId, opacity });
         if (showGsd) addOrUpdateTileOverlay(map, res, { kind: "gsd", runId, opacity, gsdMax: 0.1 });
-      }      
-      // Aggregate statistics per polygon - FIXED: Process ALL polygons that had tiles updated
+      }
+
+      // --- PRUNE STALE TILES (tiles no longer under ANY current polygon) ---
+      // Build set of needed tile keys for all CURRENT polygons at this zoom.
+      const currentPolysForPrune = getPolygons();
+      const neededTileKeys = new Set<string>();
+      for (const poly of currentPolysForPrune) {
+        for (const t of tilesCoveringPolygon(poly, zoom)) {
+          neededTileKeys.add(`${zoom}/${t.x}/${t.y}`);
+        }
+      }
+      // If poses-only synthetic AOI active
+      if (currentPolysForPrune.length === 0 && poseAreaRingRef.current.length >= 4) {
+        // derive needed tiles from synthetic ring
+        const synthPoly: PolygonLngLatWithId = { id: '__POSES__', ring: poseAreaRingRef.current };
+        for (const t of tilesCoveringPolygon(synthPoly, zoom)) neededTileKeys.add(`${zoom}/${t.x}/${t.y}`);
+      }
+      // Remove overlay layers/sources whose tile key not needed
+      const styleLayers = map.getStyle()?.layers ?? [];
+      const toRemove: string[] = [];
+      for (const layer of styleLayers) {
+        const id = layer.id;
+        if (!id.startsWith(`ogsd-${runId}-`)) continue;
+        const parts = id.split('-');
+        if (parts.length < 6) continue; // expect ogsd, runId, kind, z, x, y
+        const zStr = parts[parts.length - 3];
+        const xStr = parts[parts.length - 2];
+        const yStr = parts[parts.length - 1];
+        const key = `${zStr}/${xStr}/${yStr}`;
+        if (!neededTileKeys.has(key)) toRemove.push(id);
+      }
+      for (const id of toRemove) {
+        try {
+          if (map.getLayer(id)) map.removeLayer(id);
+          if (map.getSource(id)) map.removeSource(id);
+        } catch { /* ignore */ }
+      }
+      // Drop cached per-polygon tile stats for pruned tiles
+      perPolyTileStatsRef.current.forEach(tileMap => {
+        for (const k of Array.from(tileMap.keys())) {
+          if (!neededTileKeys.has(k)) tileMap.delete(k);
+        }
+      });
+      // --- END PRUNE ---
+
+      // Aggregate statistics per polygon - process all polygons that had tiles updated
       const aggregatedPerPolygon = new Map<string, {
         polygonId: string;
         gsdStats: GSDStats;
@@ -437,79 +485,45 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
         imageCount: number;
       }>();
 
-      // Get all polygons that had any tile stats updated (not just target polygons)
       const allUpdatedPolygonIds = new Set<string>();
       perPolygonResults.forEach((_, polygonId) => allUpdatedPolygonIds.add(polygonId));
-      
-      // Also include any polygons that were updated in the cache during this run
       perPolyTileStatsRef.current.forEach((_, polygonId) => {
-        if (allPolygonsFromMap.some((p: any) => (p.id || 'unknown') === polygonId)) {
+        if (polygonsForWorker.some((p: any) => (p.id || 'unknown') === polygonId) || polygonId==='__POSES__') {
           allUpdatedPolygonIds.add(polygonId);
         }
       });
 
-      // Re-aggregate stats for all affected polygons using the complete tile cache
       allUpdatedPolygonIds.forEach(polygonId => {
-        const polygon = allPolygonsFromMap.find((p: any) => (p.id || 'unknown') === polygonId) || (polygonId==='__POSES__' && poseAreaRingRef.current.length? { id:'__POSES__', ring: poseAreaRingRef.current }: null);
+        const polygon = polygonsForWorker.find((p: any) => (p.id || 'unknown') === polygonId) || (polygonId==='__POSES__' && poseAreaRingRef.current.length? { id:'__POSES__', ring: poseAreaRingRef.current }: null);
         if (!polygon) return;
-        
         const areaAcres = calculatePolygonAreaAcres(polygon.ring);
-
-        // Get all tile stats for this polygon from the cache
         const polygonTileStatsMap = perPolyTileStatsRef.current.get(polygonId);
         if (!polygonTileStatsMap || polygonTileStatsMap.size === 0) return;
-        
         const allTileStats = Array.from(polygonTileStatsMap.values());
         const allGsdStats = allTileStats.map(ts => ts.gsdStats).filter(Boolean);
         const aggregatedGsdStats = aggregateGSDStats(allGsdStats);
-
-        // Count unique poses (images) that hit this polygon
         const uniquePoseIds = new Set<number>();
-        for (const ts of allTileStats) {
-          for (let i = 0; i < ts.hitPoseIds.length; i++) {
-            uniquePoseIds.add(ts.hitPoseIds[i]);
-          }
-        }
-
-        aggregatedPerPolygon.set(polygonId, {
-          polygonId,
-          gsdStats: aggregatedGsdStats,
-          areaAcres,
-          imageCount: uniquePoseIds.size
-        });
+        for (const ts of allTileStats) for (let i=0;i<ts.hitPoseIds.length;i++) uniquePoseIds.add(ts.hitPoseIds[i]);
+        aggregatedPerPolygon.set(polygonId, { polygonId, gsdStats: aggregatedGsdStats, areaAcres, imageCount: uniquePoseIds.size });
       });
 
-      // Update per‑polygon stats and recompute overall in one consistent step
       setPerPolygonStats(prev => {
         const next = new Map(prev);
         aggregatedPerPolygon.forEach((v, k) => next.set(k, v));
-        
-        // Recompute overall from the updated map to keep things consistent
-        const overall = aggregateGSDStats(
-          Array.from(next.values()).map(v => v.gsdStats)
-        );
+        const overall = aggregateGSDStats(Array.from(next.values()).map(v => v.gsdStats));
         setGsdStats(overall);
-        
         return next;
       });
 
-      // Add camera position markers in 3D
       if (showCameraPoints && poses.length > 0) {
-        // Convert poses to 3D coordinates for Deck.gl
         const cameraPositions: [number, number, number][] = poses.map(pose => {
-          // Convert EPSG:3857 back to lng/lat using correct projection
-          const [lng, lat] = metersToLngLat(pose.x, pose.y);
-          
-          return [lng, lat, pose.z];
+          const [lng, lat] = metersToLngLat(pose.x, pose.y); return [lng, lat, pose.z];
         });
-
-        // Use the new 3D camera point methods
-        const api = mapRef.current;
-        if (api?.addCameraPoints) {
-          const idForCameras = opts?.polygonId ?? '__ALL__';
-          api.addCameraPoints(idForCameras, cameraPositions);
-        }
+        const api = mapRef.current; if (api?.addCameraPoints) { const idForCameras = opts?.polygonId ?? '__ALL__'; api.addCameraPoints(idForCameras, cameraPositions); }
       }
+
+      // Update previous rings snapshot AFTER successful tile updates so next edit invalidates correctly
+      prevPolygonRingsRef.current = new Map((getPolygons()).map(p => [p.id || 'unknown', p.ring] as const));
     } finally {
       worker.terminate();
       setRunning(false);
