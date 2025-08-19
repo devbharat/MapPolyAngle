@@ -98,6 +98,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
     gsdStats: GSDStats;
     areaAcres: number;
     imageCount: number;
+    cameraLabel: string;
   }>>(new Map());
   
   // NEW: poses-only mode state
@@ -327,6 +328,14 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
     Object.entries(paramsMap).forEach(([pid, p]: any) => {
       if (p?.cameraKey && CAMERA_REGISTRY[p.cameraKey]) perPolyCam[pid] = CAMERA_REGISTRY[p.cameraKey];
     });
+    const identifyCameraKey = (cam: CameraModel | null): string | null => {
+      if (!cam) return null;
+      for (const [key, m] of Object.entries(CAMERA_REGISTRY)) {
+        if (m.w_px === cam.w_px && m.h_px === cam.h_px && Math.abs(m.f_m - cam.f_m)/m.f_m < 0.02) return key;
+      }
+      return null;
+    };
+    const overrideCamKey = overrideCam ? identifyCameraKey(overrideCam) : null;
     const poses = parsePosesMeters();
     // Derive cameras + indices for worker
     let camerasArr: CameraModel[] | undefined; let poseIdxArr: Uint16Array | undefined;
@@ -521,6 +530,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
         gsdStats: GSDStats;
         areaAcres: number;
         imageCount: number;
+        cameraLabel: string;
       }>();
 
       const allUpdatedPolygonIds = new Set<string>();
@@ -542,7 +552,15 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
         const aggregatedGsdStats = aggregateGSDStats(allGsdStats);
         const uniquePoseIds = new Set<number>();
         for (const ts of allTileStats) for (let i=0;i<ts.hitPoseIds.length;i++) uniquePoseIds.add(ts.hitPoseIds[i]);
-        aggregatedPerPolygon.set(polygonId, { polygonId, gsdStats: aggregatedGsdStats, areaAcres, imageCount: uniquePoseIds.size });
+        // Determine camera label used
+        let cameraLabel: string;
+        if (overrideCam) {
+          cameraLabel = overrideCamKey ? `Override (${overrideCamKey})` : 'Override';
+        } else {
+          const params = (paramsMap as any)[polygonId];
+          cameraLabel = params?.cameraKey || 'SONY_RX1R2';
+        }
+        aggregatedPerPolygon.set(polygonId, { polygonId, gsdStats: aggregatedGsdStats, areaAcres, imageCount: uniquePoseIds.size, cameraLabel });
       });
 
       setPerPolygonStats(prev => {
@@ -728,7 +746,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
                     <Badge variant="secondary" className="text-xs font-mono">#{shortId}</Badge>
                   </CardTitle>
                   <CardDescription className="text-xs">
-                    Area: {stats.areaAcres.toFixed(2)} acres • Images: {stats.imageCount} • Pixels: {stats.gsdStats.count.toLocaleString()}<br />
+                    Area: {stats.areaAcres.toFixed(2)} acres • Images: {stats.imageCount} • Camera: {stats.cameraLabel} • Pixels: {stats.gsdStats.count.toLocaleString()}<br />
                     <span className="text-blue-600">Click to view on map</span>
                   </CardDescription>
                 </CardHeader>
