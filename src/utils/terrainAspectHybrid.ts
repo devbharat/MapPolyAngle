@@ -129,8 +129,8 @@ export function dominantContourDirectionPlaneFit(
   const fitQuality = assessFitQuality(rSquared, rmse, slopeMagnitude, samples.length);
 
   return {
-    aspectDeg: radToDeg(aspectRad),
-    contourDirDeg: radToDeg(contourRad),
+    aspectDeg: radToDegWrapped(aspectRad),
+    contourDirDeg: radToDegWrapped(contourRad),
     samples: samples.length,
     rSquared,
     rmse,
@@ -389,7 +389,11 @@ export function queryMaxElevationAlongLine(
 }
 
 const degToRad = (d: number) => d * Math.PI / 180;
-const radToDeg = (r: number) => (r * 180 / Math.PI + 360) % 360;
+// For directional quantities (bearings/aspects) we want [0, 360)
+const radToDegWrapped = (r: number) => (r * 180 / Math.PI + 360) % 360;
+// For geographic coordinates we need signed degrees
+const radToDegSigned = (r: number) => (r * 180 / Math.PI);
+const normalizeLng = (deg: number) => ((deg + 180) % 360) - 180;
 
 // Calculate destination point given start point, bearing, and distance
 export function destination(start: [number, number], bearing: number, distance: number): [number, number] {
@@ -409,8 +413,10 @@ export function destination(start: [number, number], bearing: number, distance: 
     Math.sin(brng) * Math.sin(δ) * Math.cos(φ1),
     Math.cos(δ) - Math.sin(φ1) * Math.sin(φ2)
   );
-  
-  return [radToDeg(λ2), radToDeg(φ2)];
+  // IMPORTANT: Return signed lon/lat. Longitude normalized to [-180,180), latitude kept in [-90,90].
+  const lon = normalizeLng(radToDegSigned(λ2));
+  const lat = radToDegSigned(φ2);
+  return [lon, lat];
 }
 
 // Calculate bearing between two points
@@ -423,5 +429,5 @@ export function calculateBearing(from: [number, number], to: [number, number]): 
   const y = Math.cos(φ1) * Math.sin(φ2) - Math.sin(φ1) * Math.cos(φ2) * Math.cos(Δλ);
 
   const bearing = Math.atan2(x, y);
-  return (radToDeg(bearing) + 360) % 360;
+  return radToDegWrapped(bearing);
 }

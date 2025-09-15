@@ -134,6 +134,15 @@ export function addFlightLinesForPolygon(
     });
   }
 
+  if (flightLines.length === 0) {
+    try {
+      const b = bounds;
+      console.warn(
+        `[flight-lines] No segments inside polygon for ${polygonId}. Debug: bearing=${bearingDeg.toFixed(2)}, spacing=${lineSpacing.toFixed(2)}m, center=(${centerLng.toFixed(5)},${centerLat.toFixed(5)}), bbox=lng[${b.minLng.toFixed(5)},${b.maxLng.toFixed(5)}], lat[${b.minLat.toFixed(5)},${b.maxLat.toFixed(5)}]`
+      );
+    } catch {}
+  }
+
   return { flightLines, lineSpacing };
 }
 
