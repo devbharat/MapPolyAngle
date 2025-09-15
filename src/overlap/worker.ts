@@ -5,6 +5,8 @@ import { tileMetersBounds, worldToPixel } from "./mercator";
 import { decodeTerrainRGBToElev } from "./terrain";
 import { rotMat, camRayToPixel, normalFromDEM } from "./math3d";
 import { rasterizeRingsToMask } from "./rasterize";
+// Add EGM96 conversion library for proper vertical datum handling
+import * as egm96 from 'egm96-universal';
 
 // --- New morphological helpers (halo-based, 8-neighbour) ---
 /** One‑pixel binary erosion (8‑neighbourhood). */
@@ -46,15 +48,65 @@ function cropCenter(src: Uint8Array, sizePad: number, size: number, pad: number)
   return out;
 }
 
+// --- Convert terrain elevations from EGM96 geoid to WGS84 ellipsoid ---
+/** 
+ * Converts Mapbox Terrain-RGB elevations (EGM96 geoid) to WGS84 ellipsoid heights.
+ * This ensures vertical datum consistency with DJI pose Z coordinates.
+ */
+function convertElevationsToWGS84Ellipsoid(
+  elevEGM96: Float32Array, 
+  size: number, 
+  tx: { minX: number; maxX: number; minY: number; maxY: number }
+): Float32Array {
+  const elevWGS84 = new Float32Array(size * size);
+  const pixelSize = (tx.maxX - tx.minX) / size;
+  
+  // Convert Web Mercator bounds to lat/lon for each pixel
+  const R = 6378137; // WGS84 equatorial radius
+  
+  for (let row = 0; row < size; row++) {
+    for (let col = 0; col < size; col++) {
+      const idx = row * size + col;
+      
+      // Get Web Mercator coordinates for this pixel center
+      const x = tx.minX + (col + 0.5) * pixelSize;
+      const y = tx.maxY - (row + 0.5) * pixelSize; // Note: y decreases as row increases
+      
+      // Convert Web Mercator to WGS84 lat/lon
+      const lon = (x / R) * (180 / Math.PI);
+      const lat = Math.atan(Math.sinh(y / R)) * (180 / Math.PI);
+      
+      // Get original EGM96 elevation
+      const elevEGM96Value = elevEGM96[idx];
+      
+      // Convert from EGM96 geoid to WGS84 ellipsoid
+      // egm96.egm96ToEllipsoid(lat, lon, heightAboveGeoid) returns height above ellipsoid
+      const elevWGS84Value = egm96.egm96ToEllipsoid(lat, lon, elevEGM96Value);
+      
+      elevWGS84[idx] = elevWGS84Value;
+    }
+  }
+  
+  return elevWGS84;
+}
+
 // --- Types (reuse WorkerIn/Out) ---
 type Msg = WorkerIn;
 type Ret = WorkerOut;
 
 type PreparedPose = PoseMeters & {
+  /** Camera->world rotation (row-major 3x3). */
+  R: Float64Array;
+  /** World->camera rotation (row-major 3x3), i.e., R^T. */
   RT: Float64Array;
+  /** Precomputed per-pose coverage radius (meters). */
   radius: number;
   radiusSq: number;
-  camIndex: number; // index into cameras array
+  /** index into cameras array */
+  camIndex: number;
+  /** Camera axes in world: R*[1,0,0] and R*[0,1,0] (row-major) */
+  bx0: number; bx1: number; bx2: number;
+  by0: number; by1: number; by2: number;
 };
 
 function ringsToPixelsWithTx(polygons: PolygonLngLatWithId[], tx: any) {
@@ -187,12 +239,17 @@ self.onmessage = (ev: MessageEvent<Msg>) => {
     return;
   }
 
-  // Decode elevation
-  const elev = decodeTerrainRGBToElev(data, size);
+  // CRITICAL FIX: Decode elevation and convert from EGM96 geoid to WGS84 ellipsoid
+  // This ensures vertical datum consistency with DJI poses (which are typically WGS84 ellipsoid)
+  const elevEGM96 = decodeTerrainRGBToElev(data, size);
+  const tileBounds = tileMetersBounds(z, x, y);
+  const elevWGS84 = convertElevationsToWGS84Ellipsoid(elevEGM96, size, tileBounds);
+  
+  // Now use elevWGS84 instead of raw elevEGM96 for all calculations
+  const elev = elevWGS84;
 
   // Clip / erosion radius
   const clipM = Math.max(0, options?.clipInnerBufferM ?? 0);
-  const tileBounds = tileMetersBounds(z, x, y);
   const pixM = (tileBounds.maxX - tileBounds.minX) / size;
   const radiusPx = clipM > 0 ? Math.max(1, Math.round(clipM / pixM)) : 0;
 
@@ -236,17 +293,30 @@ self.onmessage = (ev: MessageEvent<Msg>) => {
   }
 
   // Prepare poses (per-pose radius based on its camera)
+  // NOTE: Pose z coordinates are assumed to already be in WGS84 ellipsoid (typical for DJI drones)
   const prepared: PreparedPose[] = new Array(poses.length);
   for (let i=0;i<poses.length;i++) {
     const p = poses[i];
     const idxVal = poseCamIdx[i];
     const camIdx = idxVal < camModels.length ? idxVal : 0;
-    const R = rotMat(p.omega_deg, p.phi_deg, p.kappa_deg);
-    const RT = new Float64Array([R[0],R[3],R[6], R[1],R[4],R[7], R[2],R[5],R[8]]);
+    const Rm = rotMat(p.omega_deg, p.phi_deg, p.kappa_deg); // camera->world (row-major)
+    const RT = new Float64Array([ Rm[0],Rm[3],Rm[6],
+                                  Rm[1],Rm[4],Rm[7],
+                                  Rm[2],Rm[5],Rm[8] ]);      // world->camera
     const H = Math.max(1.0, p.z - zMin);
     const diagTan = camDiagTan[camIdx];
     const radius = H * diagTan * 1.25;
-    prepared[i] = { ...p, RT, radius, radiusSq: radius*radius, camIndex: camIdx };
+    prepared[i] = {
+      ...p,
+      R: new Float64Array([ Rm[0],Rm[1],Rm[2], Rm[3],Rm[4],Rm[5], Rm[6],Rm[7],Rm[8] ]),
+      RT,
+      radius,
+      radiusSq: radius*radius,
+      camIndex: camIdx,
+      // Precompute camera axis directions in world
+      bx0: Rm[0], bx1: Rm[3], bx2: Rm[6], // R*[1,0,0]
+      by0: Rm[1], by1: Rm[4], by2: Rm[7], // R*[0,1,0]
+    };
   }
 
   // Stage-1 coarse cull vs tile box
@@ -290,7 +360,10 @@ self.onmessage = (ev: MessageEvent<Msg>) => {
   const poseHitsPerPoly: Array<Set<number>> = polyIds.map(()=> new Set<number>());
 
   const cosIncMin = 1e-3;
-  // Active pixel loop
+  // DEBUG: Track camera heights for debug output
+  const debugCameraHeights = new Map<number, { poseId: string; heightAGL: number; terrainElev: number; cameraElev: number }>();
+  
+  // Active pixel loop - now using consistent WGS84 ellipsoid heights for both terrain and poses
   for (let t=0; t<activeIdxs.length; t++) {
     const idx = activeIdxs[t];
     const row = (idx/size)|0; const col = idx - row*size; const xw = xwCol[col]; const yw = ywRow[row]; const zw = elev[idx];
@@ -305,18 +378,87 @@ self.onmessage = (ev: MessageEvent<Msg>) => {
       const dx2 = xw - p.x, dy2 = yw - p.y; if (dx2*dx2 + dy2*dy2 > p.radiusSq) continue;
       const camIdx = p.camIndex; const cam = camModels[camIdx];
       const camHit = camRayToPixel(cam, p.RT, p.x, p.y, p.z, xw, yw, zw); if (!camHit) continue;
-      const vz = (zw - p.z); const L = Math.hypot(dx2, dy2, vz); const invL = 1 / L;
-      const rx = dx2*invL, ry = dy2*invL, rz = vz*invL; const cosInc = -(nx*rx + ny*ry + nz*rz); if (cosInc <= cosIncMin) continue;
-      const gsd = (L * cam_s_over_f[camIdx]) * (1 / cosInc);
-      const globalPoseIndex = poseIdx; for (let pi=0; pi<polysHere.length; pi++) poseHitsPerPoly[polysHere[pi]].add(globalPoseIndex);
-      localOverlap++; if (gsd < localMinG) localMinG = gsd; if (localOverlap >= maxOverlapNeeded) break;
-    }
+      
+      // DEBUG: Calculate and store camera height above ground for this pose
+      if (!debugCameraHeights.has(poseIdx)) {
+        const heightAGL = p.z - zw; // Camera elevation - terrain elevation = height AGL
+        debugCameraHeights.set(poseIdx, {
+          poseId: p.id || `pose_${poseIdx}`,
+          heightAGL: heightAGL,
+          terrainElev: zw,
+          cameraElev: p.z
+        });
+      }
+      
+      // --- Jacobian-based surface GSD (pinhole-correct) ---
+      const vz = (zw - p.z);
+      const L = Math.hypot(dx2, dy2, vz);
+      if (!(L > 0)) continue;
+      const invL = 1 / L;
+      const rx = dx2*invL, ry = dy2*invL, rz = vz*invL;
+      const cosInc = -(nx*rx + ny*ry + nz*rz);
+      if (cosInc <= cosIncMin) continue; // grazing/backfacing
+
+      // Ray in camera coords: r_cam = R^T * r_world
+      const rcx = p.RT[0]*rx + p.RT[1]*ry + p.RT[2]*rz;
+      const rcy = p.RT[3]*rx + p.RT[4]*ry + p.RT[5]*rz;
+      const rcz = p.RT[6]*rx + p.RT[7]*ry + p.RT[8]*rz;
+      if (Math.abs(rcz) < 1e-12) continue; // parallel to image plane
+
+      const f = cam.f_m;
+      // Sensor coordinates (meters) relative to principal point
+      const u_m = f * (rcx / rcz);
+      const v_m = f * (rcy / rcz);
+
+      // a = R * [u,v,f]^T  (camera ray direction in world for that pixel)
+      const a0 = p.R[0]*u_m + p.R[1]*v_m + p.R[2]*f;
+      const a1 = p.R[3]*u_m + p.R[4]*v_m + p.R[5]*f;
+      const a2 = p.R[6]*u_m + p.R[7]*v_m + p.R[8]*f;
+      const denom = nx*a0 + ny*a1 + nz*a2;
+      if (Math.abs(denom) < 1e-12) continue;
+
+      // Normal distance to the local tangent plane
+      const Hn = nx*(xw - p.x) + ny*(yw - p.y) + nz*(zw - p.z);
+      const invDen2 = 1.0 / (denom*denom);
+
+      // Ju = Hn/den^2 * (den*bx - (n·bx)*a), where bx = R*[1,0,0]
+      const nbx = nx*p.bx0 + ny*p.bx1 + nz*p.bx2;
+      const Jux = (denom*p.bx0 - nbx*a0) * Hn * invDen2;
+      const Juy = (denom*p.bx1 - nbx*a1) * Hn * invDen2;
+      const Juz = (denom*p.bx2 - nbx*a2) * Hn * invDen2;
+
+      // Jv = Hn/den^2 * (den*by - (n·by)*a), where by = R*[0,1,0]
+      const nby = nx*p.by0 + ny*p.by1 + nz*p.by2;
+      const Jvx = (denom*p.by0 - nby*a0) * Hn * invDen2;
+      const Jvy = (denom*p.by1 - nby*a1) * Hn * invDen2;
+      const Jvz = (denom*p.by2 - nby*a2) * Hn * invDen2;
+
+      // Convert to meters per pixel using pixel pitches; scalar GSD = geometric mean
+      const sx = cam.sx_m, sy = cam.sy_m;
+      const gsdx = Math.hypot(Jux, Juy, Juz) * sx;
+      const gsdy = Math.hypot(Jvx, Jvy, Jvz) * sy;
+      const gsd = Math.sqrt(gsdx * gsdy);
+      
+      // Debug logging (optional)
+      // if (poseIdx < 3) console.log(`GSD for pose ${poseIdx}: ${gsd.toFixed(4)}m (gsdx: ${gsdx.toFixed(4)}, gsdy: ${gsdy.toFixed(4)})`);
+       const globalPoseIndex = poseIdx; for (let pi=0; pi<polysHere.length; pi++) poseHitsPerPoly[polysHere[pi]].add(globalPoseIndex);
+       localOverlap++; if (gsd < localMinG) localMinG = gsd; if (localOverlap >= maxOverlapNeeded) break;
+     }
 
     if (localOverlap > 0) { overlap[idx] = localOverlap; gsdMin[idx] = localMinG; }
   }
 
+  // DEBUG: Print camera heights (sample first 10 for brevity)
+  const heightEntries = Array.from(debugCameraHeights.values()).slice(0, 10);
+  if (heightEntries.length > 0) {
+    //console.log(`[Worker ${z}/${x}/${y}] Camera Heights (WGS84 ellipsoid):`);
+    heightEntries.forEach(({ poseId, heightAGL, terrainElev, cameraElev }) => {
+     //console.log(`  ${poseId}: ${heightAGL.toFixed(1)}m AGL (cam: ${cameraElev.toFixed(1)}m, terrain: ${terrainElev.toFixed(1)}m)`);
+    });
+  }
+
   // Enforce minimum overlap for GSD validity
-  const MIN_OVERLAP_FOR_GSD = 4;
+  const MIN_OVERLAP_FOR_GSD = 3;
   for (let t=0;t<activeIdxs.length;t++){ const idx=activeIdxs[t]; if (overlap[idx]>0 && overlap[idx] < MIN_OVERLAP_FOR_GSD){ overlap[idx]=0; gsdMin[idx]=Number.POSITIVE_INFINITY; } }
 
   // Union summaries

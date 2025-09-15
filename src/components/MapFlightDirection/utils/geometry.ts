@@ -13,6 +13,53 @@ import {
   calculateBearing as geoBearing,
   TerrainTile,
 } from '@/utils/terrainAspectHybrid';
+// Add EGM96 conversion for proper vertical datum handling
+import * as egm96 from 'egm96-universal';
+
+/**
+ * Convert elevation from EGM96 geoid (Mapbox terrain) to WGS84 ellipsoid
+ * to ensure vertical datum consistency with DJI poses
+ */
+function convertElevationToWGS84(lat: number, lng: number, elevationEGM96: number): number {
+  return egm96.egm96ToEllipsoid(lat, lng, elevationEGM96);
+}
+
+/**
+ * Query elevation at a point and convert to WGS84 ellipsoid
+ */
+function queryElevationAtPointWGS84(lng: number, lat: number, tiles: TerrainTile[]): number {
+  const elevationEGM96 = queryElevationAtPoint(lng, lat, tiles);
+  if (!Number.isFinite(elevationEGM96)) return elevationEGM96;
+  return convertElevationToWGS84(lat, lng, elevationEGM96);
+}
+
+/**
+ * Query maximum elevation along a line and convert to WGS84 ellipsoid
+ */
+function queryMaxElevationAlongLineWGS84(
+  startLng: number, 
+  startLat: number, 
+  endLng: number, 
+  endLat: number, 
+  tiles: TerrainTile[], 
+  samples: number = 20
+): number {
+  let maxElevationWGS84 = -Infinity;
+  
+  for (let i = 0; i <= samples; i++) {
+    const t = i / samples;
+    const lng = startLng + t * (endLng - startLng);
+    const lat = startLat + t * (endLat - startLat);
+    
+    const elevationEGM96 = queryElevationAtPoint(lng, lat, tiles);
+    if (Number.isFinite(elevationEGM96)) {
+      const elevationWGS84 = convertElevationToWGS84(lat, lng, elevationEGM96);
+      maxElevationWGS84 = Math.max(maxElevationWGS84, elevationWGS84);
+    }
+  }
+  
+  return Number.isFinite(maxElevationWGS84) ? maxElevationWGS84 : -Infinity;
+}
 
 /**
  * Calculate flight line spacing based on camera parameters and desired side overlap
@@ -177,22 +224,24 @@ export function build3DFlightPath(
   lines.forEach((line, i) => {
     let lineMaxElevation = -Infinity;
 
+    // CRITICAL FIX: Use WGS84-corrected elevation queries for vertical datum consistency
     for (let j = 0; j < line.length - 1; j++) {
       const [startLng, startLat] = line[j];
       const [endLng, endLat] = line[j + 1];
-      const segmentMaxElevation = queryMaxElevationAlongLine(startLng, startLat, endLng, endLat, tiles, 20);
+      const segmentMaxElevation = queryMaxElevationAlongLineWGS84(startLng, startLat, endLng, endLat, tiles, 20);
       if (Number.isFinite(segmentMaxElevation)) {
         lineMaxElevation = Math.max(lineMaxElevation, segmentMaxElevation);
       }
     }
 
     for (const [lng, lat] of line) {
-      const pointElevation = queryElevationAtPoint(lng, lat, tiles);
+      const pointElevation = queryElevationAtPointWGS84(lng, lat, tiles);
       if (Number.isFinite(pointElevation)) {
         lineMaxElevation = Math.max(lineMaxElevation, pointElevation);
       }
     }
 
+    // Flight altitude now uses WGS84 ellipsoid heights, consistent with DJI poses
     const flightAltitude = Number.isFinite(lineMaxElevation) ? lineMaxElevation + baseAltitude : baseAltitude;
     const coords = (i % 2 === 0 ? line : [...line].reverse()).map(
       ([lng, lat]) => [lng, lat, flightAltitude] as [number, number, number]
