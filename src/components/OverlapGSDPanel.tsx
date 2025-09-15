@@ -606,27 +606,27 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
 
     const rings: [number, number][][] = api?.getPolygons?.() ?? [];
     const fl = api?.getFlightLines?.();
-    const tiles = api?.getPolygonTiles?.();
     const haveLines = !!fl && (
       opts?.polygonId
         ? !!fl.get(opts.polygonId) && fl.get(opts.polygonId)!.flightLines.length > 0
         : Array.from(fl.values()).some((v: any) => v.flightLines.length > 0)
     );
-    const haveTiles = !!tiles && (
-      opts?.polygonId
-        ? !!tiles.get(opts.polygonId) && (tiles.get(opts.polygonId)?.length ?? 0) > 0
-        : Array.from(tiles.values()).some((t: any) => (t?.length ?? 0) > 0)
-    );
     const havePolys = opts?.polygonId ? (api?.getPolygonsWithIds?.() ?? []).some((p:any)=>p.id===opts.polygonId) : (rings.length > 0);
 
-    if (ready && havePolys && haveLines && haveTiles) {
+    // Run as soon as map is ready, polygons exist, and flight lines are present.
+    // We no longer gate on MapFlightDirection's polygonTiles since GSD panel fetches its own tiles.
+    if (ready && havePolys && haveLines) {
       autoTriesRef.current = 0;
       compute(opts?.polygonId ? { polygonId: opts.polygonId } : undefined);
       return;
     }
-    if (autoTriesRef.current < 5) {
+    if (autoTriesRef.current < 15) {
       autoTriesRef.current += 1;
-      setTimeout(()=>{ if ((autoGenerate || importedPoses.length>0) && !running) autoRun(opts); }, 300);
+      // Helpful debug trace on first retry
+      if (autoTriesRef.current === 1) {
+        console.debug('[GSD auto-run] waiting:', { ready, havePolys, haveLines, reason: opts?.reason });
+      }
+      setTimeout(()=>{ if ((autoGenerate || importedPoses.length>0) && !running) autoRun(opts); }, 250);
     } else { autoTriesRef.current = 0; }
   }, [running, autoGenerate, importedPoses, compute, mapRef]);
 
