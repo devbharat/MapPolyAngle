@@ -290,7 +290,7 @@ export default function Home() {
           }}
           defaults={{
             altitudeAGL: paramsByPolygon[paramsDialog.polygonId || ""]?.altitudeAGL ?? 100,
-            frontOverlap: paramsByPolygon[paramsDialog.polygonId || ""]?.frontOverlap ?? 80,
+            frontOverlap: paramsByPolygon[paramsDialog.polygonId || ""]?.frontOverlap ?? 70,
             sideOverlap: paramsByPolygon[paramsDialog.polygonId || ""]?.sideOverlap ?? 70,
           }}
         />

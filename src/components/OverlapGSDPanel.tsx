@@ -1,7 +1,7 @@
 import React, { useCallback, useMemo, useRef, useState } from "react";
 import type mapboxgl from "mapbox-gl";
 import { OverlapWorker, fetchTerrainRGBA, tilesCoveringPolygon } from "@/overlap/controller";
-import { addOrUpdateTileOverlay, clearRunOverlays } from "@/overlap/overlay";
+import { addOrUpdateTileOverlay, clearRunOverlays, clearAllOverlays } from "@/overlap/overlay";
 import type { CameraModel, PoseMeters, PolygonLngLatWithId, GSDStats, PolygonTileStats } from "@/overlap/types";
 import { lngLatToMeters } from "@/overlap/mercator";
 import { metersToLngLat } from "@/services/Projection";
@@ -115,6 +115,8 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
   // Cache raw tile data (width, height, and cloned pixel data) to avoid ArrayBuffer transfer issues
   const tileCacheRef = useRef<Map<string, { width: number; height: number; data: Uint8ClampedArray }>>(new Map());
   const autoTriesRef = useRef(0);
+  const autoRunTimeoutRef = useRef<number | null>(null);
+  const computeSeqRef = useRef(0); // increment to invalidate in-flight computations
   const [clipInnerBufferM, setClipInnerBufferM] = useState(0);
   const [maxTiltDeg, setMaxTiltDeg] = useState(30); // NEW: max allowable camera tilt (deg from vertical)
 
@@ -175,55 +177,71 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
   }, [effectiveCameraForPolygon]);
 
   // Function to aggregate GSD statistics from multiple tiles
+  // Re-bins into 3–4 bars to keep the histogram visually compact and comparable
   const aggregateGSDStats = useCallback((tileStats: GSDStats[]): GSDStats => {
     // Filter valid tile stats
     const valid = tileStats.filter(s => s && s.count > 0 && isFinite(s.min) && isFinite(s.max) && s.max > 0);
     if (valid.length === 0) return { min:0, max:0, mean:0, count:0, totalAreaM2:0, histogram: [] } as any;
 
     // Global min/max
-    let globalMin = +Infinity, globalMax = 0;
+    let globalMin = +Infinity, globalMax = -Infinity;
     for (const s of valid) { if (s.min < globalMin) globalMin = s.min; if (s.max > globalMax) globalMax = s.max; }
+
+    // Aggregate totals (for mean/area) independent of binning
+    let totalCount = 0; let totalArea = 0; let sum = 0;
+    for (const s of valid) { totalCount += s.count; totalArea += (s.totalAreaM2 || 0); sum += s.mean * s.count; }
+
+    // Degenerate span -> single bin aggregation
     if (!(globalMax > globalMin)) {
-      // Degenerate span -> single bin aggregation
-      let totalCount = 0; let totalArea = 0; let sum = 0;
-      for (const s of valid) { totalCount += s.count; totalArea += (s.totalAreaM2 || 0); sum += s.mean * s.count; }
       return { min: globalMin, max: globalMax, mean: totalCount>0 ? sum/totalCount : 0, count: totalCount, totalAreaM2: totalArea, histogram: [{ bin: globalMin, count: totalCount, areaM2: totalArea }] } as any;
     }
 
-    const MAX_BINS = 20; // keep UI stable
-    const MIN_BIN_SIZE = 0.01; // 1 cm
-    let span = globalMax - globalMin;
-    let numBins = MAX_BINS;
-    if (span / numBins < MIN_BIN_SIZE) {
-      numBins = Math.max(1, Math.floor(span / MIN_BIN_SIZE));
-      if (numBins < 1) numBins = 1;
-    }
-    const binSize = span / numBins;
-    const bins = new Array<{ bin:number; count:number; areaM2:number }>(numBins);
-    for (let i=0;i<numBins;i++) bins[i] = { bin: globalMin + (i+0.5)*binSize, count:0, areaM2:0 };
+    const span = globalMax - globalMin;
 
-    let totalCount = 0; let totalArea = 0; let sum = 0;
-
-    // Re-bin each tile's histogram into global layout
-    for (const s of valid) {
-      totalCount += s.count;
-      totalArea += (s.totalAreaM2 || 0);
-      sum += s.mean * s.count; // weighted sum for mean
-      if (!s.histogram || s.histogram.length === 0) continue;
-      for (const hb of s.histogram) {
-        if (hb.count === 0) continue;
-        const v = hb.bin;
-        let bi = Math.floor((v - globalMin) / binSize);
-        if (bi < 0) bi = 0; if (bi >= numBins) bi = numBins - 1;
-        bins[bi].count += hb.count;
-        bins[bi].areaM2 += (hb.areaM2 || 0);
+    // Helper to re-bin into N uniform bins over [globalMin, globalMax]
+    const rebin = (nBins: number) => {
+      const edges = new Array(nBins + 1);
+      for (let i=0;i<=nBins;i++) edges[i] = globalMin + (span * i) / nBins;
+      const eps = Math.max(1e-12, span * 1e-9);
+      const bins = new Array<{ bin:number; count:number; areaM2:number }>(nBins);
+      for (let i=0;i<nBins;i++) bins[i] = { bin: (edges[i] + edges[i+1]) * 0.5, count: 0, areaM2: 0 };
+      for (const s of valid) {
+        if (!s.histogram || s.histogram.length === 0) continue;
+        for (const hb of s.histogram) {
+          if (!hb || hb.count === 0) continue;
+          const v = hb.bin;
+          let bi = Math.floor((v - globalMin) / (span / nBins + eps));
+          if (bi < 0) bi = 0; if (bi >= nBins) bi = nBins - 1;
+          bins[bi].count += hb.count;
+          bins[bi].areaM2 += (hb.areaM2 || 0);
+        }
       }
+      const nonEmpty = bins.reduce((acc,b)=> acc + (b.count>0 ? 1 : 0), 0);
+      return { bins, nonEmpty };
+    };
+
+    // Prefer 4 bins; fallback to 3 if needed
+    let choice = rebin(4);
+    if (choice.nonEmpty < 3 || choice.nonEmpty > 4) {
+      const alt = rebin(3);
+      // Pick the one that yields bars in [3,4], otherwise the one with more non-empty bins
+      choice = (alt.nonEmpty >= 3 && alt.nonEmpty <= 4) ? alt : (alt.nonEmpty > choice.nonEmpty ? alt : choice);
     }
 
-    // If some bins ended with zero area because tile histograms lacked areaM2 (shouldn't now), approximate using pixel size via proportional count * (mean bin area fraction)
-    // (Leave as 0 if unknown – UI will show 0)
+    // Compute a mean consistent with the histogram: area-weighted if area is available,
+    // otherwise count-weighted using bin centers.
+    const areaSum = choice.bins.reduce((a,b)=> a + (b.areaM2 || 0), 0);
+    let meanFromBins = 0;
+    if (areaSum > 0) {
+      const wsum = choice.bins.reduce((a,b)=> a + b.bin * (b.areaM2 || 0), 0);
+      meanFromBins = wsum / areaSum;
+    } else {
+      const cntSum = choice.bins.reduce((a,b)=> a + b.count, 0);
+      const wsum = choice.bins.reduce((a,b)=> a + b.bin * b.count, 0);
+      meanFromBins = cntSum>0 ? (wsum / cntSum) : 0;
+    }
 
-    return { min: globalMin, max: globalMax, mean: totalCount>0 ? sum/totalCount : 0, count: totalCount, totalAreaM2: totalArea, histogram: bins } as any;
+    return { min: globalMin, max: globalMax, mean: meanFromBins, count: totalCount, totalAreaM2: totalArea, histogram: choice.bins } as any;
   }, []);
 
   // Convert histogram to area series (areaM2 already provided per bin)
@@ -318,6 +336,8 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
    *  - all polygons (default)
    */
   const compute = useCallback(async (opts?: { polygonId?: string }) => {
+    // Capture a sequence id to allow external invalidation (e.g., when clearing)
+    const mySeq = ++computeSeqRef.current;
     const api = mapRef.current;
     const internalParams = api?.getPerPolygonParams?.() ?? {};
     const externalParams = getPerPolygonParams?.() ?? {};
@@ -461,6 +481,10 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
 
         // Always pass ALL polygons so each tile overlay is the union of all current areas
         const res = await worker.runTile({ tile, polygons: polygonsForWorker, poses, cameras: camerasArr, poseCameraIndices: poseIdxArr, camera: (!camerasArr || camerasArr.length===0)? undefined : undefined, options: { clipInnerBufferM } } as any);
+        // If a clear() or new compute() happened, stop applying results
+        if (mySeq !== computeSeqRef.current) {
+          break;
+        }
 
         if (res.perPolygon) {
           for (const polyStats of res.perPolygon) {
@@ -477,11 +501,14 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
           }
         }
 
-        if (showOverlap) addOrUpdateTileOverlay(map, res, { kind: "overlap", runId, opacity });
-        if (showGsd) addOrUpdateTileOverlay(map, res, { kind: "gsd", runId, opacity, gsdMax: 0.1 });
+        if (mySeq === computeSeqRef.current) {
+          if (showOverlap) addOrUpdateTileOverlay(map, res, { kind: "overlap", runId, opacity });
+          if (showGsd) addOrUpdateTileOverlay(map, res, { kind: "gsd", runId, opacity, gsdMax: 0.1 });
+        }
       }
 
       // --- PRUNE STALE TILES (tiles no longer under ANY current polygon) ---
+      if (mySeq !== computeSeqRef.current) return; // aborted
       // Build set of needed tile keys for all CURRENT polygons at this zoom.
       const currentPolysForPrune = getPolygons();
       const neededTileKeys = new Set<string>();
@@ -564,7 +591,8 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
       });
 
       setPerPolygonStats(prev => {
-        const next = new Map(prev);
+        // Rebuild the map from the aggregated set to drop deleted polygons
+        const next = new Map<string, { polygonId: string; gsdStats: GSDStats; areaAcres: number; imageCount: number; cameraLabel: string }>();
         aggregatedPerPolygon.forEach((v, k) => next.set(k, v));
         const overall = aggregateGSDStats(Array.from(next.values()).map(v => v.gsdStats));
         setGsdStats(overall);
@@ -626,7 +654,8 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
       if (autoTriesRef.current === 1) {
         console.debug('[GSD auto-run] waiting:', { ready, havePolys, haveLines, reason: opts?.reason });
       }
-      setTimeout(()=>{ if ((autoGenerate || importedPoses.length>0) && !running) autoRun(opts); }, 250);
+      if (autoRunTimeoutRef.current) clearTimeout(autoRunTimeoutRef.current);
+      autoRunTimeoutRef.current = window.setTimeout(()=>{ if ((autoGenerate || importedPoses.length>0) && !running) autoRun(opts); }, 250);
     } else { autoTriesRef.current = 0; }
   }, [running, autoGenerate, importedPoses, compute, mapRef]);
 
@@ -638,8 +667,13 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
   const clear = useCallback(() => {
     const map: any = mapRef.current?.getMap?.();
     if (map) {
-      if (globalRunIdRef.current) clearRunOverlays(map, globalRunIdRef.current);
+      // Invalidate any in-flight compute
+      computeSeqRef.current += 1;
+      if (autoRunTimeoutRef.current) { clearTimeout(autoRunTimeoutRef.current); autoRunTimeoutRef.current = null; }
+      // Remove all overlays regardless of run id to be safe
+      clearAllOverlays(map);
       perPolyTileStatsRef.current.clear();
+      prevPolygonRingsRef.current = new Map();
       const now = Date.now();
       globalRunIdRef.current = `${now}`;
       const api = mapRef.current;
@@ -654,6 +688,11 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
       onPosesImported?.(0); // notify parent
     }
   }, [mapRef, onPosesImported]);
+
+  // Provide clear function to parent so header and Map can invoke it
+  React.useEffect(() => {
+    onClearExposed?.(clear);
+  }, [clear, onClearExposed]);
 
   const handlePoseFileChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -753,7 +792,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
                 <CardContent className="space-y-4">
                   <div className="grid grid-cols-3 gap-4 text-xs">
                     <div className="text-center"><div className="font-medium text-green-600">{(stats.gsdStats.min * 100).toFixed(1)} cm</div><div className="text-gray-500">Min GSD</div></div>
-                    <div className="text-center"><div className="font-medium text-blue-600">{(stats.gsdStats.mean * 100).toFixed(1)} cm</div><div className="text-gray-500">Mean GSD</div></div>
+                    <div className="text-center"><div className="font-medium text-blue-600">{(stats.gsdStats.mean * 100).toFixed(2)} cm</div><div className="text-gray-500">Mean GSD</div></div>
                     <div className="text-center"><div className="font-medium text-red-600">{(stats.gsdStats.max * 100).toFixed(1)} cm</div><div className="text-gray-500">Max GSD</div></div>
                   </div>
                   <div className="h-48">
@@ -783,7 +822,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
           <CardContent className="space-y-4">
             <div className="grid grid-cols-3 gap-4 text-xs">
               <div className="text-center"><div className="font-medium text-green-600">{(gsdStats.min * 100).toFixed(1)} cm</div><div className="text-gray-500">Min GSD</div></div>
-              <div className="text-center"><div className="font-medium text-blue-600">{(gsdStats.mean * 100).toFixed(1)} cm</div><div className="text-gray-500">Mean GSD</div></div>
+              <div className="text-center"><div className="font-medium text-blue-600">{(gsdStats.mean * 100).toFixed(2)} cm</div><div className="text-gray-500">Mean GSD</div></div>
               <div className="text-center"><div className="font-medium text-red-600">{(gsdStats.max * 100).toFixed(1)} cm</div><div className="text-gray-500">Max GSD</div></div>
             </div>
             <div className="h-48">

@@ -184,3 +184,17 @@ export function clearRunOverlays(map: mapboxgl.Map, runId: string) {
     }
   }
 }
+
+// Remove all overlays produced by the GSD/overlap pipeline, regardless of runId.
+export function clearAllOverlays(map: mapboxgl.Map) {
+  if (!map.isStyleLoaded?.()) return;
+  const layers = map.getStyle().layers || [];
+  for (const layer of layers) {
+    const id = layer.id;
+    if (!id.startsWith('ogsd-')) continue;
+    try {
+      if (map.getLayer(id)) map.removeLayer(id);
+      if (map.getSource(id)) map.removeSource(id);
+    } catch { /* ignore */ }
+  }
+}

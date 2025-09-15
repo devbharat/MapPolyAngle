@@ -164,6 +164,12 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
     // ---------- analysis callbacks ----------
     const handleAnalysisResult = useCallback(
       (result: PolygonAnalysisResult, tiles: any[]) => {
+        // If polygon no longer exists (deleted), ignore late results
+        const draw = drawRef.current as any;
+        const stillExists = !!draw?.get?.(result.polygonId);
+        if (!stillExists) {
+          return;
+        }
         // 1) Commit result and defer parent notification to avoid React 18 render conflicts
         setPolygonResults((prev) => {
           const next = new Map(prev);
@@ -305,6 +311,8 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           setPolygonResults((prev) => {
             const next = new Map(prev);
             next.delete(polygonId);
+            // Keep ref in sync so parent receives updated results list
+            polygonResultsRef.current = next;
             debouncedAnalysisComplete();
             return next;
           });
@@ -334,10 +342,11 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
             return next;
           });
 
-          onClearGSD?.();
+          // Trigger GSD recompute for remaining polygons instead of clearing everything
+          onFlightLinesUpdated?.('__all__');
         }
       });
-    }, [cancelAnalysis, debouncedAnalysisComplete, onClearGSD]);
+    }, [cancelAnalysis, debouncedAnalysisComplete, onFlightLinesUpdated]);
 
     // ---------- Map init ----------
     const onMapLoad = useCallback(
@@ -908,6 +917,8 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
 
         cancelAllAnalyses();
         onClearGSD?.();
+        // Notify parent that results are cleared
+        onAnalysisComplete?.([]);
       },
       clearPolygon: (polygonId: string) => {
         if (drawRef.current) drawRef.current.delete(polygonId);

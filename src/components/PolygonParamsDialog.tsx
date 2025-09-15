@@ -22,9 +22,9 @@ export default function PolygonParamsDialog({
   defaults
 }: Props) {
   const [altitudeAGL, setAltitudeAGL] = React.useState<number>(defaults?.altitudeAGL ?? 100);
-  const [frontOverlap, setFrontOverlap] = React.useState<number>(defaults?.frontOverlap ?? 80);
+  const [frontOverlap, setFrontOverlap] = React.useState<number>(defaults?.frontOverlap ?? 70);
   const [sideOverlap, setSideOverlap] = React.useState<number>(defaults?.sideOverlap ?? 70);
-  const [cameraKey, setCameraKey] = React.useState<string>("SONY_RX1R2");
+  const [cameraKey, setCameraKey] = React.useState<string>("MAP61_17MM");
 
   // map keys to models (could be lifted up later if needed)
   const cameraOptions: Array<{ key:string; model:any; label:string }> = [
@@ -38,9 +38,9 @@ export default function PolygonParamsDialog({
   React.useEffect(() => {
     if (open) {
       setAltitudeAGL(defaults?.altitudeAGL ?? 100);
-      setFrontOverlap(defaults?.frontOverlap ?? 80);
+      setFrontOverlap(defaults?.frontOverlap ?? 70);
       setSideOverlap(defaults?.sideOverlap ?? 70);
-      setCameraKey("SONY_RX1R2");
+      setCameraKey("MAP61_17MM");
     }
   }, [open, defaults?.altitudeAGL, defaults?.frontOverlap, defaults?.sideOverlap]);
 
@@ -78,7 +78,7 @@ export default function PolygonParamsDialog({
             Front overlap (%)
             <input className="w-full border rounded px-2 py-1 text-xs" type="number" min={0} max={95}
                    value={frontOverlap}
-                   onChange={(e)=>setFrontOverlap(parseInt(e.target.value || "80"))} />
+                   onChange={(e)=>setFrontOverlap(parseInt(e.target.value || "70"))} />
           </label>
           <label className="text-xs text-gray-600 block">
             Side overlap (%)
