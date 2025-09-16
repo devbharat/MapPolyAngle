@@ -125,6 +125,9 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
     const polygonResultsRef = React.useRef(polygonResults);
     // NEW: Suppress per‑polygon flight line update events during batched imports
     const suppressFlightLineEventsRef = React.useRef(false);
+    // NEW: Altitude mode + minimum clearance configuration (global)
+    const [altitudeMode, setAltitudeMode] = useState<'legacy' | 'min-clearance'>('min-clearance');
+    const [minClearanceM, setMinClearanceM] = useState<number>(60);
 
     React.useEffect(() => { polygonParamsRef.current = polygonParams; }, [polygonParams]);
     React.useEffect(() => { bearingOverridesRef.current = bearingOverrides; }, [bearingOverrides]);
@@ -139,6 +142,19 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       }, 0);
       return timeoutId;
     }, [onAnalysisComplete]);
+
+    // Rebuild 3D paths when altitude mode or minimum clearance changes
+    useEffect(() => {
+      if (!deckOverlayRef.current) return;
+      const overlay = deckOverlayRef.current;
+      // For each polygon with flight lines and tiles, rebuild path3D and update layer
+      polygonFlightLines.forEach((fl, pid) => {
+        const tiles = polygonTiles.get(pid) || [];
+        if (!tiles || fl.flightLines.length === 0) return;
+        const path3d = build3DFlightPath(fl.flightLines, tiles, fl.lineSpacing, { altitudeAGL: fl.altitudeAGL, mode: altitudeMode, minClearance: minClearanceM });
+        update3DPathLayer(overlay, pid, path3d, setDeckLayers);
+      });
+    }, [altitudeMode, minClearanceM]);
 
     // ---------- helpers ----------
     const fitMapToRings = useCallback((rings: [number, number][][]) => {
@@ -254,11 +270,11 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         }
 
         if (deckOverlayRef.current && lines.flightLines.length > 0) {
-          const path3d = build3DFlightPath(lines.flightLines, tiles, lines.lineSpacing, params.altitudeAGL);
+          const path3d = build3DFlightPath(lines.flightLines, tiles, lines.lineSpacing, { altitudeAGL: params.altitudeAGL, mode: altitudeMode, minClearance: minClearanceM });
           update3DPathLayer(deckOverlayRef.current, result.polygonId, path3d, setDeckLayers);
         }
       },
-      [debouncedAnalysisComplete, onFlightLinesUpdated, onRequestParams]
+      [debouncedAnalysisComplete, onFlightLinesUpdated, onRequestParams, altitudeMode, minClearanceM]
     );
 
     const memoizedOnAnalysisStart = useCallback((polygonId: string) => {
@@ -580,7 +596,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           const lineSpacing = flEntry?.lineSpacing ?? imported.items[idx]?.lineSpacingM ?? 25;
           const altitudeAGL = polygonsToUpdate.get(polygonId)?.params.altitudeAGL ?? imported.items[idx]?.altitudeAGL ?? 100;
           if (deckOverlayRef.current && flEntry?.flightLines?.length) {
-            const path3d = build3DFlightPath(flEntry.flightLines, tiles, lineSpacing, altitudeAGL);
+            const path3d = build3DFlightPath(flEntry.flightLines, tiles, lineSpacing, { altitudeAGL, mode: altitudeMode, minClearance: minClearanceM });
             update3DPathLayer(deckOverlayRef.current, polygonId, path3d, setDeckLayers);
           }
         }
@@ -736,7 +752,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       }
 
       if (deckOverlayRef.current && fl.flightLines.length > 0) {
-        const path3d = build3DFlightPath(fl.flightLines, tiles, fl.lineSpacing, params.altitudeAGL);
+        const path3d = build3DFlightPath(fl.flightLines, tiles, fl.lineSpacing, { altitudeAGL: params.altitudeAGL, mode: altitudeMode, minClearance: minClearanceM });
         update3DPathLayer(deckOverlayRef.current, polygonId, path3d, setDeckLayers);
       }
 
@@ -841,7 +857,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       });
       const tiles = polygonTiles.get(polygonId) || [];
       if (deckOverlayRef.current && fl.flightLines.length > 0) {
-        const path3d = build3DFlightPath(fl.flightLines, tiles, fl.lineSpacing, params.altitudeAGL);
+        const path3d = build3DFlightPath(fl.flightLines, tiles, fl.lineSpacing, { altitudeAGL: params.altitudeAGL, mode: altitudeMode, minClearance: minClearanceM });
         update3DPathLayer(deckOverlayRef.current, polygonId, path3d, setDeckLayers);
       }
       console.log(`✅ Restored file direction: ${original.bearingDeg}° bearing, ${original.lineSpacingM}m spacing`);
@@ -967,6 +983,11 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       // expose bulk apply helper
       applyParamsToAllPending,
       getPerPolygonParams: () => Object.fromEntries(polygonParams),
+      // Altitude strategy and clearance controls
+      setAltitudeMode: (m: 'legacy' | 'min-clearance') => setAltitudeMode(m),
+      getAltitudeMode: () => altitudeMode,
+      setMinClearance: (m: number) => setMinClearanceM(Math.max(0, m)),
+      getMinClearance: () => minClearanceM,
 
       openKmlFilePicker: () => {
         kmlInputRef.current?.click();

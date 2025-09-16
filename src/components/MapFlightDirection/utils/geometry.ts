@@ -62,6 +62,45 @@ function queryMaxElevationAlongLineWGS84(
 }
 
 /**
+ * Helper: Query min and max elevation along a polyline (WGS84) with sampling per segment.
+ */
+export function queryMinMaxElevationAlongPolylineWGS84(
+  line: [number, number][],
+  tiles: TerrainTile[],
+  samplesPerSegment: number = 20
+): { min: number; max: number } {
+  let minElev = +Infinity;
+  let maxElev = -Infinity;
+  if (!Array.isArray(line) || line.length === 0) return { min: minElev, max: maxElev };
+
+  for (let i = 0; i < line.length - 1; i++) {
+    const [startLng, startLat] = line[i];
+    const [endLng, endLat] = line[i + 1];
+    for (let s = 0; s <= samplesPerSegment; s++) {
+      const t = s / samplesPerSegment;
+      const lng = startLng + t * (endLng - startLng);
+      const lat = startLat + t * (endLat - startLat);
+      const elevEGM96 = queryElevationAtPoint(lng, lat, tiles);
+      if (!Number.isFinite(elevEGM96)) continue;
+      const elevW = convertElevationToWGS84(lat, lng, elevEGM96);
+      if (elevW < minElev) minElev = elevW;
+      if (elevW > maxElev) maxElev = elevW;
+    }
+  }
+
+  // Also consider vertices individually (in case of zero-length segments)
+  for (const [lng, lat] of line) {
+    const elevEGM96 = queryElevationAtPoint(lng, lat, tiles);
+    if (!Number.isFinite(elevEGM96)) continue;
+    const elevW = convertElevationToWGS84(lat, lng, elevEGM96);
+    if (elevW < minElev) minElev = elevW;
+    if (elevW > maxElev) maxElev = elevW;
+  }
+
+  return { min: minElev, max: maxElev };
+}
+
+/**
  * Calculate flight line spacing based on camera parameters and desired side overlap
  * @param camera Camera model with focal length and pixel size
  * @param altitudeAGL Flight altitude above ground level (meters)
@@ -217,32 +256,32 @@ export function build3DFlightPath(
   lines: number[][][],
   tiles: TerrainTile[],
   lineSpacing: number,
-  baseAltitude: number = 100
+  opts: { altitudeAGL: number; mode?: 'legacy' | 'min-clearance'; minClearance?: number } | number = 100
 ): [number, number, number][][] {
   const path: [number, number, number][][] = [];
+  const usingLegacySig = typeof opts === 'number';
+  const altitudeAGL = usingLegacySig ? (opts as number) : (opts as any).altitudeAGL;
+  const mode: 'legacy' | 'min-clearance' = usingLegacySig ? 'legacy' : ((opts as any).mode ?? 'legacy');
+  const minClearance = usingLegacySig ? 60 : Math.max(0, (opts as any).minClearance ?? 60);
 
   lines.forEach((line, i) => {
-    let lineMaxElevation = -Infinity;
+    // Compute min/max along the sweep line
+    const { min: lineMinElev, max: lineMaxElev } = queryMinMaxElevationAlongPolylineWGS84(line as any, tiles, 20);
 
-    // CRITICAL FIX: Use WGS84-corrected elevation queries for vertical datum consistency
-    for (let j = 0; j < line.length - 1; j++) {
-      const [startLng, startLat] = line[j];
-      const [endLng, endLat] = line[j + 1];
-      const segmentMaxElevation = queryMaxElevationAlongLineWGS84(startLng, startLat, endLng, endLat, tiles, 20);
-      if (Number.isFinite(segmentMaxElevation)) {
-        lineMaxElevation = Math.max(lineMaxElevation, segmentMaxElevation);
-      }
+    // Determine sweep altitude per selected mode
+    let flightAltitude: number;
+    if (mode === 'legacy') {
+      // Old behavior: highest point + altitudeAGL
+      const refElev = Number.isFinite(lineMaxElev) ? lineMaxElev : 0;
+      flightAltitude = refElev + altitudeAGL;
+    } else {
+      // New behavior:
+      // - meet requested GSD by using lowest sampled terrain + AGL
+      // - enforce minimum ground clearance using highest sampled terrain
+      const a1 = Number.isFinite(lineMinElev) ? (lineMinElev + altitudeAGL) : altitudeAGL;
+      const a2 = Number.isFinite(lineMaxElev) ? (lineMaxElev + minClearance) : altitudeAGL;
+      flightAltitude = Math.max(a1, a2);
     }
-
-    for (const [lng, lat] of line) {
-      const pointElevation = queryElevationAtPointWGS84(lng, lat, tiles);
-      if (Number.isFinite(pointElevation)) {
-        lineMaxElevation = Math.max(lineMaxElevation, pointElevation);
-      }
-    }
-
-    // Flight altitude now uses WGS84 ellipsoid heights, consistent with DJI poses
-    const flightAltitude = Number.isFinite(lineMaxElevation) ? lineMaxElevation + baseAltitude : baseAltitude;
     const coords = (i % 2 === 0 ? line : [...line].reverse()).map(
       ([lng, lat]) => [lng, lat, flightAltitude] as [number, number, number]
     );
@@ -262,12 +301,26 @@ export function build3DFlightPath(
           : geoBearing([P0[0], P0[1]], [P2[0], P2[1]]);
 
       const filletRadius = Math.max(30, lineSpacing / 2);
-      const fillet = buildFillet(P0, P2, dirPrev, dirNext, filletRadius);
+      let fillet = buildFillet(P0, P2, dirPrev, dirNext, filletRadius);
 
       if (fillet.length > 2) {
+        // In min-clearance mode, ensure connector maintains min clearance as well
+        if (mode === 'min-clearance') {
+          const fillet2D = fillet.map(p => [p[0], p[1]] as [number, number]);
+          const { max: connMaxElev } = queryMinMaxElevationAlongPolylineWGS84(fillet2D, tiles, 12);
+          const needed = Number.isFinite(connMaxElev) ? (connMaxElev + minClearance) : undefined;
+          if (needed && fillet[0][2] < needed) {
+            fillet = fillet.map(p => [p[0], p[1], needed] as [number, number, number]);
+          }
+        }
         path.push(fillet);
       } else {
-        const connectorAltitude = Math.max(P0[2], P2[2]);
+        let connectorAltitude = Math.max(P0[2], P2[2]);
+        if (mode === 'min-clearance') {
+          const { max: connMaxElev } = queryMinMaxElevationAlongPolylineWGS84([[P0[0], P0[1]],[P2[0], P2[1]]], tiles, 12);
+          const needed = Number.isFinite(connMaxElev) ? (connMaxElev + minClearance) : undefined;
+          if (needed && connectorAltitude < needed) connectorAltitude = needed;
+        }
         path.push([[P0[0], P0[1], connectorAltitude], [P2[0], P2[1], connectorAltitude]]);
       }
     }

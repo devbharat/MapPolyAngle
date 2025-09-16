@@ -251,7 +251,8 @@ self.onmessage = (ev: MessageEvent<Msg>) => {
   // Clip / erosion radius
   const clipM = Math.max(0, options?.clipInnerBufferM ?? 0);
   const pixM = (tileBounds.maxX - tileBounds.minX) / size;
-  const radiusPx = clipM > 0 ? Math.max(1, Math.round(clipM / pixM)) : 0;
+  // Use ceil so we guarantee at least the requested buffer distance
+  const radiusPx = clipM > 0 ? Math.max(1, Math.ceil(clipM / pixM)) : 0;
 
   const { tx, masks: polyMasks, unionMask: polyMask, ids: polyIds } = buildPolygonMasks(polygons, z, x, y, size, radiusPx);
 
@@ -278,7 +279,15 @@ self.onmessage = (ev: MessageEvent<Msg>) => {
   // Precompute normals & active indices
   const normals = new Float32Array(size*size*3);
   const activeIdxs = new Uint32Array(polyPixelCount);
-  { let w=0; for (let idx=0; idx<elev.length; idx++){ if (!polyMask[idx]) continue; const row=(idx/size)|0; const col=idx-row*size; const n=normalFromDEM(elev,size,row,col,pixSize); const base=idx*3; normals[base]=n[0]; normals[base+1]=n[1]; normals[base+2]=n[2]; activeIdxs[w++]=idx; } }
+  { let w=0; for (let idx=0; idx<elev.length; idx++){
+      if (!polyMask[idx]) continue;
+      const row=(idx/size)|0; const col=idx-row*size;
+      // Adjust pixel spacing by cos(latitude) to better approximate ground spacing
+      const pixSizeGround = pixSize * cosLatPerRow[row];
+      const n=normalFromDEM(elev,size,row,col,pixSizeGround);
+      const base=idx*3; normals[base]=n[0]; normals[base+1]=n[1]; normals[base+2]=n[2];
+      activeIdxs[w++]=idx;
+    } }
 
   // Per-camera precompute (diag tan + s/f)
   const camDiagTan: number[] = new Array(camModels.length);
@@ -303,7 +312,11 @@ self.onmessage = (ev: MessageEvent<Msg>) => {
     const RT = new Float64Array([ Rm[0],Rm[3],Rm[6],
                                   Rm[1],Rm[4],Rm[7],
                                   Rm[2],Rm[5],Rm[8] ]);      // world->camera
-    const H = Math.max(1.0, p.z - zMin);
+    // Estimate local ground at the pose location to compute AGL-based radius
+    const colP = Math.min(size - 1, Math.max(0, Math.floor((p.x - minX) / pixSize)));
+    const rowP = Math.min(size - 1, Math.max(0, Math.floor((maxY - p.y) / pixSize)));
+    const zLocal = elev[rowP * size + colP];
+    const H = Math.max(1.0, p.z - zLocal);
     const diagTan = camDiagTan[camIdx];
     const radius = H * diagTan * 1.25;
     prepared[i] = {
@@ -403,7 +416,8 @@ self.onmessage = (ev: MessageEvent<Msg>) => {
       const rcx = p.RT[0]*rx + p.RT[1]*ry + p.RT[2]*rz;
       const rcy = p.RT[3]*rx + p.RT[4]*ry + p.RT[5]*rz;
       const rcz = p.RT[6]*rx + p.RT[7]*ry + p.RT[8]*rz;
-      if (Math.abs(rcz) < 1e-12) continue; // parallel to image plane
+      // Camera looks along -Z; rcz should be negative when in front
+      if (rcz >= 0) continue; // behind or parallel to image plane
 
       const f = cam.f_m;
       // Sensor coordinates (meters) relative to principal point
@@ -442,7 +456,8 @@ self.onmessage = (ev: MessageEvent<Msg>) => {
       // Debug logging (optional)
       // if (poseIdx < 3) console.log(`GSD for pose ${poseIdx}: ${gsd.toFixed(4)}m (gsdx: ${gsdx.toFixed(4)}, gsdy: ${gsdy.toFixed(4)})`);
        const globalPoseIndex = poseIdx; for (let pi=0; pi<polysHere.length; pi++) poseHitsPerPoly[polysHere[pi]].add(globalPoseIndex);
-       localOverlap++; if (gsd < localMinG) localMinG = gsd; if (localOverlap >= maxOverlapNeeded) break;
+      if (localOverlap < maxOverlapNeeded) localOverlap++;
+      if (gsd < localMinG) localMinG = gsd;
      }
 
     if (localOverlap > 0) { overlap[idx] = localOverlap; gsdMin[idx] = localMinG; }

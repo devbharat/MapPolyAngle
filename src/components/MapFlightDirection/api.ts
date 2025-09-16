@@ -48,6 +48,12 @@ export interface MapFlightDirectionAPI {
   }>;
   getPerPolygonParams(): Record<string, FlightParams>;
 
+  // Altitude strategy and clearance controls
+  setAltitudeMode(mode: 'legacy' | 'min-clearance'): void;
+  getAltitudeMode(): 'legacy' | 'min-clearance';
+  setMinClearance(meters: number): void;
+  getMinClearance(): number;
+
   // 3D visualization
   addCameraPoints(polygonId: string, positions: [number, number, number][]): void;
   removeCameraPoints(polygonId: string): void;

@@ -119,6 +119,18 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
   const computeSeqRef = useRef(0); // increment to invalidate in-flight computations
   const [clipInnerBufferM, setClipInnerBufferM] = useState(0);
   const [maxTiltDeg, setMaxTiltDeg] = useState(30); // NEW: max allowable camera tilt (deg from vertical)
+  // NEW: altitude strategy & min clearance (synced with map API if available)
+  const [altitudeModeUI, setAltitudeModeUI] = useState<'legacy' | 'min-clearance'>('min-clearance');
+  const [minClearanceUI, setMinClearanceUI] = useState<number>(60);
+
+  // Sync initial values from map API
+  React.useEffect(() => {
+    const api = mapRef.current;
+    const mode = (api as any)?.getAltitudeMode ? (api as any).getAltitudeMode() : 'min-clearance';
+    const minc = (api as any)?.getMinClearance ? (api as any).getMinClearance() : 60;
+    setAltitudeModeUI(mode);
+    setMinClearanceUI(minc);
+  }, [mapRef]);
 
   // Helper function to generate user-friendly polygon names
   const getPolygonDisplayName = useCallback((polygonId: string): { displayName: string; shortId: string } => {
@@ -176,72 +188,81 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
     return groundHeight * (1 - frontOverlap / 100);
   }, [effectiveCameraForPolygon]);
 
-  // Function to aggregate GSD statistics from multiple tiles
-  // Re-bins into 3–4 bars to keep the histogram visually compact and comparable
+  // FIXED: Function to aggregate GSD statistics from multiple tiles
+  // Preserves accuracy and uses proper histogram merging instead of forced rebinning
   const aggregateGSDStats = useCallback((tileStats: GSDStats[]): GSDStats => {
     // Filter valid tile stats
     const valid = tileStats.filter(s => s && s.count > 0 && isFinite(s.min) && isFinite(s.max) && s.max > 0);
     if (valid.length === 0) return { min:0, max:0, mean:0, count:0, totalAreaM2:0, histogram: [] } as any;
 
-    // Global min/max
+    // Calculate accurate aggregated statistics using original data
+    let totalCount = 0, totalArea = 0, weightedSum = 0;
     let globalMin = +Infinity, globalMax = -Infinity;
-    for (const s of valid) { if (s.min < globalMin) globalMin = s.min; if (s.max > globalMax) globalMax = s.max; }
 
-    // Aggregate totals (for mean/area) independent of binning
-    let totalCount = 0; let totalArea = 0; let sum = 0;
-    for (const s of valid) { totalCount += s.count; totalArea += (s.totalAreaM2 || 0); sum += s.mean * s.count; }
-
-    // Degenerate span -> single bin aggregation
-    if (!(globalMax > globalMin)) {
-      return { min: globalMin, max: globalMax, mean: totalCount>0 ? sum/totalCount : 0, count: totalCount, totalAreaM2: totalArea, histogram: [{ bin: globalMin, count: totalCount, areaM2: totalArea }] } as any;
+    for (const s of valid) {
+      totalCount += s.count;
+      totalArea += (s.totalAreaM2 || 0);
+      weightedSum += s.mean * s.count; // Use original accurate means
+      if (s.min < globalMin) globalMin = s.min;
+      if (s.max > globalMax) globalMax = s.max;
     }
 
-    const span = globalMax - globalMin;
+    const accurateMean = totalCount > 0 ? weightedSum / totalCount : 0;
 
-    // Helper to re-bin into N uniform bins over [globalMin, globalMax]
-    const rebin = (nBins: number) => {
-      const edges = new Array(nBins + 1);
-      for (let i=0;i<=nBins;i++) edges[i] = globalMin + (span * i) / nBins;
-      const eps = Math.max(1e-12, span * 1e-9);
-      const bins = new Array<{ bin:number; count:number; areaM2:number }>(nBins);
-      for (let i=0;i<nBins;i++) bins[i] = { bin: (edges[i] + edges[i+1]) * 0.5, count: 0, areaM2: 0 };
-      for (const s of valid) {
+    // Merge histograms intelligently without losing information
+    const mergeHistograms = (statsArray: GSDStats[]): Array<{ bin: number; count: number; areaM2: number }> => {
+      if (statsArray.length === 0) return [];
+      
+      // Find the range and determine appropriate binning
+      const span = globalMax - globalMin;
+      if (span <= 0) {
+        return [{ bin: globalMin, count: totalCount, areaM2: totalArea }];
+      }
+
+      // Use adaptive binning: start with reasonable number of bins
+      const targetBins = Math.min(20, Math.max(5, Math.ceil(span / 0.01))); // 1cm minimum bin size
+      const binSize = span / targetBins;
+      
+      // Create bins
+      const bins = new Array<{ bin: number; count: number; areaM2: number }>(targetBins);
+      for (let i = 0; i < targetBins; i++) {
+        bins[i] = { 
+          bin: globalMin + (i + 0.5) * binSize, 
+          count: 0, 
+          areaM2: 0 
+        };
+      }
+
+      // Aggregate data from all histograms
+      for (const s of statsArray) {
         if (!s.histogram || s.histogram.length === 0) continue;
+        
         for (const hb of s.histogram) {
           if (!hb || hb.count === 0) continue;
-          const v = hb.bin;
-          let bi = Math.floor((v - globalMin) / (span / nBins + eps));
-          if (bi < 0) bi = 0; if (bi >= nBins) bi = nBins - 1;
-          bins[bi].count += hb.count;
-          bins[bi].areaM2 += (hb.areaM2 || 0);
+          
+          // Find appropriate bin for this histogram entry
+          let binIndex = Math.floor((hb.bin - globalMin) / binSize);
+          binIndex = Math.max(0, Math.min(targetBins - 1, binIndex));
+          
+          bins[binIndex].count += hb.count;
+          bins[binIndex].areaM2 += (hb.areaM2 || 0);
         }
       }
-      const nonEmpty = bins.reduce((acc,b)=> acc + (b.count>0 ? 1 : 0), 0);
-      return { bins, nonEmpty };
+
+      // Remove empty bins for cleaner display
+      return bins.filter(bin => bin.count > 0);
     };
 
-    // Prefer 4 bins; fallback to 3 if needed
-    let choice = rebin(4);
-    if (choice.nonEmpty < 3 || choice.nonEmpty > 4) {
-      const alt = rebin(3);
-      // Pick the one that yields bars in [3,4], otherwise the one with more non-empty bins
-      choice = (alt.nonEmpty >= 3 && alt.nonEmpty <= 4) ? alt : (alt.nonEmpty > choice.nonEmpty ? alt : choice);
-    }
+    const mergedHistogram = mergeHistograms(valid);
 
-    // Compute a mean consistent with the histogram: area-weighted if area is available,
-    // otherwise count-weighted using bin centers.
-    const areaSum = choice.bins.reduce((a,b)=> a + (b.areaM2 || 0), 0);
-    let meanFromBins = 0;
-    if (areaSum > 0) {
-      const wsum = choice.bins.reduce((a,b)=> a + b.bin * (b.areaM2 || 0), 0);
-      meanFromBins = wsum / areaSum;
-    } else {
-      const cntSum = choice.bins.reduce((a,b)=> a + b.count, 0);
-      const wsum = choice.bins.reduce((a,b)=> a + b.bin * b.count, 0);
-      meanFromBins = cntSum>0 ? (wsum / cntSum) : 0;
-    }
-
-    return { min: globalMin, max: globalMax, mean: meanFromBins, count: totalCount, totalAreaM2: totalArea, histogram: choice.bins } as any;
+    return {
+      min: globalMin,
+      max: globalMax,
+      mean: accurateMean, // Use the accurate mean from original data
+      count: totalCount,
+      totalAreaM2: totalArea,
+      histogram: mergedHistogram
+    } as any;
   }, []);
 
   // Convert histogram to area series (areaM2 already provided per bin)
@@ -289,11 +310,13 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
       const front = p?.frontOverlap ?? 80;
       const spacingForward = photoSpacingFor(polygonId, altForThisPoly, front, paramsMap);
 
+      const mode = (api as any)?.getAltitudeMode ? (api as any).getAltitudeMode() : 'legacy';
+      const minClr = (api as any)?.getMinClearance ? (api as any).getMinClearance() : 60;
       const path3D = build3DFlightPath(
         flightLines,
         tiles,
         lineSpacing,
-        altForThisPoly
+        { altitudeAGL: altForThisPoly, mode, minClearance: minClr }
       );
 
       const cameraPositions = sampleCameraPositionsOnFlightPath(path3D, spacingForward);
@@ -855,6 +878,38 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
           <label className="text-xs text-gray-600 block">Altitude AGL (m)<input className="w-full border rounded px-2 py-1 text-xs" type="number" value={altitude} onChange={e=>setAltitude(parseInt(e.target.value||'100'))} /></label>
           <label className="text-xs text-gray-600 block">Front overlap (%)<input className="w-full border rounded px-2 py-1 text-xs" type="number" min={0} max={95} value={frontOverlap} onChange={e=>setFrontOverlap(parseInt(e.target.value||'80'))} /></label>
             <label className="text-xs text-gray-600 block">Side overlap (%)<input className="w-full border rounded px-2 py-1 text-xs" type="number" min={0} max={95} value={sideOverlap} onChange={e=>setSideOverlap(parseInt(e.target.value||'70'))} /></label>
+          <label className="text-xs text-gray-600 block">
+            Altitude mode
+            <select
+              className="w-full border rounded px-2 py-1 text-xs mt-1"
+              value={altitudeModeUI}
+              onChange={(e)=>{
+                const m = (e.target.value as 'legacy'|'min-clearance');
+                setAltitudeModeUI(m);
+                const api = mapRef.current as any;
+                if (api?.setAltitudeMode) api.setAltitudeMode(m);
+                setTimeout(()=>{ compute(); }, 0);
+              }}
+            >
+              <option value="legacy">Legacy (highest ground + AGL)</option>
+              <option value="min-clearance">Min-clearance (lowest + AGL; enforce clearance)</option>
+            </select>
+          </label>
+          <label className="text-xs text-gray-600 block">Min clearance (m)
+            <input
+              className="w-full border rounded px-2 py-1 text-xs"
+              type="number"
+              min={0}
+              value={minClearanceUI}
+              onChange={(e)=>{
+                const v = Math.max(0, parseFloat(e.target.value||'60'));
+                setMinClearanceUI(v);
+                const api = mapRef.current as any;
+                if (api?.setMinClearance) api.setMinClearance(v);
+                setTimeout(()=>{ compute(); }, 0);
+              }}
+            />
+          </label>
           <label className="text-xs text-gray-600 block">Max tilt (deg)<input className="w-full border rounded px-2 py-1 text-xs" type="number" min={0} max={90} value={maxTiltDeg} onChange={e=>setMaxTiltDeg(Math.max(0, Math.min(90, parseFloat(e.target.value||'10'))))} /></label>
           <label className="text-xs text-gray-600 block">DEM zoom (tile level)<input className="w-full border rounded px-2 py-1 text-xs" type="number" min={8} max={16} value={zoom} onChange={e=>setZoom(Math.max(8, Math.min(16, parseInt(e.target.value||'14'))))} /></label>
           <label className="text-xs text-gray-600 block">Clip edge (m)<input className="w-full border rounded px-2 py-1 text-xs" type="number" min={0} value={clipInnerBufferM} onChange={e=>setClipInnerBufferM(Math.max(0, parseFloat(e.target.value||'0')))} /></label>
