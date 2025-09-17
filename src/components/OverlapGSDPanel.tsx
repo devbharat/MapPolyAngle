@@ -120,13 +120,13 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
   const [clipInnerBufferM, setClipInnerBufferM] = useState(0);
   const [maxTiltDeg, setMaxTiltDeg] = useState(30); // NEW: max allowable camera tilt (deg from vertical)
   // NEW: altitude strategy & min clearance (synced with map API if available)
-  const [altitudeModeUI, setAltitudeModeUI] = useState<'legacy' | 'min-clearance'>('min-clearance');
+  const [altitudeModeUI, setAltitudeModeUI] = useState<'legacy' | 'min-clearance'>('legacy');
   const [minClearanceUI, setMinClearanceUI] = useState<number>(60);
 
   // Sync initial values from map API
   React.useEffect(() => {
     const api = mapRef.current;
-    const mode = (api as any)?.getAltitudeMode ? (api as any).getAltitudeMode() : 'min-clearance';
+    const mode = (api as any)?.getAltitudeMode ? (api as any).getAltitudeMode() : 'legacy';
     const minc = (api as any)?.getMinClearance ? (api as any).getMinClearance() : 60;
     setAltitudeModeUI(mode);
     setMinClearanceUI(minc);
@@ -188,8 +188,9 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
     return groundHeight * (1 - frontOverlap / 100);
   }, [effectiveCameraForPolygon]);
 
-  // FIXED: Function to aggregate GSD statistics from multiple tiles
-  // Preserves accuracy and uses proper histogram merging instead of forced rebinning
+  // Accurate aggregation with tail trimming and fixed 8-bin histogram for display
+  const [tailAreaAcres, setTailAreaAcres] = useState<number>(1); // trim per side (acres)
+
   const aggregateGSDStats = useCallback((tileStats: GSDStats[]): GSDStats => {
     // Filter valid tile stats
     const valid = tileStats.filter(s => s && s.count > 0 && isFinite(s.min) && isFinite(s.max) && s.max > 0);
@@ -209,61 +210,56 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
 
     const accurateMean = totalCount > 0 ? weightedSum / totalCount : 0;
 
-    // Merge histograms intelligently without losing information
-    const mergeHistograms = (statsArray: GSDStats[]): Array<{ bin: number; count: number; areaM2: number }> => {
-      if (statsArray.length === 0) return [];
-      
-      // Find the range and determine appropriate binning
-      const span = globalMax - globalMin;
-      if (span <= 0) {
-        return [{ bin: globalMin, count: totalCount, areaM2: totalArea }];
+    // Merge histograms into 8 uniform bins across [globalMin, globalMax]
+    const span = globalMax - globalMin;
+    if (!(span > 0)) {
+      return { min: globalMin, max: globalMax, mean: accurateMean, count: totalCount, totalAreaM2: totalArea, histogram: [{ bin: globalMin, count: totalCount, areaM2: totalArea }] } as any;
+    }
+    const targetBins = 8;
+    const binSize = span / targetBins;
+    const bins = new Array<{ bin: number; count: number; areaM2: number }>(targetBins);
+    for (let i = 0; i < targetBins; i++) bins[i] = { bin: globalMin + (i + 0.5) * binSize, count: 0, areaM2: 0 };
+
+    for (const s of valid) {
+      if (!s.histogram || s.histogram.length === 0) continue;
+      for (const hb of s.histogram) {
+        if (!hb || hb.count === 0) continue;
+        let bi = Math.floor((hb.bin - globalMin) / binSize);
+        if (bi < 0) bi = 0; if (bi >= targetBins) bi = targetBins - 1;
+        bins[bi].count += hb.count;
+        bins[bi].areaM2 += (hb.areaM2 || 0);
       }
+    }
 
-      // Use adaptive binning: start with reasonable number of bins
-      const targetBins = Math.min(20, Math.max(5, Math.ceil(span / 0.01))); // 1cm minimum bin size
-      const binSize = span / targetBins;
-      
-      // Create bins
-      const bins = new Array<{ bin: number; count: number; areaM2: number }>(targetBins);
-      for (let i = 0; i < targetBins; i++) {
-        bins[i] = { 
-          bin: globalMin + (i + 0.5) * binSize, 
-          count: 0, 
-          areaM2: 0 
-        };
-      }
+    // Trim tails by area: each side at most tailAreaAcres
+    const ACRE_TO_M2 = 4046.8564224;
+    const tailAreaM2 = Math.max(0, (tailAreaAcres || 0) * ACRE_TO_M2);
+    const areaSum = bins.reduce((a,b)=> a + (b.areaM2 || 0), 0);
+    let minTrim = globalMin, maxTrim = globalMax;
+    if (areaSum > 0 && tailAreaM2 > 0 && tailAreaM2 * 2 < areaSum) {
+      // left trim
+      let cum = 0, i = 0;
+      for (; i < bins.length; i++) { const a = bins[i].areaM2 || 0; if (cum + a >= tailAreaM2) break; cum += a; }
+      if (i < bins.length) minTrim = bins[i].bin;
+      // right trim
+      cum = 0; let j = bins.length - 1;
+      for (; j >= 0; j--) { const a = bins[j].areaM2 || 0; if (cum + a >= tailAreaM2) break; cum += a; }
+      if (j >= 0) maxTrim = bins[j].bin;
+      if (!(maxTrim > minTrim)) { minTrim = globalMin; maxTrim = globalMax; }
+    }
 
-      // Aggregate data from all histograms
-      for (const s of statsArray) {
-        if (!s.histogram || s.histogram.length === 0) continue;
-        
-        for (const hb of s.histogram) {
-          if (!hb || hb.count === 0) continue;
-          
-          // Find appropriate bin for this histogram entry
-          let binIndex = Math.floor((hb.bin - globalMin) / binSize);
-          binIndex = Math.max(0, Math.min(targetBins - 1, binIndex));
-          
-          bins[binIndex].count += hb.count;
-          bins[binIndex].areaM2 += (hb.areaM2 || 0);
-        }
-      }
-
-      // Remove empty bins for cleaner display
-      return bins.filter(bin => bin.count > 0);
-    };
-
-    const mergedHistogram = mergeHistograms(valid);
+    // Remove completely empty bins for display cleanliness
+    const mergedHistogram = bins.filter(b => b.count > 0 || (b.areaM2 || 0) > 0);
 
     return {
-      min: globalMin,
-      max: globalMax,
-      mean: accurateMean, // Use the accurate mean from original data
+      min: minTrim,
+      max: maxTrim,
+      mean: accurateMean,
       count: totalCount,
       totalAreaM2: totalArea,
       histogram: mergedHistogram
     } as any;
-  }, []);
+  }, [tailAreaAcres]);
 
   // Convert histogram to area series (areaM2 already provided per bin)
   const convertHistogramToArea = useCallback((stats: GSDStats): { bin: number; areaM2: number }[] => {
@@ -452,6 +448,8 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
       // Full recompute - clear existing overlays
       if (globalRunIdRef.current) clearRunOverlays(map, globalRunIdRef.current);
       globalRunIdRef.current = `${now}`;
+      // Start from a clean stats slate so results reflect only current geometry
+      perPolyTileStatsRef.current.clear();
     }
     const runId = globalRunIdRef.current ?? `${now}`; // first run fallback
     if (!globalRunIdRef.current) globalRunIdRef.current = runId;
@@ -668,7 +666,9 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
     // We no longer gate on MapFlightDirection's polygonTiles since GSD panel fetches its own tiles.
     if (ready && havePolys && haveLines) {
       autoTriesRef.current = 0;
-      compute(opts?.polygonId ? { polygonId: opts.polygonId } : undefined);
+      // Recompute from scratch; defer one tick for state flush after edits/deletes
+      // Always defer one tick to allow React state updates (lines/tiles) to flush
+      setTimeout(()=> compute(), 0);
       return;
     }
     if (autoTriesRef.current < 15) {
@@ -913,6 +913,16 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
           <label className="text-xs text-gray-600 block">Max tilt (deg)<input className="w-full border rounded px-2 py-1 text-xs" type="number" min={0} max={90} value={maxTiltDeg} onChange={e=>setMaxTiltDeg(Math.max(0, Math.min(90, parseFloat(e.target.value||'10'))))} /></label>
           <label className="text-xs text-gray-600 block">DEM zoom (tile level)<input className="w-full border rounded px-2 py-1 text-xs" type="number" min={8} max={16} value={zoom} onChange={e=>setZoom(Math.max(8, Math.min(16, parseInt(e.target.value||'14'))))} /></label>
           <label className="text-xs text-gray-600 block">Clip edge (m)<input className="w-full border rounded px-2 py-1 text-xs" type="number" min={0} value={clipInnerBufferM} onChange={e=>setClipInnerBufferM(Math.max(0, parseFloat(e.target.value||'0')))} /></label>
+          <label className="text-xs text-gray-600 block">Trim tails (acres per side)
+            <input
+              className="w-full border rounded px-2 py-1 text-xs"
+              type="number"
+              min={0}
+              step={0.1}
+              value={tailAreaAcres}
+              onChange={(e)=>{ const v = Math.max(0, parseFloat(e.target.value || '1')); setTailAreaAcres(v); setTimeout(()=>{ compute(); }, 0); }}
+            />
+          </label>
           {autoGenerate && <div className="text-xs text-gray-500">{parsePosesMeters()?.length || 0} poses generated</div>}
         </div>
       </div>

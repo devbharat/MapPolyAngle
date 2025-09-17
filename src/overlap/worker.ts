@@ -473,7 +473,7 @@ self.onmessage = (ev: MessageEvent<Msg>) => {
   }
 
   // Enforce minimum overlap for GSD validity
-  const MIN_OVERLAP_FOR_GSD = 3;
+  const MIN_OVERLAP_FOR_GSD = 4;
   for (let t=0;t<activeIdxs.length;t++){ const idx=activeIdxs[t]; if (overlap[idx]>0 && overlap[idx] < MIN_OVERLAP_FOR_GSD){ overlap[idx]=0; gsdMin[idx]=Number.POSITIVE_INFINITY; } }
 
   // Union summaries

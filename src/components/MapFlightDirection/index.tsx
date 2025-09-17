@@ -126,7 +126,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
     // NEW: Suppress per‑polygon flight line update events during batched imports
     const suppressFlightLineEventsRef = React.useRef(false);
     // NEW: Altitude mode + minimum clearance configuration (global)
-    const [altitudeMode, setAltitudeMode] = useState<'legacy' | 'min-clearance'>('min-clearance');
+    const [altitudeMode, setAltitudeMode] = useState<'legacy' | 'min-clearance'>('legacy');
     const [minClearanceM, setMinClearanceM] = useState<number>(60);
 
     React.useEffect(() => { polygonParamsRef.current = polygonParams; }, [polygonParams]);
@@ -358,8 +358,14 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
             return next;
           });
 
-          // Trigger GSD recompute for remaining polygons instead of clearing everything
-          onFlightLinesUpdated?.('__all__');
+          // Trigger GSD recompute for remaining polygons after state flush
+          setTimeout(() => onFlightLinesUpdated?.('__all__'), 0);
+          // If no polygons left at all, clear GSD overlays entirely
+          try {
+            const coll = (drawRef.current as any)?.getAll?.();
+            const hasAny = Array.isArray(coll?.features) && coll.features.some((f:any)=>f?.geometry?.type==='Polygon');
+            if (!hasAny) onClearGSD?.();
+          } catch {}
         }
       });
     }, [cancelAnalysis, debouncedAnalysisComplete, onFlightLinesUpdated]);
