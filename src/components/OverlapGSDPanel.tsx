@@ -141,14 +141,14 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
   // NEW: altitude strategy & min clearance & turn extension (synced with map API if available)
   const [altitudeModeUI, setAltitudeModeUI] = useState<'legacy' | 'min-clearance'>('legacy');
   const [minClearanceUI, setMinClearanceUI] = useState<number>(60);
-  const [turnExtendUI, setTurnExtendUI] = useState<number>(80);
+  const [turnExtendUI, setTurnExtendUI] = useState<number>(96);
 
   // Sync initial values from map API
   React.useEffect(() => {
     const api = mapRef.current;
     const mode = (api as any)?.getAltitudeMode ? (api as any).getAltitudeMode() : 'legacy';
     const minc = (api as any)?.getMinClearance ? (api as any).getMinClearance() : 60;
-    const ext = (api as any)?.getTurnExtend ? (api as any).getTurnExtend() : 80;
+    const ext = (api as any)?.getTurnExtend ? (api as any).getTurnExtend() : 96;
     setAltitudeModeUI(mode);
     setMinClearanceUI(minc);
     setTurnExtendUI(ext);
@@ -330,11 +330,12 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
 
       const mode = (api as any)?.getAltitudeMode ? (api as any).getAltitudeMode() : 'legacy';
       const minClr = (api as any)?.getMinClearance ? (api as any).getMinClearance() : 60;
+      const turnExtend = (api as any)?.getTurnExtend ? Math.max(0, (api as any).getTurnExtend()) : turnExtendUI;
       const path3D = build3DFlightPath(
         flightLines,
         tiles,
         lineSpacing,
-        { altitudeAGL: altForThisPoly, mode, minClearance: minClr }
+        { altitudeAGL: altForThisPoly, mode, minClearance: minClr, turnExtendM: turnExtend }
       );
 
       const cameraPositions = sampleCameraPositionsOnFlightPath(path3D, spacingForward, { includeTurns: false });
@@ -362,7 +363,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
       });
     }
     return poses;
-  }, [getPerPolygonParams, mapRef, photoSpacingFor]);
+  }, [getPerPolygonParams, mapRef, photoSpacingFor, turnExtendUI]);
 
   const parsePosesMeters = useCallback((): PoseMeters[] | null => {
     const api = mapRef.current;
@@ -1124,7 +1125,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
               min={0}
               value={turnExtendUI}
               onChange={(e)=>{
-                const v = Math.max(0, parseFloat(e.target.value||'80'));
+                const v = Math.max(0, parseFloat(e.target.value||'96'));
                 setTurnExtendUI(v);
                 const api = mapRef.current as any;
                 if (api?.setTurnExtend) api.setTurnExtend(v);

@@ -131,7 +131,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
     // NEW: Altitude mode + minimum clearance configuration (global)
     const [altitudeMode, setAltitudeMode] = useState<'legacy' | 'min-clearance'>('legacy');
     const [minClearanceM, setMinClearanceM] = useState<number>(60);
-    const [turnExtendM, setTurnExtendM] = useState<number>(80);
+    const [turnExtendM, setTurnExtendM] = useState<number>(96);
 
     React.useEffect(() => { polygonParamsRef.current = polygonParams; }, [polygonParams]);
     React.useEffect(() => { bearingOverridesRef.current = bearingOverrides; }, [bearingOverrides]);
@@ -768,7 +768,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           const lineSpacing = flEntry?.lineSpacing ?? imported.items[idx]?.lineSpacingM ?? 25;
           const altitudeAGL = polygonsToUpdate.get(polygonId)?.params.altitudeAGL ?? imported.items[idx]?.altitudeAGL ?? 100;
           if (deckOverlayRef.current && flEntry?.flightLines?.length) {
-            const path3d = build3DFlightPath(flEntry.flightLines, tiles, lineSpacing, { altitudeAGL, mode: altitudeMode, minClearance: minClearanceM, turnExtendM: 80 });
+            const path3d = build3DFlightPath(flEntry.flightLines, tiles, lineSpacing, { altitudeAGL, mode: altitudeMode, minClearance: minClearanceM, turnExtendM });
             update3DPathLayer(deckOverlayRef.current, polygonId, path3d, setDeckLayers);
           }
         }
@@ -978,7 +978,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       });
       const tiles = polygonTiles.get(polygonId) || [];
       if (deckOverlayRef.current && fl.flightLines.length > 0) {
-        const path3d = build3DFlightPath(fl.flightLines, tiles, fl.lineSpacing, { altitudeAGL: params.altitudeAGL, mode: altitudeMode, minClearance: minClearanceM, turnExtendM: 80 });
+        const path3d = build3DFlightPath(fl.flightLines, tiles, fl.lineSpacing, { altitudeAGL: params.altitudeAGL, mode: altitudeMode, minClearance: minClearanceM, turnExtendM });
         update3DPathLayer(deckOverlayRef.current, polygonId, path3d, setDeckLayers);
       }
       console.log(`✅ Restored file direction: ${original.bearingDeg}° bearing, ${original.lineSpacingM}m spacing`);
