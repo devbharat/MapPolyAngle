@@ -116,7 +116,7 @@ export function addFlightLinesForPolygon(
     // Update paint properties if needed
     map.setPaintProperty(layerId, 'line-color', getLineColor(quality));
     map.setPaintProperty(layerId, 'line-opacity', 0.8);
-    map.setPaintProperty(layerId, 'line-width', 1);
+    map.setPaintProperty(layerId, 'line-width', 0.5);
   } else {
     map.addLayer({
       id: layerId,
@@ -128,7 +128,7 @@ export function addFlightLinesForPolygon(
       },
       paint: {
         'line-color': getLineColor(quality),
-        'line-width': 1,
+        'line-width': 0.5,
         'line-opacity': 0.8,
       },
     });

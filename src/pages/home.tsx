@@ -352,13 +352,7 @@ export default function Home() {
                             </span>
                           </div>
                           <div className="flex items-center space-x-2">
-                            {/* Quality Indicator */}
-                            {result.fitQuality && (
-                              <div className={`flex items-center space-x-1 px-2 py-0.5 rounded-full text-xs font-medium ${getQualityIndicator(result.fitQuality).bgColor} ${getQualityIndicator(result.fitQuality).color}`}>
-                                <span>{getQualityIndicator(result.fitQuality).icon}</span>
-                                <span>{getQualityIndicator(result.fitQuality).label}</span>
-                              </div>
-                            )}
+                            {/* Fit quality removed */}
                             <Button 
                               size="sm" 
                               variant="ghost" 
@@ -407,66 +401,7 @@ export default function Home() {
                           </div>
                         )}
                         
-                        {/* Secondary Metrics */}
-                        <div className="space-y-1 text-xs">
-                          <div className="flex justify-between items-center">
-                            <span className="text-gray-600">Terrain Aspect:</span>
-                            <span className="font-mono font-medium">{result.aspectDeg.toFixed(1)}°</span>
-                          </div>
-                          
-                          <div className="flex justify-between items-center">
-                            <span className="text-gray-600">Sample Points:</span>
-                            <span className="font-mono font-medium">{result.samples.toLocaleString()}</span>
-                          </div>
-
-                          <div className="flex justify-between items-center">
-                            <span className="text-gray-600">Terrain Zoom:</span>
-                            <span className="font-mono font-medium">
-                              z{polygonResult.terrainZoom}
-                              {polygonResult.terrainZoom === 15 && <span className="text-green-600 ml-1">⚡</span>}
-                              {polygonResult.terrainZoom === 12 && <span className="text-orange-600 ml-1">🏃</span>}
-                            </span>
-                          </div>
-
-                          {/* Flight Altitude Information */}
-                          {result.maxElevation !== undefined && (
-                            <>
-                              <div className="flex justify-between items-center">
-                                <span className="text-gray-600">Max Terrain:</span>
-                                <span className="font-mono font-medium">{result.maxElevation.toFixed(1)}m</span>
-                              </div>
-                              <div className="flex justify-between items-center">
-                                <span className="text-gray-600">Flight Altitude:</span>
-                                <span className="font-mono font-medium text-blue-600">
-                                  {(result.maxElevation + 100).toFixed(1)}m
-                                  <span className="text-blue-600 ml-1">✈️</span>
-                                </span>
-                              </div>
-                            </>
-                          )}
-
-                          {/* Advanced Metrics */}
-                          {result.rSquared !== undefined && (
-                            <div className="flex justify-between items-center">
-                              <span className="text-gray-600">R² (fit accuracy):</span>
-                              <span className="font-mono font-medium">{result.rSquared.toFixed(3)}</span>
-                            </div>
-                          )}
-
-                          {result.rmse !== undefined && (
-                            <div className="flex justify-between items-center">
-                              <span className="text-gray-600">RMSE:</span>
-                              <span className="font-mono font-medium">{result.rmse.toFixed(1)}m</span>
-                            </div>
-                          )}
-
-                          {result.slopeMagnitude !== undefined && (
-                            <div className="flex justify-between items-center">
-                              <span className="text-gray-600">Terrain Slope:</span>
-                              <span className="font-mono font-medium">{(result.slopeMagnitude * 100).toFixed(1)}%</span>
-                            </div>
-                          )}
-                        </div>
+                        {/* Secondary metrics removed (Aspect, Samples, Zoom, Altitudes, R², RMSE, Slope) */}
                       </div>
                     );
                   })}
@@ -486,12 +421,8 @@ export default function Home() {
                       <span>3D Plane Fitting</span>
                     </div>
                   </div>
-                  <div className="flex gap-2">
-                    <Button size="sm" variant="outline" className="h-7 px-2 text-xs flex-1"
-                            onClick={()=>{ if(paramsDialog.polygonId){ /* nothing */ }}}
-                            disabled={!!paramsDialog.open}>Queue Active</Button>
-                  </div>
-                  {selectedPolygonId && (
+                  {/* Removed Queue Active button */}
+                  {selectedPolygonId && polygonResults.some(r => r.polygonId === selectedPolygonId) && (
                     <div className="flex gap-2">
                       <Button size="sm" className="h-7 px-2 text-xs flex-1"
                               onClick={()=> mapRef.current?.optimizePolygonDirection?.(selectedPolygonId)}

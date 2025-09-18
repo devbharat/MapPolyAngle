@@ -177,10 +177,10 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
   }, [cameraText, useOverrideCamera]);
 
   const effectiveCameraForPolygon = useCallback((polygonId: string, paramsMap: any): CameraModel => {
-    const override = parseCameraOverride();
-    if (override) return override;
     const p = paramsMap[polygonId];
     if (p?.cameraKey && CAMERA_REGISTRY[p.cameraKey]) return CAMERA_REGISTRY[p.cameraKey];
+    const override = parseCameraOverride();
+    if (override) return override;
     return SONY_RX1R2; // fallback
   }, [parseCameraOverride, CAMERA_REGISTRY]);
 
@@ -626,12 +626,14 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
         const uniquePoseIds = new Set<number>();
         for (const ts of allTileStats) for (let i=0;i<ts.hitPoseIds.length;i++) uniquePoseIds.add(ts.hitPoseIds[i]);
         // Determine camera label used
+        const params = (paramsMap as any)[polygonId];
         let cameraLabel: string;
-        if (overrideCam) {
+        if (params?.cameraKey && CAMERA_REGISTRY[params.cameraKey]) {
+          cameraLabel = params.cameraKey;
+        } else if (overrideCam) {
           cameraLabel = overrideCamKey ? `Override (${overrideCamKey})` : 'Override';
         } else {
-          const params = (paramsMap as any)[polygonId];
-          cameraLabel = params?.cameraKey || 'SONY_RX1R2';
+          cameraLabel = 'SONY_RX1R2';
         }
         aggregatedPerPolygon.set(polygonId, { polygonId, gsdStats: aggregatedGsdStats, areaAcres, imageCount: uniquePoseIds.size, cameraLabel });
       });
@@ -790,6 +792,8 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
       }
     };
     reader.readAsText(file);
+    // Allow selecting the same file again by resetting the input element
+    e.target.value = "";
   }, [mapRef, onPosesImported, CAMERA_REGISTRY]);
 
   React.useEffect(()=>{
@@ -811,6 +815,13 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
 
   return (
     <div className="backdrop-blur-md bg-white/95 rounded-md border p-3 space-y-3">
+      <input
+        ref={poseFileRef}
+        type="file"
+        accept="application/json,.json"
+        className="hidden"
+        onChange={handlePoseFileChange}
+      />
       <div className="flex items-center justify-between">
         <h3 className="text-sm font-medium text-gray-900">GSD Analysis</h3>
       </div>
@@ -892,19 +903,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
 
       <div className="grid grid-cols-1 gap-2">
         <div className="space-y-2">
-          <div className="text-xs font-medium">Poses (optional)</div>
-          <div className="flex items-center gap-2">
-            <button className="h-8 px-2 rounded border text-xs" onClick={()=>poseFileRef.current?.click()} title="Import camera poses from JSON" id="poses-json-input-proxy">Import poses (JSON)</button>
-            <input ref={poseFileRef} type="file" accept=".json,application/json" onChange={(e)=>{ handlePoseFileChange(e); }} style={{ display:'none' }} />
-            <label className="text-xs flex items-center gap-1"><input type="checkbox" checked={autoGenerate} onChange={e=>setAutoGenerate(e.target.checked)} />Auto-generate</label>
-          </div>
-          {!autoGenerate && (<div className="text-[11px] text-gray-600">{importedPoses.length ? `${importedPoses.length.toLocaleString()} poses imported` : 'No poses imported yet'}</div>)}
-        </div>
-        <div className="space-y-2">
           <div className="text-xs font-medium mb-1">Flight Parameters</div>
-          <label className="text-xs text-gray-600 block">Altitude AGL (m)<input className="w-full border rounded px-2 py-1 text-xs" type="number" value={altitude} onChange={e=>setAltitude(parseInt(e.target.value||'100'))} /></label>
-          <label className="text-xs text-gray-600 block">Front overlap (%)<input className="w-full border rounded px-2 py-1 text-xs" type="number" min={0} max={95} value={frontOverlap} onChange={e=>setFrontOverlap(parseInt(e.target.value||'80'))} /></label>
-            <label className="text-xs text-gray-600 block">Side overlap (%)<input className="w-full border rounded px-2 py-1 text-xs" type="number" min={0} max={95} value={sideOverlap} onChange={e=>setSideOverlap(parseInt(e.target.value||'70'))} /></label>
           <label className="text-xs text-gray-600 block">
             Altitude mode
             <select
@@ -953,25 +952,12 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
             />
           </label>
           <label className="text-xs text-gray-600 block">Max tilt (deg)<input className="w-full border rounded px-2 py-1 text-xs" type="number" min={0} max={90} value={maxTiltDeg} onChange={e=>setMaxTiltDeg(Math.max(0, Math.min(90, parseFloat(e.target.value||'10'))))} /></label>
-          <label className="text-xs text-gray-600 block">DEM zoom (tile level)<input className="w-full border rounded px-2 py-1 text-xs" type="number" min={8} max={16} value={zoom} onChange={e=>setZoom(Math.max(8, Math.min(16, parseInt(e.target.value||'14'))))} /></label>
-          <label className="text-xs text-gray-600 block">Clip edge (m)<input className="w-full border rounded px-2 py-1 text-xs" type="number" min={0} value={clipInnerBufferM} onChange={e=>setClipInnerBufferM(Math.max(0, parseFloat(e.target.value||'0')))} /></label>
-          <label className="text-xs text-gray-600 block">Trim tails (acres per side)
-            <input
-              className="w-full border rounded px-2 py-1 text-xs"
-              type="number"
-              min={0}
-              step={0.1}
-              value={tailAreaAcres}
-              onChange={(e)=>{ const v = Math.max(0, parseFloat(e.target.value || '1')); setTailAreaAcres(v); setTimeout(()=>{ compute(); }, 0); }}
-            />
-          </label>
           {autoGenerate && <div className="text-xs text-gray-500">{parsePosesMeters()?.length || 0} poses generated</div>}
         </div>
       </div>
 
       <div className="flex gap-2 items-center">
-        <button onClick={() => compute()} disabled={running} className="h-8 px-2 rounded bg-blue-600 text-white text-xs disabled:opacity-50">{running ? 'Computing…' : 'Manual Compute'}</button>
-        <button onClick={clear} className="h-8 px-2 rounded border text-xs">Clear overlay</button>
+        <button onClick={() => compute()} disabled={running} className="h-8 px-2 rounded bg-blue-600 text-white text-xs disabled:opacity-50">{running ? 'Computing…' : 'Recompute GSD'}</button>
       </div>
 
       <p className="text-[11px] text-gray-500">Automatic GSD analysis runs when polygons are created or flight parameters change.</p>
