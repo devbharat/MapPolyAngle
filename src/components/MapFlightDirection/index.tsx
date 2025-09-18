@@ -54,6 +54,7 @@ interface Props {
   onError?: (error: string, polygonId?: string) => void;
   onFlightLinesUpdated?: (changed: string | '__all__') => void;
   onClearGSD?: () => void;
+  onPolygonSelected?: (polygonId: string | null) => void;
 }
 
 export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>(
@@ -70,6 +71,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       onError,
       onFlightLinesUpdated,
       onClearGSD,
+      onPolygonSelected,
     },
     ref
   ) => {
@@ -125,6 +127,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
     const polygonResultsRef = React.useRef(polygonResults);
     // NEW: Suppress per‑polygon flight line update events during batched imports
     const suppressFlightLineEventsRef = React.useRef(false);
+    const pendingOptimizeRef = React.useRef<Set<string>>(new Set());
     // NEW: Altitude mode + minimum clearance configuration (global)
     const [altitudeMode, setAltitudeMode] = useState<'legacy' | 'min-clearance'>('legacy');
     const [minClearanceM, setMinClearanceM] = useState<number>(60);
@@ -143,6 +146,113 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       }, 0);
       return timeoutId;
     }, [onAnalysisComplete]);
+
+    const applyPolygonParams = useCallback((polygonId: string, params: PolygonParams, opts?: { skipEvent?: boolean; skipQueue?: boolean }) => {
+      setPolygonParams((prev) => {
+        const next = new Map(prev);
+        next.set(polygonId, params);
+        return next;
+      });
+
+      const res = polygonResultsRef.current.get(polygonId);
+      const tiles = polygonTilesRef.current.get(polygonId) || [];
+      if (!res || !mapRef.current) return;
+
+      const cameraKey = (params as any).cameraKey;
+      const camera = cameraKey ? (CAMERA_REGISTRY as any)[cameraKey] || DEFAULT_CAMERA : DEFAULT_CAMERA;
+      const defaultSpacing = calculateFlightLineSpacing(camera, params.altitudeAGL, params.sideOverlap);
+
+      const customBearing = params.useCustomBearing && Number.isFinite(params.customBearingDeg)
+        ? (((params.customBearingDeg ?? 0) % 360) + 360) % 360
+        : undefined;
+
+      let override = bearingOverridesRef.current.get(polygonId);
+
+      if (customBearing !== undefined) {
+        const entry = { bearingDeg: customBearing, lineSpacingM: defaultSpacing, source: 'user' as const };
+        setBearingOverrides((prev) => {
+          const next = new Map(prev);
+          next.set(polygonId, entry);
+          return next;
+        });
+        const nextOverrides = new Map(bearingOverridesRef.current);
+        nextOverrides.set(polygonId, entry);
+        bearingOverridesRef.current = nextOverrides;
+        override = entry;
+      } else if (override?.source === 'user') {
+        setBearingOverrides((prev) => {
+          const next = new Map(prev);
+          next.delete(polygonId);
+          return next;
+        });
+        const nextOverrides = new Map(bearingOverridesRef.current);
+        nextOverrides.delete(polygonId);
+        bearingOverridesRef.current = nextOverrides;
+        override = bearingOverridesRef.current.get(polygonId);
+      }
+
+      const bearingDeg = override ? override.bearingDeg : res.result.contourDirDeg;
+      const spacing = override?.lineSpacingM ?? defaultSpacing;
+
+      removeFlightLinesForPolygon(mapRef.current, polygonId);
+      const fl = addFlightLinesForPolygon(
+        mapRef.current,
+        polygonId,
+        res.polygon.coordinates,
+        bearingDeg,
+        spacing,
+        res.result.fitQuality
+      );
+
+      setPolygonFlightLines((prev) => {
+        const next = new Map(prev);
+        next.set(polygonId, { ...fl, altitudeAGL: params.altitudeAGL });
+        return next;
+      });
+
+      if (!opts?.skipEvent && !suppressFlightLineEventsRef.current) {
+        onFlightLinesUpdated?.(polygonId);
+      }
+
+      if (deckOverlayRef.current && fl.flightLines.length > 0) {
+        const path3d = build3DFlightPath(fl.flightLines, tiles, fl.lineSpacing, { altitudeAGL: params.altitudeAGL, mode: altitudeMode, minClearance: minClearanceM, turnExtendM });
+        update3DPathLayer(deckOverlayRef.current, polygonId, path3d, setDeckLayers);
+        const spacingForward = forwardSpacing(camera, params.altitudeAGL, params.frontOverlap);
+        const samples = sampleCameraPositionsOnFlightPath(path3d, spacingForward, { includeTurns: false });
+        const zOffset = 1;
+        const ring = res.polygon.coordinates as [number,number][];
+        const inside = (lng:number,lat:number,ring:[number,number][]) => {
+          let ins=false; for(let i=0,j=ring.length-1;i<ring.length;j=i++){
+            const xi=ring[i][0], yi=ring[i][1], xj=ring[j][0], yj=ring[j][1];
+            const intersect=((yi>lat)!==(yj>lat)) && (lng < (xj-xi)*(lat-yi)/(yj-yi)+xi); if(intersect) ins=!ins;
+          } return ins;
+        };
+        const positions: [number, number, number][] = samples
+          .filter(([lng,lat]) => inside(lng,lat,ring))
+          .map(([lng,lat,alt]) => [lng,lat,alt + zOffset]);
+        update3DTriggerPointsLayer(deckOverlayRef.current, polygonId, positions, setDeckLayers);
+      }
+
+      if (opts?.skipQueue) return;
+
+      setPendingParamPolygons(prev => {
+        const rest = prev.filter(id => id !== polygonId);
+        if (!bulkApplyRef.current && rest.length > 0) {
+          const nextId = rest[0];
+          const nextRes = polygonResultsRef.current.get(nextId);
+          if (nextRes) {
+            setTimeout(() => onRequestParams?.(nextId, nextRes.polygon.coordinates), 0);
+          } else {
+            const draw = drawRef.current as any;
+            const f = draw?.get?.(nextId);
+            if (f?.geometry?.type === 'Polygon') setTimeout(() => onRequestParams?.(nextId, f.geometry.coordinates[0]), 0);
+          }
+        } else if (rest.length === 0) {
+          bulkPresetParamsRef.current = null;
+        }
+        return rest;
+      });
+    }, [polygonResults, polygonTiles, onFlightLinesUpdated, altitudeMode, minClearanceM, turnExtendM]);
 
     // Rebuild 3D paths when altitude mode, minimum clearance, or turn extension changes
     useEffect(() => {
@@ -289,8 +399,16 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
             .map(([lng,lat,alt]) => [lng,lat,alt + zOffset]);
           update3DTriggerPointsLayer(deckOverlayRef.current, result.polygonId, positions, setDeckLayers);
         }
+
+        if (pendingOptimizeRef.current.has(result.polygonId)) {
+          pendingOptimizeRef.current.delete(result.polygonId);
+          const currentParams = polygonParamsRef.current.get(result.polygonId) ?? { altitudeAGL: 100, frontOverlap: 80, sideOverlap: 70 };
+          const paramsToApply: PolygonParams = { ...currentParams, useCustomBearing: false };
+          if ('customBearingDeg' in paramsToApply) delete (paramsToApply as any).customBearingDeg;
+          applyPolygonParams(result.polygonId, paramsToApply, { skipQueue: true });
+        }
       },
-      [debouncedAnalysisComplete, onFlightLinesUpdated, onRequestParams, altitudeMode, minClearanceM]
+      [debouncedAnalysisComplete, onFlightLinesUpdated, onRequestParams, altitudeMode, minClearanceM, applyPolygonParams]
     );
 
     const memoizedOnAnalysisStart = useCallback((polygonId: string) => {
@@ -401,17 +519,21 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           try {
             const feats = Array.isArray(e?.features) ? e.features : [];
             const f = feats.find((f: any) => f?.geometry?.type === 'Polygon');
-            if (!f) return;
+            if (!f) {
+              setTimeout(() => onPolygonSelected?.(null), 0);
+              return;
+            }
             const pid = f.id as string;
             const ring = (f.geometry?.coordinates?.[0]) as [number, number][] | undefined;
             if (pid && ring && ring.length >= 4) {
               // Defer to avoid selection-change re-entrancy
               setTimeout(()=> onRequestParams?.(pid, ring), 0);
+              setTimeout(() => onPolygonSelected?.(pid), 0);
             }
           } catch {}
         });
       },
-      [handleDrawCreate, handleDrawUpdate, handleDrawDelete]
+      [handleDrawCreate, handleDrawUpdate, handleDrawDelete, onRequestParams, onPolygonSelected]
     );
 
     useMapInitialization({
@@ -751,84 +873,6 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       };
     }, [importKmlFromText, onError]);
 
-    // ---------- Imperative API ----------
-    const applyPolygonParams = useCallback((polygonId: string, params: PolygonParams, opts?: { skipEvent?: boolean; skipQueue?: boolean }) => {
-      setPolygonParams((prev) => {
-        const next = new Map(prev);
-        next.set(polygonId, params);
-        return next;
-      });
-
-      const res = polygonResults.get(polygonId);
-      const tiles = polygonTiles.get(polygonId) || [];
-      if (!res || !mapRef.current) return;
-
-      const override = bearingOverridesRef.current.get(polygonId);
-      const bearingDeg = override ? override.bearingDeg : res.result.contourDirDeg;
-      const camera = (params as any).cameraKey ? CAMERA_REGISTRY[(params as any).cameraKey] || DEFAULT_CAMERA : DEFAULT_CAMERA;
-      // When user edits params, always recompute spacing from current side overlap/altitude
-      const spacing = calculateFlightLineSpacing(camera, params.altitudeAGL, params.sideOverlap);
-
-      removeFlightLinesForPolygon(mapRef.current, polygonId);
-      const fl = addFlightLinesForPolygon(
-        mapRef.current,
-        polygonId,
-        res.polygon.coordinates,
-        bearingDeg,
-        spacing,
-        res.result.fitQuality
-      );
-
-      setPolygonFlightLines((prev) => {
-        const next = new Map(prev);
-        next.set(polygonId, { ...fl, altitudeAGL: params.altitudeAGL });
-        return next;
-      });
-
-      if (!opts?.skipEvent && !suppressFlightLineEventsRef.current) {
-        onFlightLinesUpdated?.(polygonId);
-      }
-
-      if (deckOverlayRef.current && fl.flightLines.length > 0) {
-        const path3d = build3DFlightPath(fl.flightLines, tiles, fl.lineSpacing, { altitudeAGL: params.altitudeAGL, mode: altitudeMode, minClearance: minClearanceM, turnExtendM });
-        update3DPathLayer(deckOverlayRef.current, polygonId, path3d, setDeckLayers);
-        const spacingForward = forwardSpacing(camera, params.altitudeAGL, params.frontOverlap);
-        const samples = sampleCameraPositionsOnFlightPath(path3d, spacingForward, { includeTurns: false });
-        const zOffset = 1;
-        const ring = res.polygon.coordinates as [number,number][];
-        const inside = (lng:number,lat:number,ring:[number,number][]) => {
-          let ins=false; for(let i=0,j=ring.length-1;i<ring.length;j=i++){
-            const xi=ring[i][0], yi=ring[i][1], xj=ring[j][0], yj=ring[j][1];
-            const intersect=((yi>lat)!==(yj>lat)) && (lng < (xj-xi)*(lat-yi)/(yj-yi)+xi); if(intersect) ins=!ins;
-          } return ins;
-        };
-        const positions: [number, number, number][] = samples
-          .filter(([lng,lat]) => inside(lng,lat,ring))
-          .map(([lng,lat,alt]) => [lng,lat,alt + zOffset]);
-        update3DTriggerPointsLayer(deckOverlayRef.current, polygonId, positions, setDeckLayers);
-      }
-
-      if (opts?.skipQueue) return; // bulk path; do not touch queue
-
-      setPendingParamPolygons(prev => {
-        const rest = prev.filter(id => id !== polygonId);
-        if (!bulkApplyRef.current && rest.length > 0) {
-          const nextId = rest[0];
-          const nextRes = polygonResultsRef.current.get(nextId);
-          if (nextRes) {
-            setTimeout(() => onRequestParams?.(nextId, nextRes.polygon.coordinates), 0);
-          } else {
-            const draw = drawRef.current as any;
-            const f = draw?.get?.(nextId);
-            if (f?.geometry?.type === 'Polygon') setTimeout(() => onRequestParams?.(nextId, f.geometry.coordinates[0]), 0);
-          }
-        } else if (rest.length === 0) {
-          bulkPresetParamsRef.current = null;
-        }
-        return rest;
-      });
-    }, [polygonResults, polygonTiles, onFlightLinesUpdated]);
-
     // NEW: Apply same params to all queued polygons (bulk "Apply All")
     const applyParamsToAllPending = useCallback((params: PolygonParams) => {
       const queueSnapshot = [...pendingParamPolygons];
@@ -866,18 +910,28 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       });
       bearingOverridesRef.current = new Map(bearingOverridesRef.current);
       bearingOverridesRef.current.delete(polygonId);
-      const hasResults = polygonResults.has(polygonId);
-      if (!hasResults) {
-        console.log(`⚡ No terrain analysis yet for polygon ${polygonId}, running analysis first...`);
+      const currentParams = polygonParamsRef.current.get(polygonId) ?? { altitudeAGL: 100, frontOverlap: 80, sideOverlap: 70 };
+      const params: PolygonParams = { ...currentParams, useCustomBearing: false };
+      if ('customBearingDeg' in params) delete (params as any).customBearingDeg;
+
+      const result = polygonResultsRef.current.get(polygonId);
+      if (!result) {
+        console.log(`⚡ No terrain analysis yet for polygon ${polygonId}, queueing optimization after analysis...`);
+        pendingOptimizeRef.current.add(polygonId);
+        setPolygonParams((prev) => {
+          const next = new Map(prev);
+          next.set(polygonId, params);
+          return next;
+        });
         const draw = drawRef.current as any;
         const f = draw?.get?.(polygonId);
         if (f?.geometry?.type === 'Polygon') analyzePolygon(polygonId, f);
         return;
       }
-      const params = polygonParamsRef.current.get(polygonId) ?? { altitudeAGL: 100, frontOverlap: 80, sideOverlap: 70 };
+
       console.log(`✅ Applying terrain-optimal direction for polygon ${polygonId}`);
       applyPolygonParams(polygonId, params);
-    }, [polygonResults, applyPolygonParams, analyzePolygon]);
+    }, [applyPolygonParams, analyzePolygon]);
 
     // RESTORED: revertPolygonToImportedDirection
     const revertPolygonToImportedDirection = useCallback((polygonId: string) => {
@@ -892,7 +946,9 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       });
       bearingOverridesRef.current = new Map(bearingOverridesRef.current);
       bearingOverridesRef.current.set(polygonId, { bearingDeg: original.bearingDeg, lineSpacingM: original.lineSpacingM, source: 'wingtra' });
-      const params = polygonParams.get(polygonId) ?? { altitudeAGL: 100, frontOverlap: 80, sideOverlap: 70 };
+      const currentParams = polygonParams.get(polygonId) ?? { altitudeAGL: 100, frontOverlap: 80, sideOverlap: 70 };
+      const params: PolygonParams = { ...currentParams, useCustomBearing: false };
+      if ('customBearingDeg' in params) delete (params as any).customBearingDeg;
       removeFlightLinesForPolygon(mapRef.current, polygonId);
       const fl = addFlightLinesForPolygon(
         mapRef.current,

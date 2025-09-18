@@ -3,14 +3,15 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Select, SelectTrigger, SelectContent, SelectItem, SelectValue } from "@/components/ui/select";
 import { SONY_RX1R2, DJI_ZENMUSE_P1_24MM, ILX_LR1_INSPECT_85MM, MAP61_17MM, RGB61_24MM } from "@/domain/camera";
+import type { PolygonParams } from "@/components/MapFlightDirection/types";
 
 type Props = {
   open: boolean;
   polygonId: string | null;
   onClose: () => void;
-  onSubmit: (params: { altitudeAGL: number; frontOverlap: number; sideOverlap: number }) => void;
-  onSubmitAll?: (params: { altitudeAGL: number; frontOverlap: number; sideOverlap: number }) => void; // bulk apply
-  defaults?: { altitudeAGL?: number; frontOverlap?: number; sideOverlap?: number; cameraKey?: string };
+  onSubmit: (params: PolygonParams) => void;
+  onSubmitAll?: (params: PolygonParams) => void; // bulk apply
+  defaults?: PolygonParams;
 };
 
 export default function PolygonParamsDialog({
@@ -25,6 +26,9 @@ export default function PolygonParamsDialog({
   const [frontOverlap, setFrontOverlap] = React.useState<number>(defaults?.frontOverlap ?? 70);
   const [sideOverlap, setSideOverlap] = React.useState<number>(defaults?.sideOverlap ?? 70);
   const [cameraKey, setCameraKey] = React.useState<string>(defaults?.cameraKey ?? "MAP61_17MM");
+  const [showAdvanced, setShowAdvanced] = React.useState<boolean>(false);
+  const [useCustomBearing, setUseCustomBearing] = React.useState<boolean>(defaults?.useCustomBearing ?? false);
+  const [customBearingDeg, setCustomBearingDeg] = React.useState<number>(defaults?.customBearingDeg ?? 0);
 
   // map keys to models (could be lifted up later if needed)
   const cameraOptions: Array<{ key:string; model:any; label:string }> = [
@@ -41,8 +45,11 @@ export default function PolygonParamsDialog({
       setFrontOverlap(defaults?.frontOverlap ?? 70);
       setSideOverlap(defaults?.sideOverlap ?? 70);
       setCameraKey(defaults?.cameraKey ?? "MAP61_17MM");
+      setUseCustomBearing(defaults?.useCustomBearing ?? false);
+      setCustomBearingDeg(defaults?.customBearingDeg ?? 0);
+      setShowAdvanced(defaults?.useCustomBearing ?? false);
     }
-  }, [open, defaults?.altitudeAGL, defaults?.frontOverlap, defaults?.sideOverlap]);
+  }, [open, defaults?.altitudeAGL, defaults?.frontOverlap, defaults?.sideOverlap, defaults?.cameraKey, defaults?.useCustomBearing, defaults?.customBearingDeg]);
 
   if (!open || !polygonId) return null;
 
@@ -87,11 +94,64 @@ export default function PolygonParamsDialog({
                    onChange={(e)=>setSideOverlap(parseInt(e.target.value || "70"))} />
           </label>
 
+          <div className="pt-1">
+            <button
+              type="button"
+              className="text-[11px] text-blue-600 hover:underline"
+              onClick={() => setShowAdvanced((prev) => !prev)}
+            >
+              {showAdvanced ? 'Hide advanced options' : 'Show advanced options'}
+            </button>
+          </div>
+
+          {showAdvanced && (
+            <div className="border rounded-md p-2 space-y-2 bg-slate-50">
+              <label className="flex items-center gap-2 text-xs text-gray-600">
+                <input
+                  type="checkbox"
+                  checked={useCustomBearing}
+                  onChange={(e) => {
+                    setUseCustomBearing(e.target.checked);
+                    if (e.target.checked) setShowAdvanced(true);
+                  }}
+                />
+                Use custom flight direction
+              </label>
+              <label className="text-xs text-gray-600 block">
+                Flight direction (° clockwise from North)
+                <input
+                  className="w-full border rounded px-2 py-1 text-xs mt-1"
+                  type="number"
+                  min={0}
+                  max={359.9}
+                  step={0.1}
+                  value={customBearingDeg}
+                  disabled={!useCustomBearing}
+                  onChange={(e) => {
+                    const raw = parseFloat(e.target.value || '0');
+                    if (Number.isFinite(raw)) setCustomBearingDeg(raw);
+                  }}
+                />
+              </label>
+            </div>
+          )}
+
           <div className="flex gap-2 pt-1">
             <Button
               size="sm"
               className="flex-1 min-w-0 h-8 px-2 text-xs"
-              onClick={() => onSubmit({ altitudeAGL, frontOverlap, sideOverlap, cameraKey } as any)}>
+              onClick={() => {
+                const normalizedBearing = ((customBearingDeg % 360) + 360) % 360;
+                const payload: PolygonParams = {
+                  altitudeAGL,
+                  frontOverlap,
+                  sideOverlap,
+                  cameraKey,
+                  useCustomBearing,
+                  customBearingDeg: useCustomBearing ? normalizedBearing : undefined,
+                };
+                onSubmit(payload);
+              }}>
               Apply
             </Button>
             {onSubmitAll && (
@@ -99,7 +159,18 @@ export default function PolygonParamsDialog({
                 size="sm"
                 variant="secondary"
                 className="h-8 px-2 text-xs whitespace-nowrap"
-                onClick={() => onSubmitAll({ altitudeAGL, frontOverlap, sideOverlap, cameraKey } as any)}
+                onClick={() => {
+                  const normalizedBearing = ((customBearingDeg % 360) + 360) % 360;
+                  const payload: PolygonParams = {
+                    altitudeAGL,
+                    frontOverlap,
+                    sideOverlap,
+                    cameraKey,
+                    useCustomBearing,
+                    customBearingDeg: useCustomBearing ? normalizedBearing : undefined,
+                  };
+                  onSubmitAll(payload);
+                }}
                 title="Apply these parameters to all remaining polygons awaiting setup"
               >
                 Apply All

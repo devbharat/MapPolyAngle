@@ -6,7 +6,7 @@ import { Card, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { LoadingSpinner } from '@/components/ui/loading-spinner';
 import { useIsMobile } from '@/hooks/use-mobile';
-import { Map, Trash2, CheckCircle, AlertCircle, TrendingUp, Target, X, Upload, Download } from 'lucide-react';
+import { Map, Trash2, AlertCircle, Upload, Download } from 'lucide-react';
 import OverlapGSDPanel from "@/components/OverlapGSDPanel";
 import PolygonParamsDialog from "@/components/PolygonParamsDialog";
 import type { PolygonParams } from '@/components/MapFlightDirection/types';
@@ -83,10 +83,9 @@ export default function Home() {
 
   const handleApplyParams = useCallback((params: PolygonParams) => {
     const polygonId = paramsDialog.polygonId!;
-    // Send params down to MapFlightDirection so it can draw lines + 3D path
     mapRef.current?.applyPolygonParams?.(polygonId, params);
-    // Store for GSD per‑polygon camera sampling
-    setParamsByPolygon(prev => ({ ...prev, [polygonId]: params }));
+    const updated = mapRef.current?.getPerPolygonParams?.() || {};
+    setParamsByPolygon(updated as any);
     setParamsDialog({ open: false, polygonId: null });
   }, [paramsDialog.polygonId]);
 
@@ -104,6 +103,8 @@ export default function Home() {
     if (mapRef.current) {
       setImportedOriginals(mapRef.current.getImportedOriginals?.() ?? {});
       setOverrides(mapRef.current.getBearingOverrides?.() ?? {});
+      const mapParams = mapRef.current.getPerPolygonParams?.() ?? {};
+      setParamsByPolygon(mapParams as any);
     }
   }, []);
 
@@ -123,6 +124,8 @@ export default function Home() {
     if (mapRef.current) {
       setImportedOriginals(mapRef.current.getImportedOriginals?.() ?? {});
       setOverrides(mapRef.current.getBearingOverrides?.() ?? {});
+      const mapParams = mapRef.current.getPerPolygonParams?.() ?? {};
+      setParamsByPolygon(mapParams as any);
     }
   }, [polygonResults.length]);
 
@@ -134,14 +137,7 @@ export default function Home() {
     setParamsByPolygon({});
     setImportedOriginals({});
     setOverrides({});
-  }, []);
-
-  const clearSpecificPolygon = useCallback((polygonId: string) => {
-    mapRef.current?.clearPolygon?.(polygonId);
-    setParamsByPolygon(prev => {
-      const { [polygonId]: removed, ...rest } = prev;
-      return rest;
-    });
+    setSelectedPolygonId(null);
   }, []);
 
   // Helper function to get quality indicator
@@ -279,7 +275,7 @@ export default function Home() {
         {(() => {
           const pid = paramsDialog.polygonId || "";
           const mapParams = mapRef.current?.getPerPolygonParams?.() || {} as any;
-          const current = paramsByPolygon[pid] || mapParams[pid] || {} as any;
+          const current = mapParams[pid] || paramsByPolygon[pid] || {} as any;
           return (
         <PolygonParamsDialog
           open={paramsDialog.open}
@@ -287,7 +283,7 @@ export default function Home() {
           onClose={handleCloseParams}
           onSubmit={handleApplyParams}
           onSubmitAll={(params) => {
-            mapRef.current?.applyParamsToAllPending?.(params as any);
+            mapRef.current?.applyParamsToAllPending?.(params);
             // Refresh local cache from source of truth
             const updated = mapRef.current?.getPerPolygonParams?.() || {};
             setParamsByPolygon(updated as any);
@@ -298,6 +294,8 @@ export default function Home() {
             frontOverlap: current.frontOverlap ?? 70,
             sideOverlap: current.sideOverlap ?? 70,
             cameraKey: current.cameraKey ?? 'MAP61_17MM',
+            useCustomBearing: current.useCustomBearing ?? false,
+            customBearingDeg: current.customBearingDeg ?? undefined,
           }}
         />); })()}
 
@@ -305,11 +303,11 @@ export default function Home() {
         {!isMobile && (
           <div className="absolute top-2 right-2 z-40 w-[500px] max-w-[90vw] max-h-[calc(100vh-120px)] overflow-y-auto">
 
-          {/* Analysis Results */}
+          {/* Unified Analysis Panel */}
           <Card className="backdrop-blur-md bg-white/95">
-            <CardContent className="p-3">
-              <div className="flex items-center justify-between mb-2">
-                <h3 className="text-sm font-medium text-gray-900">Analysis Results</h3>
+            <CardContent className="p-3 space-y-3">
+              <div className="flex items-center justify-between">
+                <h3 className="text-sm font-medium text-gray-900">Analysis</h3>
               </div>
               
               {isAnalyzing && (
@@ -331,114 +329,7 @@ export default function Home() {
               )}
 
               {/* Multiple Polygon Results */}
-              {hasResults && (
-                <div className="space-y-4 max-h-96 overflow-y-auto">
-                  {polygonResults.map((polygonResult, index) => {
-                    const { polygonId, result } = polygonResult;
-                    const shortId = polygonId.slice(0, 8);
-                    const fromFile = !!importedOriginals[polygonId];
-                    const hasOverride = !!overrides[polygonId]; // currently using file heading
-                    
-                    return (
-                      <div key={polygonId} className={`border rounded-lg p-3 bg-white ${selectedPolygonId===polygonId ? 'ring-2 ring-blue-400' : ''}`} onClick={()=>setSelectedPolygonId(polygonId)}>
-                        {/* Polygon Header */}
-                        <div className="flex items-center justify-between mb-2">
-                          <div className="flex items-center space-x-2">
-                            <span className="text-sm font-medium text-gray-900">
-                              Polygon {index + 1}
-                            </span>
-                            <span className="text-xs text-gray-500 font-mono">
-                              #{shortId}
-                            </span>
-                          </div>
-                          <div className="flex items-center space-x-2">
-                            {/* Fit quality removed */}
-                            <Button 
-                              size="sm" 
-                              variant="ghost" 
-                              className="h-6 w-6 p-0 text-gray-400 hover:text-red-500"
-                              onClick={() => clearSpecificPolygon(polygonId)}
-                            >
-                              <X className="w-3 h-3" />
-                            </Button>
-                          </div>
-                        </div>
 
-                        {/* Flight Direction - Primary Result */}
-                        <div className="bg-blue-50 rounded-lg p-2 mb-2">
-                          <div className="flex items-center justify-between">
-                            <div className="flex items-center space-x-2">
-                              <Target className="w-4 h-4 text-blue-600" />
-                              <span className="text-sm font-medium text-blue-900">Flight Direction:</span>
-                            </div>
-                            <span className="font-mono text-lg font-bold text-blue-700">
-                              {result.contourDirDeg.toFixed(1)}°
-                            </span>
-                          </div>
-                        </div>
-
-                        {/* per-polygon actions when imported */}
-                        {fromFile && (
-                          <div className="flex gap-2 mb-2">
-                            {hasOverride ? (
-                              <Button size="sm" className="h-7 px-2 text-xs"
-                                      onClick={(e) => { e.stopPropagation(); mapRef.current?.optimizePolygonDirection?.(polygonId); }}
-                                      title="Drop file override and use terrain-optimal direction">
-                                🎯 Optimize
-                              </Button>
-                            ) : (
-                              <Button size="sm" variant="outline" className="h-7 px-2 text-xs"
-                                      onClick={(e) => { e.stopPropagation(); mapRef.current?.revertPolygonToImportedDirection?.(polygonId); }}
-                                      title="Restore Wingtra file bearing/spacing">
-                                📁 File dir
-                              </Button>
-                            )}
-                            <Button size="sm" variant="outline" className="h-7 px-2 text-xs"
-                                    onClick={(e) => { e.stopPropagation(); mapRef.current?.runFullAnalysis?.(polygonId); }}
-                                    title="Clear overrides, run fresh analysis, and ask for new params">
-                              🔄 Full
-                            </Button>
-                          </div>
-                        )}
-                        
-                        {/* Secondary metrics removed (Aspect, Samples, Zoom, Altitudes, R², RMSE, Slope) */}
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-
-              {/* Summary for multiple polygons */}
-              {hasResults && polygonResults.length > 1 && (
-                <div className="border-t pt-2 mt-3 space-y-2">
-                  <div className="flex items-center justify-between text-xs">
-                    <div className="flex items-center space-x-2 text-green-600">
-                      <CheckCircle className="w-3 h-3" />
-                      <span>{polygonResults.length} Areas Analyzed</span>
-                    </div>
-                    <div className="flex items-center space-x-1 text-gray-500">
-                      <TrendingUp className="w-3 h-3" />
-                      <span>3D Plane Fitting</span>
-                    </div>
-                  </div>
-                  {/* Removed Queue Active button */}
-                  {selectedPolygonId && polygonResults.some(r => r.polygonId === selectedPolygonId) && (
-                    <div className="flex gap-2">
-                      <Button size="sm" className="h-7 px-2 text-xs flex-1"
-                              onClick={()=> mapRef.current?.optimizePolygonDirection?.(selectedPolygonId)}
-                              title="Optimize selected polygon direction">
-                        🎯 Optimize Selected
-                      </Button>
-                    </div>
-                  )}
-                </div>
-              )}
-            </CardContent>
-          </Card>
-
-          {/* Always mount the GSD Panel to ensure auto-run callback is registered */}
-          <Card className="backdrop-blur-md bg-white/95 mt-4">
-            <CardContent className="p-3">
               <div className={panelEnabled ? '' : 'opacity-50 pointer-events-none'}>
                 <OverlapGSDPanel 
                   mapRef={mapRef} 
@@ -448,6 +339,11 @@ export default function Home() {
                   onClearExposed={handleClearReceived}
                   onExposePoseImporter={(fn)=>{ openDJIImporterRef.current = fn; }}
                   onPosesImported={(c)=> setImportedPoseCount(c)}
+                  polygonAnalyses={polygonResults}
+                  overrides={overrides}
+                  importedOriginals={importedOriginals}
+                  selectedPolygonId={selectedPolygonId}
+                  onSelectPolygon={setSelectedPolygonId}
                 />
               </div>
             </CardContent>
@@ -469,6 +365,7 @@ export default function Home() {
           onRequestParams={handleRequestParams}
           onFlightLinesUpdated={handleFlightLinesUpdated}
           onClearGSD={() => clearGSDRef.current?.()}
+          onPolygonSelected={setSelectedPolygonId}
         />
       </div>
     </div>

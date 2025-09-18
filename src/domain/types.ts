@@ -26,6 +26,8 @@ export interface FlightParams {
   frontOverlap: number; // front overlap percentage (0–95)
   sideOverlap: number;  // side overlap percentage (0–95)
   cameraKey?: string;   // optional camera identifier (maps to models in domain/camera)
+  useCustomBearing?: boolean; // optional manual bearing flag
+  customBearingDeg?: number;  // optional manual bearing degrees clockwise from north
 }
 
 export interface TerrainTile {

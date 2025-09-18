@@ -7,12 +7,14 @@ import { lngLatToMeters } from "@/overlap/mercator";
 import { metersToLngLat } from "@/services/Projection";
 import { SONY_RX1R2, DJI_ZENMUSE_P1_24MM, ILX_LR1_INSPECT_85MM, MAP61_17MM, RGB61_24MM } from "@/domain/camera";
 import { sampleCameraPositionsOnFlightPath, build3DFlightPath } from "@/components/MapFlightDirection/utils/geometry";
-import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
+import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { toast } from "@/hooks/use-toast";
 import type { MapFlightDirectionAPI } from "@/components/MapFlightDirection/api";
 import { extractPoses, wgs84ToWebMercator, CameraPoseWGS84, extractCameraModel } from "@/utils/djiGeotags";
+import type { PolygonAnalysisResult } from "@/components/MapFlightDirection/types";
 // Turf types may be unresolved if TS can't find bundled types; cast as any.
 // @ts-ignore
 import * as turf from '@turf/turf';
@@ -28,6 +30,11 @@ type Props = {
   onExposePoseImporter?: (openImporter: () => void) => void;
   // NEW: report pose import count to parent so parent can enable panel when only poses exist
   onPosesImported?: (count: number) => void;
+  polygonAnalyses: PolygonAnalysisResult[];
+  overrides: Record<string, { bearingDeg: number; lineSpacingM?: number; source: 'wingtra' | 'user' }>;
+  importedOriginals: Record<string, { bearingDeg: number; lineSpacingM: number }>;
+  selectedPolygonId?: string | null;
+  onSelectPolygon?: (id: string | null) => void;
 };
 
 // Helper function to calculate polygon area in acres
@@ -70,7 +77,7 @@ function metersBoundsToLngLatRing(minX:number,minY:number,maxX:number,maxY:numbe
   return [a,b,c,d,a];
 }
 
-export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAutoRun, onClearExposed, onExposePoseImporter, onPosesImported }: Props) {
+export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAutoRun, onClearExposed, onExposePoseImporter, onPosesImported, polygonAnalyses, overrides, importedOriginals, selectedPolygonId: controlledSelectedId, onSelectPolygon }: Props) {
   const CAMERA_REGISTRY: Record<string, CameraModel> = useMemo(()=>({
     SONY_RX1R2,
     DJI_ZENMUSE_P1_24MM,
@@ -100,7 +107,19 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
     imageCount: number;
     cameraLabel: string;
   }>>(new Map());
-  
+  const [internalSelectedId, setInternalSelectedId] = useState<string | null>(null);
+  const isControlled = controlledSelectedId !== undefined;
+  const activeSelectedId = isControlled ? (controlledSelectedId ?? null) : internalSelectedId;
+  const itemRefs = useRef<Map<string, HTMLDivElement>>(new Map());
+
+  const setSelection = useCallback((id: string | null) => {
+    if (onSelectPolygon) {
+      onSelectPolygon(id);
+    } else {
+      setInternalSelectedId(id);
+    }
+  }, [onSelectPolygon]);
+
   // NEW: poses-only mode state
   const poseFileRef = useRef<HTMLInputElement>(null);
   const [importedPoses, setImportedPoses] = useState<PoseMeters[]>([]);
@@ -366,6 +385,51 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
     if (!api?.getPolygonsWithIds) return [];
     return api.getPolygonsWithIds(); // returns { id?: string; ring: [number, number][] }[]
   }, [mapRef]);
+
+  const combinedPolygons = useMemo(() => {
+    const polygonOrdering = getPolygons().map((p) => p.id || 'unknown');
+    const order = polygonOrdering.length > 0 ? polygonOrdering : polygonAnalyses.map((analysis) => analysis.polygonId);
+    const map = new Map<string, { analysis?: PolygonAnalysisResult; stats?: { polygonId: string; gsdStats: GSDStats; areaAcres: number; imageCount: number; cameraLabel: string } }>();
+
+    polygonAnalyses.forEach((analysis) => {
+      map.set(analysis.polygonId, { analysis, stats: perPolygonStats.get(analysis.polygonId) });
+    });
+
+    perPolygonStats.forEach((stats, polygonId) => {
+      if (map.has(polygonId)) {
+        map.set(polygonId, { analysis: map.get(polygonId)?.analysis, stats });
+      } else {
+        map.set(polygonId, { stats });
+      }
+    });
+
+    const orderedIds = [...order, ...Array.from(perPolygonStats.keys()).filter((id) => !order.includes(id))];
+
+    return orderedIds
+      .map((polygonId, index) => ({ polygonId, analysis: map.get(polygonId)?.analysis, stats: map.get(polygonId)?.stats, sortIndex: index }))
+      .filter(({ analysis, stats }) => analysis || stats)
+      .sort((a, b) => a.sortIndex - b.sortIndex);
+  }, [polygonAnalyses, perPolygonStats, getPolygons]);
+
+  React.useEffect(() => {
+    if (combinedPolygons.length === 0) {
+      if (!isControlled && activeSelectedId) setInternalSelectedId(null);
+      return;
+    }
+    if (activeSelectedId && !combinedPolygons.some(item => item.polygonId === activeSelectedId)) {
+      if (!isControlled) setInternalSelectedId(combinedPolygons[0].polygonId);
+    } else if (!activeSelectedId && !isControlled) {
+      setInternalSelectedId(combinedPolygons[0].polygonId);
+    }
+  }, [combinedPolygons, activeSelectedId, isControlled]);
+
+  React.useEffect(() => {
+    if (!activeSelectedId) return;
+    const node = itemRefs.current.get(activeSelectedId);
+    if (node && node.scrollIntoView) {
+      node.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+  }, [activeSelectedId]);
 
   /**
    * Compute GSD/overlap for either:
@@ -833,46 +897,163 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
         </label>
       </div>
 
-      {/* Per-Polygon Statistics */}
-      {perPolygonStats.size > 0 && (
-        <div className="space-y-2">
-          {Array.from(perPolygonStats.entries()).map(([polygonId, stats]) => {
+      <div className="space-y-2">
+        {combinedPolygons.length === 0 ? (
+          <Card>
+            <CardContent className="py-6 text-center text-xs text-gray-500">
+              No polygons analyzed yet.
+            </CardContent>
+          </Card>
+        ) : (
+          combinedPolygons.map(({ polygonId, analysis, stats }) => {
             const { displayName, shortId } = getPolygonDisplayName(polygonId);
+            const overrideInfo = overrides?.[polygonId];
+            const directionSource = overrideInfo?.source === 'user'
+              ? 'Custom'
+              : overrideInfo?.source === 'wingtra'
+                ? 'File'
+                : 'Terrain';
+            const directionDeg = (overrideInfo?.bearingDeg ?? analysis?.result?.contourDirDeg ?? 0).toFixed(1);
+            const fromFile = !!importedOriginals?.[polygonId];
+            const gsdStats = stats?.gsdStats;
+            const areaAcres = stats?.areaAcres ?? 0;
+            const imageCount = stats?.imageCount ?? 0;
+            const isSelected = activeSelectedId === polygonId;
+
             return (
-              <Card key={polygonId} className="mt-2 cursor-pointer hover:shadow-md transition-shadow border-l-4 border-l-blue-500" onClick={() => highlightPolygon(polygonId)}>
-                <CardHeader className="pb-3">
-                  <CardTitle className="text-sm flex items-center gap-2">
-                    <span>{displayName}</span>
-                    <Badge variant="secondary" className="text-xs font-mono">#{shortId}</Badge>
-                  </CardTitle>
-                  <CardDescription className="text-xs">
-                    Area: {stats.areaAcres.toFixed(2)} acres • Images: {stats.imageCount} • Camera: {stats.cameraLabel} • Pixels: {stats.gsdStats.count.toLocaleString()}<br />
-                    <span className="text-blue-600">Click to view on map</span>
-                  </CardDescription>
-                </CardHeader>
-                <CardContent className="space-y-4">
-                  <div className="grid grid-cols-3 gap-4 text-xs">
-                    <div className="text-center"><div className="font-medium text-green-600">{(stats.gsdStats.min * 100).toFixed(1)} cm</div><div className="text-gray-500">Min GSD</div></div>
-                    <div className="text-center"><div className="font-medium text-blue-600">{(stats.gsdStats.mean * 100).toFixed(2)} cm</div><div className="text-gray-500">Mean GSD</div></div>
-                    <div className="text-center"><div className="font-medium text-red-600">{(stats.gsdStats.max * 100).toFixed(1)} cm</div><div className="text-gray-500">Max GSD</div></div>
+              <Card
+                key={polygonId}
+                ref={(node) => {
+                  if (node) {
+                    itemRefs.current.set(polygonId, node);
+                  } else {
+                    itemRefs.current.delete(polygonId);
+                  }
+                }}
+                className={`mt-2 transition-shadow border-l-4 ${isSelected ? 'border-l-blue-500 shadow-lg ring-1 ring-blue-400' : 'border-l-transparent hover:shadow-md'}`}
+                onClick={() => {
+                  setSelection(polygonId);
+                  highlightPolygon(polygonId);
+                }}
+              >
+                <CardContent className="p-3 space-y-3">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <div className="text-sm font-medium text-gray-900">{displayName}</div>
+                      <div className="text-xs text-gray-500 font-mono">#{shortId}</div>
+                    </div>
+                    <Badge variant="outline" className="text-[10px] uppercase tracking-wide">{directionSource}</Badge>
                   </div>
-                  <div className="h-48">
-                    <ResponsiveContainer width="100%" height="100%">
-                      <BarChart data={convertHistogramToArea(stats.gsdStats).map(bin => ({ gsd: (bin.bin * 100).toFixed(1), areaM2: bin.areaM2, areaAcres: bin.areaM2 / ACRE_M2 }))}>
-                        <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
-                        <XAxis dataKey="gsd" tick={{ fontSize: 10 }} label={{ value: 'GSD (cm)', position: 'insideBottom', offset: -5, style: { fontSize: '10px' } }} />
-                        <YAxis tick={{ fontSize: 10 }} tickFormatter={(v:number)=> (v/ACRE_M2).toFixed(2)} label={{ value: 'Area (acres)', angle: -90, position: 'insideLeft', style: { fontSize: '10px' } }} />
-                        <Tooltip formatter={(value)=>{ const m2=value as number; const acres=m2/ACRE_M2; return [`${acres.toFixed(2)} acres (${m2.toFixed(0)} m²)`, 'Area']; }} labelFormatter={(label)=>`GSD: ${label} cm`} labelStyle={{ fontSize: '11px' }} contentStyle={{ fontSize: '11px' }} />
-                        <Bar dataKey="areaM2" fill="#8b5cf6" stroke="#7c3aed" strokeWidth={0.5} radius={[1,1,0,0]} />
-                      </BarChart>
-                    </ResponsiveContainer>
+
+                  <div className="bg-blue-50 rounded-lg p-2 flex items-center justify-between">
+                    <span className="text-sm font-medium text-blue-900">Flight Direction</span>
+                    <span className="font-mono text-lg font-bold text-blue-700">{directionDeg}°</span>
                   </div>
+
+                  <div className="flex flex-wrap gap-2">
+                    <Button
+                      size="sm"
+                      className="h-7 px-2 text-xs"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        mapRef.current?.optimizePolygonDirection?.(polygonId);
+                        setTimeout(() => setSelection(polygonId), 0);
+                      }}
+                      title="Use terrain-optimal direction"
+                    >
+                      🎯 Optimize
+                    </Button>
+
+                    {fromFile && (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        className="h-7 px-2 text-xs"
+                        disabled={overrideInfo?.source === 'wingtra'}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          mapRef.current?.revertPolygonToImportedDirection?.(polygonId);
+                          setTimeout(() => setSelection(polygonId), 0);
+                        }}
+                        title="Restore Wingtra file bearing/spacing"
+                      >
+                        📁 File dir
+                      </Button>
+                    )}
+
+                    {fromFile && (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        className="h-7 px-2 text-xs"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          mapRef.current?.runFullAnalysis?.(polygonId);
+                        }}
+                        title="Clear overrides and rerun terrain analysis"
+                      >
+                        🔄 Full
+                      </Button>
+                    )}
+
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      className="h-7 px-2 text-xs ml-auto text-red-500"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          mapRef.current?.clearPolygon?.(polygonId);
+                          setTimeout(() => setSelection(null), 0);
+                        }}
+                      title="Remove polygon"
+                    >
+                      ✖ Remove
+                    </Button>
+                  </div>
+
+                  {gsdStats ? (
+                    <div className="space-y-2">
+                      <div className="grid grid-cols-3 gap-3 text-xs">
+                        <div className="text-center">
+                          <div className="font-medium text-green-600">{(gsdStats.min * 100).toFixed(1)} cm</div>
+                          <div className="text-gray-500">Min GSD</div>
+                        </div>
+                        <div className="text-center">
+                          <div className="font-medium text-blue-600">{(gsdStats.mean * 100).toFixed(2)} cm</div>
+                          <div className="text-gray-500">Mean GSD</div>
+                        </div>
+                        <div className="text-center">
+                          <div className="font-medium text-red-600">{(gsdStats.max * 100).toFixed(1)} cm</div>
+                          <div className="text-gray-500">Max GSD</div>
+                        </div>
+                      </div>
+
+                      <div className="grid grid-cols-2 gap-3 text-xs text-gray-600">
+                        <div>Image count: <span className="font-medium text-gray-900">{imageCount}</span></div>
+                        <div>Area: <span className="font-medium text-gray-900">{areaAcres.toFixed(2)} acres</span></div>
+                      </div>
+
+                      <div className="h-40">
+                        <ResponsiveContainer width="100%" height="100%">
+                          <BarChart data={convertHistogramToArea(gsdStats).map(bin => ({ gsd: (bin.bin * 100).toFixed(1), areaM2: bin.areaM2, areaAcres: bin.areaM2 / ACRE_M2 }))}>
+                            <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
+                            <XAxis dataKey="gsd" tick={{ fontSize: 10 }} label={{ value: 'GSD (cm)', position: 'insideBottom', offset: -5, style: { fontSize: '10px' } }} />
+                            <YAxis tick={{ fontSize: 10 }} tickFormatter={(v:number)=> (v/ACRE_M2).toFixed(2)} label={{ value: 'Area (acres)', angle: -90, position: 'insideLeft', style: { fontSize: '10px' } }} />
+                            <Tooltip formatter={(value)=>{ const m2=value as number; const acres=m2/ACRE_M2; return [`${acres.toFixed(2)} acres (${m2.toFixed(0)} m²)`, 'Area']; }} labelFormatter={(label)=>`GSD: ${label} cm`} labelStyle={{ fontSize: '11px' }} contentStyle={{ fontSize: '11px' }} />
+                            <Bar dataKey="areaM2" fill="#3b82f6" stroke="#1e40af" strokeWidth={0.5} radius={[1,1,0,0]} />
+                          </BarChart>
+                        </ResponsiveContainer>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="text-xs text-gray-500">GSD analysis will appear after flight lines are generated.</div>
+                  )}
                 </CardContent>
               </Card>
             );
-          })}
-        </div>
-      )}
+          })
+        )}
+      </div>
 
       {gsdStats && gsdStats.count > 0 && (
         <Card className="mt-2">

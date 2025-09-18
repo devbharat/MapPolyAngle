@@ -22,4 +22,6 @@ export interface PolygonParams {
   frontOverlap: number;  // percent 0–95
   sideOverlap: number;   // percent 0–95
   cameraKey?: string;    // optional camera identifier
+  useCustomBearing?: boolean; // optional: user wants to specify bearing manually
+  customBearingDeg?: number;  // bearing degrees CW from North
 }
