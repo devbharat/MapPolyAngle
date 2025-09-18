@@ -179,16 +179,29 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         nextOverrides.set(polygonId, entry);
         bearingOverridesRef.current = nextOverrides;
         override = entry;
-      } else if (override?.source === 'user') {
-        setBearingOverrides((prev) => {
-          const next = new Map(prev);
-          next.delete(polygonId);
-          return next;
-        });
-        const nextOverrides = new Map(bearingOverridesRef.current);
-        nextOverrides.delete(polygonId);
-        bearingOverridesRef.current = nextOverrides;
-        override = bearingOverridesRef.current.get(polygonId);
+      } else {
+        if (override?.source === 'user') {
+          setBearingOverrides((prev) => {
+            const next = new Map(prev);
+            next.delete(polygonId);
+            return next;
+          });
+          const nextOverrides = new Map(bearingOverridesRef.current);
+          nextOverrides.delete(polygonId);
+          bearingOverridesRef.current = nextOverrides;
+          override = bearingOverridesRef.current.get(polygonId);
+        } else if (override) {
+          const updated = { ...override, lineSpacingM: defaultSpacing };
+          setBearingOverrides((prev) => {
+            const next = new Map(prev);
+            next.set(polygonId, updated);
+            return next;
+          });
+          const nextOverrides = new Map(bearingOverridesRef.current);
+          nextOverrides.set(polygonId, updated);
+          bearingOverridesRef.current = nextOverrides;
+          override = updated;
+        }
       }
 
       const bearingDeg = override ? override.bearingDeg : res.result.contourDirDeg;
