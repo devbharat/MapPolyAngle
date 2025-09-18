@@ -87,6 +87,7 @@ export function update3DCameraPointsLayer(
   cameraPositions: [number, number, number][],
   setLayers: React.Dispatch<React.SetStateAction<any[]>>
 ) {
+  const isImportedPoses = polygonId === '__POSES__';
   const cameraLayer = new ScatterplotLayer({
     id: `camera-points-${polygonId}`,
     data: cameraPositions.map((pos, index) => ({
@@ -95,10 +96,11 @@ export function update3DCameraPointsLayer(
       altitude: pos[2]
     })),
     getPosition: (d: any) => d.position,
-    getRadius: 8,
+    // Make imported red circles smaller than polygon camera points
+    getRadius: isImportedPoses ? 3 : 8,
     getFillColor: [255, 71, 87, 255], // Red color #ff4757
     getLineColor: [255, 255, 255, 255], // White outline
-    lineWidthMinPixels: 2,
+    lineWidthMinPixels: isImportedPoses ? 1 : 2,
     radiusUnits: 'meters',
     coordinateSystem: COORDINATE_SYSTEM.LNGLAT,
     parameters: {
@@ -126,6 +128,51 @@ export function remove3DCameraPointsLayer(
   setLayers((currentLayers) => {
     const filteredLayers = currentLayers.filter(
       (l) => !l.id.includes(`camera-points-${polygonId}`)
+    );
+    overlay.setProps({ layers: filteredLayers });
+    return filteredLayers;
+  });
+}
+
+// Trigger points along flight lines, rendered in the air via Deck.gl
+export function update3DTriggerPointsLayer(
+  overlay: MapboxOverlay,
+  polygonId: string,
+  triggerPositions: [number, number, number][],
+  setLayers: React.Dispatch<React.SetStateAction<any[]>>
+) {
+  const triggerLayer = new ScatterplotLayer({
+    id: `trigger-points-${polygonId}`,
+    data: triggerPositions.map((pos) => ({ position: pos })),
+    getPosition: (d: any) => d.position,
+    getRadius: 4, // half the size of camera points
+    getFillColor: [12, 36, 97, 230], // Dark blue
+    getLineColor: [230, 240, 255, 220],
+    lineWidthMinPixels: 1,
+    radiusUnits: 'meters',
+    coordinateSystem: COORDINATE_SYSTEM.LNGLAT,
+    // Draw on top of the path; avoid depth occlusion
+    parameters: { depthTest: false, depthWrite: false },
+  });
+
+  setLayers((currentLayers) => {
+    const filteredLayers = currentLayers.filter(
+      (l) => !l.id.includes(`trigger-points-${polygonId}`)
+    );
+    const newLayers = [...filteredLayers, triggerLayer];
+    overlay.setProps({ layers: newLayers });
+    return newLayers;
+  });
+}
+
+export function remove3DTriggerPointsLayer(
+  overlay: MapboxOverlay,
+  polygonId: string,
+  setLayers: React.Dispatch<React.SetStateAction<any[]>>
+) {
+  setLayers((currentLayers) => {
+    const filteredLayers = currentLayers.filter(
+      (l) => !l.id.includes(`trigger-points-${polygonId}`)
     );
     overlay.setProps({ layers: filteredLayers });
     return filteredLayers;

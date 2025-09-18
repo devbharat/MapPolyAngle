@@ -218,7 +218,7 @@ export function addTriggerPointsForPolygon(
     type: 'circle',
     source: sourceId,
     paint: {
-      'circle-radius': 3,
+      'circle-radius': 1.5,
       'circle-color': '#111827',
       'circle-stroke-width': 1,
       'circle-stroke-color': '#ffffff'

@@ -10,7 +10,7 @@ type Props = {
   onClose: () => void;
   onSubmit: (params: { altitudeAGL: number; frontOverlap: number; sideOverlap: number }) => void;
   onSubmitAll?: (params: { altitudeAGL: number; frontOverlap: number; sideOverlap: number }) => void; // bulk apply
-  defaults?: { altitudeAGL?: number; frontOverlap?: number; sideOverlap?: number };
+  defaults?: { altitudeAGL?: number; frontOverlap?: number; sideOverlap?: number; cameraKey?: string };
 };
 
 export default function PolygonParamsDialog({
@@ -24,7 +24,7 @@ export default function PolygonParamsDialog({
   const [altitudeAGL, setAltitudeAGL] = React.useState<number>(defaults?.altitudeAGL ?? 100);
   const [frontOverlap, setFrontOverlap] = React.useState<number>(defaults?.frontOverlap ?? 70);
   const [sideOverlap, setSideOverlap] = React.useState<number>(defaults?.sideOverlap ?? 70);
-  const [cameraKey, setCameraKey] = React.useState<string>("MAP61_17MM");
+  const [cameraKey, setCameraKey] = React.useState<string>(defaults?.cameraKey ?? "MAP61_17MM");
 
   // map keys to models (could be lifted up later if needed)
   const cameraOptions: Array<{ key:string; model:any; label:string }> = [
@@ -40,7 +40,7 @@ export default function PolygonParamsDialog({
       setAltitudeAGL(defaults?.altitudeAGL ?? 100);
       setFrontOverlap(defaults?.frontOverlap ?? 70);
       setSideOverlap(defaults?.sideOverlap ?? 70);
-      setCameraKey("MAP61_17MM");
+      setCameraKey(defaults?.cameraKey ?? "MAP61_17MM");
     }
   }, [open, defaults?.altitudeAGL, defaults?.frontOverlap, defaults?.sideOverlap]);
 

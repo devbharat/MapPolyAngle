@@ -276,6 +276,11 @@ export default function Home() {
 
       <div className="flex-1 relative">
         {/* PER‑POLYGON PARAMS DIALOG */}
+        {(() => {
+          const pid = paramsDialog.polygonId || "";
+          const mapParams = mapRef.current?.getPerPolygonParams?.() || {} as any;
+          const current = paramsByPolygon[pid] || mapParams[pid] || {} as any;
+          return (
         <PolygonParamsDialog
           open={paramsDialog.open}
           polygonId={paramsDialog.polygonId}
@@ -289,11 +294,12 @@ export default function Home() {
             setParamsDialog({ open: false, polygonId: null });
           }}
           defaults={{
-            altitudeAGL: paramsByPolygon[paramsDialog.polygonId || ""]?.altitudeAGL ?? 100,
-            frontOverlap: paramsByPolygon[paramsDialog.polygonId || ""]?.frontOverlap ?? 70,
-            sideOverlap: paramsByPolygon[paramsDialog.polygonId || ""]?.sideOverlap ?? 70,
+            altitudeAGL: current.altitudeAGL ?? 100,
+            frontOverlap: current.frontOverlap ?? 70,
+            sideOverlap: current.sideOverlap ?? 70,
+            cameraKey: current.cameraKey ?? 'MAP61_17MM',
           }}
-        />
+        />); })()}
 
         {/* Right Side Panel - Combined Controls and Instructions - Hidden on mobile */}
         {!isMobile && (

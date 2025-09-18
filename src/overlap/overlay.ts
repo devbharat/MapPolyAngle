@@ -65,12 +65,13 @@ function encodeOverlapToImage(overlap: Uint16Array, size: number, maxValue: numb
  * Convert GSD values to a heatmap visualization  
  * Higher GSD = worse resolution = warmer colors (red), Lower GSD = better resolution = cooler colors (blue/green)
  */
-function encodeGsdToImage(gsd: Float32Array, size: number, gsdMax = 0.50): HTMLCanvasElement {
+function encodeGsdToImage(gsd: Float32Array, size: number, gsdMin = 0.005, gsdMax = 0.05): HTMLCanvasElement {
   const canvas = document.createElement("canvas");
   canvas.width = size; canvas.height = size;
   const ctx = canvas.getContext("2d", { willReadFrequently: true })!;
   const img = ctx.createImageData(size, size);
-  const effectiveMax = Math.max(1e-6, gsdMax); // Consistent across tiles
+  const lo = Math.max(0, gsdMin);
+  const hi = Math.max(lo + 1e-6, gsdMax);
   
   for (let i = 0, j = 0; i < gsd.length; i++, j += 4) {
     const g = gsd[i];
@@ -79,8 +80,8 @@ function encodeGsdToImage(gsd: Float32Array, size: number, gsdMax = 0.50): HTMLC
       img.data[j] = 0; img.data[j + 1] = 0; img.data[j + 2] = 0; img.data[j + 3] = 0;
       continue;
     }
-    // Normalize: higher GSD (worse) → 1 (warmer); lower (better) → 0 (cooler)
-    const t = Math.max(0, Math.min(1, g / effectiveMax));
+    // Normalize within [gsdMin, gsdMax]: higher GSD (worse) → 1 (warmer); lower (better) → 0 (cooler)
+    const t = Math.max(0, Math.min(1, (g - lo) / (hi - lo)));
     const [r, g_color, b] = heatmapColor(t);
     
     img.data[j] = r;
@@ -94,7 +95,7 @@ function encodeGsdToImage(gsd: Float32Array, size: number, gsdMax = 0.50): HTMLC
 }
 
 export function addOrUpdateTileOverlay(
-  map: mapboxgl.Map, result: TileResult, opts: { kind: "overlap"|"gsd"; runId: string; opacity?: number; gsdMax?: number }
+  map: mapboxgl.Map, result: TileResult, opts: { kind: "overlap"|"gsd"; runId: string; opacity?: number; gsdMax?: number; gsdMin?: number }
 ) {
   const idBase = `ogsd-${opts.runId}-${opts.kind}-${result.z}-${result.x}-${result.y}`;
   const sourceId = idBase;
@@ -106,7 +107,7 @@ export function addOrUpdateTileOverlay(
   if (opts.kind === "overlap") {
     canvas = encodeOverlapToImage(result.overlap, result.size, result.maxOverlap || 1);
   } else {
-    canvas = encodeGsdToImage(result.gsdMin, result.size, opts.gsdMax ?? 0.5);
+    canvas = encodeGsdToImage(result.gsdMin, result.size, opts.gsdMin ?? 0.005, opts.gsdMax ?? 0.05);
   }
 
   // Convert to data URL (required for Mapbox image source)

@@ -256,30 +256,48 @@ export function build3DFlightPath(
   lines: number[][][],
   tiles: TerrainTile[],
   lineSpacing: number,
-  opts: { altitudeAGL: number; mode?: 'legacy' | 'min-clearance'; minClearance?: number } | number = 100
+  opts: { altitudeAGL: number; mode?: 'legacy' | 'min-clearance'; minClearance?: number; turnExtendM?: number } | number = 100
 ): [number, number, number][][] {
   const path: [number, number, number][][] = [];
   const usingLegacySig = typeof opts === 'number';
   const altitudeAGL = usingLegacySig ? (opts as number) : (opts as any).altitudeAGL;
   const mode: 'legacy' | 'min-clearance' = usingLegacySig ? 'legacy' : ((opts as any).mode ?? 'legacy');
   const minClearance = usingLegacySig ? 60 : Math.max(0, (opts as any).minClearance ?? 60);
+  const turnExtendM = usingLegacySig ? 0 : Math.max(0, (opts as any).turnExtendM ?? 0);
 
   lines.forEach((line, i) => {
     // Compute min/max along the sweep line
     const { min: lineMinElev, max: lineMaxElev } = queryMinMaxElevationAlongPolylineWGS84(line as any, tiles, 20);
+    // Also consider the straight extensions beyond the ends (turnaround area)
+    let extendedMax = lineMaxElev;
+    if (!usingLegacySig && (opts as any).turnExtendM && (opts as any).turnExtendM > 0 && (line as any).length >= 2) {
+      const te = Math.max(0, (opts as any).turnExtendM as number);
+      const L0 = line[0] as [number,number];
+      const L1 = line[1] as [number,number];
+      const LN = line[line.length-1] as [number,number];
+      const LN1 = line[line.length-2] as [number,number];
+      // Sweep bearing from first to second point
+      const sweepBrg = geoBearing([L0[0], L0[1]], [L1[0], L1[1]]);
+      const startExt = geoDestination([L0[0], L0[1]], (sweepBrg + 180) % 360, te);
+      const endExt = geoDestination([LN[0], LN[1]], sweepBrg, te);
+      const startMax = queryMaxElevationAlongLineWGS84(startExt[0], startExt[1], L0[0], L0[1], tiles, 20);
+      const endMax = queryMaxElevationAlongLineWGS84(LN[0], LN[1], endExt[0], endExt[1], tiles, 20);
+      if (Number.isFinite(startMax)) extendedMax = Math.max(extendedMax, startMax);
+      if (Number.isFinite(endMax)) extendedMax = Math.max(extendedMax, endMax);
+    }
 
     // Determine sweep altitude per selected mode
     let flightAltitude: number;
     if (mode === 'legacy') {
       // Old behavior: highest point + altitudeAGL
-      const refElev = Number.isFinite(lineMaxElev) ? lineMaxElev : 0;
+      const refElev = Number.isFinite(extendedMax) ? extendedMax : 0;
       flightAltitude = refElev + altitudeAGL;
     } else {
       // New behavior:
       // - meet requested GSD by using lowest sampled terrain + AGL
       // - enforce minimum ground clearance using highest sampled terrain
       const a1 = Number.isFinite(lineMinElev) ? (lineMinElev + altitudeAGL) : altitudeAGL;
-      const a2 = Number.isFinite(lineMaxElev) ? (lineMaxElev + minClearance) : altitudeAGL;
+      const a2 = Number.isFinite(extendedMax) ? (extendedMax + minClearance) : altitudeAGL;
       flightAltitude = Math.max(a1, a2);
     }
     const coords = (i % 2 === 0 ? line : [...line].reverse()).map(
@@ -301,7 +319,14 @@ export function build3DFlightPath(
           : geoBearing([P0[0], P0[1]], [P2[0], P2[1]]);
 
       const filletRadius = Math.max(30, lineSpacing / 2);
-      let fillet = buildFillet(P0, P2, dirPrev, dirNext, filletRadius);
+      // Optionally extend the fillet further out of the area
+      const startForFillet: [number, number, number] = turnExtendM > 0
+        ? (() => { const p = geoDestination([P0[0], P0[1]], dirPrev, turnExtendM); return [p[0], p[1], P0[2]]; })()
+        : P0;
+      const endForFillet: [number, number, number] = turnExtendM > 0
+        ? (() => { const p = geoDestination([P2[0], P2[1]], (dirNext + 180) % 360, turnExtendM); return [p[0], p[1], P2[2]]; })()
+        : P2;
+      let fillet = buildFillet(startForFillet, endForFillet, dirPrev, dirNext, filletRadius);
 
       if (fillet.length > 2) {
         // In min-clearance mode, ensure connector maintains min clearance as well
@@ -313,7 +338,14 @@ export function build3DFlightPath(
             fillet = fillet.map(p => [p[0], p[1], needed] as [number, number, number]);
           }
         }
-        path.push(fillet);
+        // If extended, add straight lead-out/lead-in to meet the fillet cleanly
+        if (turnExtendM > 0) {
+          path.push([P0, startForFillet]);
+          path.push(fillet);
+          path.push([endForFillet, P2]);
+        } else {
+          path.push(fillet);
+        }
       } else {
         let connectorAltitude = Math.max(P0[2], P2[2]);
         if (mode === 'min-clearance') {
@@ -321,7 +353,14 @@ export function build3DFlightPath(
           const needed = Number.isFinite(connMaxElev) ? (connMaxElev + minClearance) : undefined;
           if (needed && connectorAltitude < needed) connectorAltitude = needed;
         }
-        path.push([[P0[0], P0[1], connectorAltitude], [P2[0], P2[1], connectorAltitude]]);
+        if (turnExtendM > 0) {
+          const p0ext = geoDestination([P0[0], P0[1]], dirPrev, turnExtendM);
+          const p2ext = geoDestination([P2[0], P2[1]], (dirNext + 180) % 360, turnExtendM);
+          path.push([[P0[0], P0[1], connectorAltitude], [p0ext[0], p0ext[1], connectorAltitude]]);
+          path.push([[p2ext[0], p2ext[1], connectorAltitude], [P2[0], P2[1], connectorAltitude]]);
+        } else {
+          path.push([[P0[0], P0[1], connectorAltitude], [P2[0], P2[1], connectorAltitude]]);
+        }
       }
     }
     path.push(coords);
@@ -337,11 +376,17 @@ export function build3DFlightPath(
  */
 export function sampleCameraPositionsOnFlightPath(
   path3D: [number, number, number][][],
-  photoSpacingMeters: number
+  photoSpacingMeters: number,
+  opts?: { includeTurns?: boolean }
 ): [number, number, number, number][] {
   const cameraPositions: [number, number, number, number][] = [];
-  
-  for (const segment of path3D) {
+  const includeTurns = !!opts?.includeTurns;
+
+  for (let segIndex = 0; segIndex < path3D.length; segIndex++) {
+    // Skip connector/turn segments by convention: fillets are inserted between straights,
+    // so they end up at odd indices (0: straight0, 1: turn0-1, 2: straight1, 3: turn1-2, ...)
+    if (!includeTurns && (segIndex % 2 === 1)) continue;
+    const segment = path3D[segIndex];
     if (segment.length < 2) continue;
     
     let totalDistance = 0;

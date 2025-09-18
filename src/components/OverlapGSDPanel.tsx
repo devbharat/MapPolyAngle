@@ -119,17 +119,20 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
   const computeSeqRef = useRef(0); // increment to invalidate in-flight computations
   const [clipInnerBufferM, setClipInnerBufferM] = useState(0);
   const [maxTiltDeg, setMaxTiltDeg] = useState(30); // NEW: max allowable camera tilt (deg from vertical)
-  // NEW: altitude strategy & min clearance (synced with map API if available)
+  // NEW: altitude strategy & min clearance & turn extension (synced with map API if available)
   const [altitudeModeUI, setAltitudeModeUI] = useState<'legacy' | 'min-clearance'>('legacy');
   const [minClearanceUI, setMinClearanceUI] = useState<number>(60);
+  const [turnExtendUI, setTurnExtendUI] = useState<number>(80);
 
   // Sync initial values from map API
   React.useEffect(() => {
     const api = mapRef.current;
     const mode = (api as any)?.getAltitudeMode ? (api as any).getAltitudeMode() : 'legacy';
     const minc = (api as any)?.getMinClearance ? (api as any).getMinClearance() : 60;
+    const ext = (api as any)?.getTurnExtend ? (api as any).getTurnExtend() : 80;
     setAltitudeModeUI(mode);
     setMinClearanceUI(minc);
+    setTurnExtendUI(ext);
   }, [mapRef]);
 
   // Helper function to generate user-friendly polygon names
@@ -315,9 +318,19 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
         { altitudeAGL: altForThisPoly, mode, minClearance: minClr }
       );
 
-      const cameraPositions = sampleCameraPositionsOnFlightPath(path3D, spacingForward);
+      const cameraPositions = sampleCameraPositionsOnFlightPath(path3D, spacingForward, { includeTurns: false });
+      // Filter out cameras outside the polygon ring
+      const polys = api.getPolygonsWithIds?.() || [];
+      const ring = (polys.find((pp:any)=> (pp.id||'unknown')===polygonId)?.ring) as [number,number][] | undefined;
+      const inside = (lng:number,lat:number,ring:[number,number][]) => {
+        let ins=false; for(let i=0,j=ring.length-1;i<ring.length;j=i++){
+          const xi=ring[i][0], yi=ring[i][1], xj=ring[j][0], yj=ring[j][1];
+          const intersect=((yi>lat)!==(yj>lat)) && (lng < (xj-xi)*(lat-yi)/(yj-yi)+xi); if(intersect) ins=!ins;
+        } return ins;
+      };
+      const filtered = ring && ring.length>=3 ? cameraPositions.filter(([lng,lat])=> inside(lng,lat,ring)) : cameraPositions;
 
-      cameraPositions.forEach(([lng, lat, altMSL, yawDeg]) => {
+      filtered.forEach(([lng, lat, altMSL, yawDeg]) => {
         const [x, y] = lngLatToMeters(lng, lat);
         poses.push({
           id: `photo_${poseId++}`,
@@ -333,7 +346,12 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
   }, [getPerPolygonParams, mapRef, photoSpacingFor]);
 
   const parsePosesMeters = useCallback((): PoseMeters[] | null => {
-    const base = autoGenerate ? generatePosesFromFlightLines() : (importedPoses.length ? importedPoses : []);
+    const api = mapRef.current;
+    const fl = api?.getFlightLines?.();
+    const haveLines = !!fl && Array.from(fl.values()).some((v: any) => v.flightLines && v.flightLines.length > 0);
+    const generated = haveLines ? generatePosesFromFlightLines() : [];
+    // Always keep imported poses; add generated ones when lines exist
+    const base: PoseMeters[] = [ ...(importedPoses || []), ...(generated || []) ];
     if (!base) return [];
     // NEW: filter poses by tilt (sqrt(omega^2 + phi^2) ~ small-angle off-nadir approximation)
     const filtered = maxTiltDeg >= 0 ? base.filter(p => {
@@ -341,7 +359,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
       return tilt <= maxTiltDeg;
     }) : base;
     return filtered;
-  }, [autoGenerate, generatePosesFromFlightLines, importedPoses, maxTiltDeg]);
+  }, [generatePosesFromFlightLines, importedPoses, maxTiltDeg, mapRef]);
 
   const getPolygons = useCallback((): PolygonLngLatWithId[] => {
     const api = mapRef.current;
@@ -385,19 +403,24 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
       for (let i=0;i<poses.length;i++) {
         const pose = poses[i];
         let cam: CameraModel | undefined = undefined;
-        if (overrideCam && typeof overrideCam === 'object' && 'f_m' in overrideCam) {
-          cam = overrideCam as CameraModel;
-        } else if (pose.polygonId && perPolyCam[pose.polygonId]) {
+        // 1) Generated poses: polygon camera
+        if (pose.polygonId && perPolyCam[pose.polygonId]) {
           cam = perPolyCam[pose.polygonId];
+        } else if (!pose.polygonId && importedPoses.length > 0) {
+          // 2) Imported poses: camera from parsed DJI payload
+          try {
+            const parsed = JSON.parse(cameraText) as CameraModel;
+            if (parsed && typeof parsed.f_m === 'number') cam = parsed;
+          } catch {}
+        } else if (overrideCam && typeof overrideCam === 'object' && 'f_m' in overrideCam) {
+          // 3) Optional global override only if explicitly enabled
+          cam = overrideCam as CameraModel;
         }
         if (!cam) cam = SONY_RX1R2;
         if (!camObjToIndex.has(cam)) { camObjToIndex.set(cam, cams.length); cams.push(cam); }
         indices[i] = camObjToIndex.get(cam)!;
       }
-      if (overrideCam && typeof overrideCam === 'object' && 'f_m' in overrideCam) {
-        camerasArr = [cams[0]]; // override forces single camera
-        poseIdxArr = new Uint16Array(poses.length); // zeros
-      } else if (cams.length > 1) {
+      if (cams.length > 1) {
         camerasArr = cams; poseIdxArr = indices; // multi-camera
       } else {
         camerasArr = [cams[0]]; poseIdxArr = new Uint16Array(poses.length);
@@ -406,21 +429,24 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
     // All polygons currently on the map
     let allPolygons = getPolygons();
     let tilesSourcePolygons: PolygonLngLatWithId[] = opts?.polygonId ? allPolygons.filter(p => (p.id || 'unknown') === opts.polygonId) : allPolygons;
-    if (tilesSourcePolygons.length === 0 && poses && poses.length > 0) {
-      const buildPosesAOIRing = (poses: PoseMeters[]): [number,number][] => {
-        if (!poses || poses.length < 3) return [];
+    // Always include a synthetic AOI for imported poses if any
+    if (poses && poses.length > 0 && importedPoses.length > 0) {
+      const buildPosesAOIRing = (posesIn: PoseMeters[]): [number,number][] => {
+        if (!posesIn || posesIn.length < 3) return [];
         const MAX_POINTS = 2000;
-        const step = Math.max(1, Math.floor(poses.length / MAX_POINTS));
-        const pts = poses.filter((_,i)=> i % step === 0).map(p=>{ const [lng, lat] = metersToLngLat(p.x, p.y); return turf.point([lng, lat]); });
+        const step = Math.max(1, Math.floor(posesIn.length / MAX_POINTS));
+        const pts = posesIn.filter((_,i)=> i % step === 0).map(p=>{ const [lng, lat] = metersToLngLat(p.x, p.y); return turf.point([lng, lat]); });
         const fc = turf.featureCollection(pts); const hull = turf.convex(fc); if (!hull) return [];
         const geom: any = (hull as any).geometry; return geom.type === 'Polygon' ? geom.coordinates[0] : geom.coordinates[0][0];
       };
-      const ring = poseAreaRingRef.current?.length ? poseAreaRingRef.current : buildPosesAOIRing(poses);
+      const ring = poseAreaRingRef.current?.length ? poseAreaRingRef.current : buildPosesAOIRing(importedPoses);
       poseAreaRingRef.current = ring;
       if (ring.length >= 4) {
         const synth = { id: '__POSES__', ring } as PolygonLngLatWithId;
-        allPolygons = [synth];
-        tilesSourcePolygons = [synth];
+        // Add to total polygon set
+        allPolygons = [...allPolygons, synth];
+        // If running a full compute, also include in tiles coverage to keep imported AOI visible
+        if (!opts?.polygonId || opts.polygonId === '__POSES__') tilesSourcePolygons = [...tilesSourcePolygons, synth];
       }
     }
 
@@ -524,7 +550,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
 
         if (mySeq === computeSeqRef.current) {
           if (showOverlap) addOrUpdateTileOverlay(map, res, { kind: "overlap", runId, opacity });
-          if (showGsd) addOrUpdateTileOverlay(map, res, { kind: "gsd", runId, opacity, gsdMax: 0.1 });
+        if (showGsd) addOrUpdateTileOverlay(map, res, { kind: "gsd", runId, opacity, gsdMin: 0.005, gsdMax: 0.05 });
         }
       }
 
@@ -538,9 +564,8 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
           neededTileKeys.add(`${zoom}/${t.x}/${t.y}`);
         }
       }
-      // If poses-only synthetic AOI active
-      if (currentPolysForPrune.length === 0 && poseAreaRingRef.current.length >= 4) {
-        // derive needed tiles from synthetic ring
+      // Always include synthetic AOI for imported poses if present
+      if (poseAreaRingRef.current.length >= 4) {
         const synthPoly: PolygonLngLatWithId = { id: '__POSES__', ring: poseAreaRingRef.current };
         for (const t of tilesCoveringPolygon(synthPoly, zoom)) neededTileKeys.add(`${zoom}/${t.x}/${t.y}`);
       }
@@ -621,10 +646,12 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
       });
 
       if (showCameraPoints && poses.length > 0) {
-        const cameraPositions: [number, number, number][] = poses.map(pose => {
+        // Only render imported poses (no polygonId) as red camera points under a dedicated layer
+        const importedOnly = poses.filter(p => !p.polygonId);
+        const cameraPositions: [number, number, number][] = importedOnly.map(pose => {
           const [lng, lat] = metersToLngLat(pose.x, pose.y); return [lng, lat, pose.z];
         });
-        const api = mapRef.current; if (api?.addCameraPoints) { const idForCameras = opts?.polygonId ?? '__ALL__'; api.addCameraPoints(idForCameras, cameraPositions); }
+        const api = mapRef.current; if (api?.addCameraPoints) { api.addCameraPoints('__POSES__', cameraPositions); }
       }
 
       // Update previous rings snapshot AFTER successful tile updates so next edit invalidates correctly
@@ -906,6 +933,21 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
                 setMinClearanceUI(v);
                 const api = mapRef.current as any;
                 if (api?.setMinClearance) api.setMinClearance(v);
+                setTimeout(()=>{ compute(); }, 0);
+              }}
+            />
+          </label>
+          <label className="text-xs text-gray-600 block">Turn extend (m)
+            <input
+              className="w-full border rounded px-2 py-1 text-xs"
+              type="number"
+              min={0}
+              value={turnExtendUI}
+              onChange={(e)=>{
+                const v = Math.max(0, parseFloat(e.target.value||'80'));
+                setTurnExtendUI(v);
+                const api = mapRef.current as any;
+                if (api?.setTurnExtend) api.setTurnExtend(v);
                 setTimeout(()=>{ compute(); }, 0);
               }}
             />

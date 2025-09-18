@@ -53,6 +53,8 @@ export interface MapFlightDirectionAPI {
   getAltitudeMode(): 'legacy' | 'min-clearance';
   setMinClearance(meters: number): void;
   getMinClearance(): number;
+  setTurnExtend(meters: number): void;
+  getTurnExtend(): number;
 
   // 3D visualization
   addCameraPoints(polygonId: string, positions: [number, number, number][]): void;
