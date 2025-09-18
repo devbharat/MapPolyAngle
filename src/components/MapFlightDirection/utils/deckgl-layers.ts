@@ -20,42 +20,22 @@ export function update3DPathLayer(
   const layers: any[] = [];
 
   // Create a simple 3D path layer for each flight line segment
-  path3d.forEach((segment, index) => {
-    const pathLayer = new PathLayer({
-      id: `drone-path-${polygonId}-${index}`,
-      data: [segment],
-      getPath: (d: any) => d,
-      getColor: [30, 144, 255, 200], // Semi-transparent blue
-      getWidth: 8, // 8 meter width
-      widthUnits: 'meters',
-      coordinateSystem: COORDINATE_SYSTEM.LNGLAT,
-      billboard: false, // Keep it oriented in 3D space
-      parameters: {
-        depthTest: true,
-        depthWrite: true,
-      },
-    });
-    
-    layers.push(pathLayer);
-  });
-
-  // Optional: Add a thinner centerline for better visibility
-  const centerlineLayer = new PathLayer({
-    id: `drone-centerline-${polygonId}`,
+  const pathLayer = new PathLayer({
+    id: `drone-path-${polygonId}`,
     data: path3d,
     getPath: (d: any) => d,
-    getColor: [100, 200, 255, 255], // Bright blue centerline
+    getColor: [100, 200, 255, 240], // thin light blue line
     getWidth: 2,
     widthUnits: 'meters',
     coordinateSystem: COORDINATE_SYSTEM.LNGLAT,
     billboard: false,
     parameters: {
       depthTest: true,
-      depthWrite: false, // Draw on top
+      depthWrite: true,
     },
   });
 
-  layers.push(centerlineLayer);
+  layers.push(pathLayer);
 
   setLayers((currentLayers) => {
     const filteredLayers = currentLayers.filter(
