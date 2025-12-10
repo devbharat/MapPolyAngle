@@ -26,8 +26,8 @@ type Props = {
   getPerPolygonParams?: () => Record<string, { altitudeAGL: number; frontOverlap: number; sideOverlap: number; cameraKey?: string }> ;
   onAutoRun?: (autoRunFn: (opts?: { polygonId?: string; reason?: 'lines'|'spacing'|'alt'|'manual' }) => void) => void;
   onClearExposed?: (clearFn: () => void) => void;
-  // NEW: expose a method so parent (header) can trigger DJI pose JSON import
-  onExposePoseImporter?: (openImporter: () => void) => void;
+  // NEW: expose a method so parent (header) can trigger DJI / Wingtra pose JSON import
+  onExposePoseImporter?: (openImporter: (mode?: 'dji' | 'wingtra') => void) => void;
   // NEW: report pose import count to parent so parent can enable panel when only poses exist
   onPosesImported?: (count: number) => void;
   polygonAnalyses: PolygonAnalysisResult[];
@@ -122,6 +122,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
 
   // NEW: poses-only mode state
   const poseFileRef = useRef<HTMLInputElement>(null);
+  const [poseImportKind, setPoseImportKind] = useState<'auto' | 'dji' | 'wingtra'>('auto');
   const [importedPoses, setImportedPoses] = useState<PoseMeters[]>([]);
   const poseAreaRingRef = useRef<[number,number][]>([]);
   // Remember previous polygon rings so we can re-render tiles a moved polygon USED to cover
@@ -189,6 +190,92 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
       map.fitBounds([[Math.min(...lngs), Math.min(...lats)], [Math.max(...lngs), Math.max(...lats)]], { padding:50, duration:1000, maxZoom:16 });
     }
   }, [mapRef]);
+
+  const matchCameraKeyFromName = useCallback((name?: string | null): string | null => {
+    if (!name) return null;
+    const target = name.toLowerCase();
+    for (const [key, cam] of Object.entries(CAMERA_REGISTRY)) {
+      const names = cam.names || [];
+      if (names.some(n => {
+        const t = n.toLowerCase();
+        return t === target || target.includes(t) || t.includes(target);
+      })) {
+        return key;
+      }
+    }
+    return null;
+  }, [CAMERA_REGISTRY]);
+
+  const toNumber = (v: any): number | undefined => {
+    if (typeof v === 'number') return v;
+    if (typeof v === 'string') {
+      const n = parseFloat(v);
+      return Number.isFinite(n) ? n : undefined;
+    }
+    return undefined;
+  };
+
+  const radMaybeDegToDeg = (v: number | undefined): number | undefined => {
+    if (!Number.isFinite(v)) return undefined;
+    const abs = Math.abs(v as number);
+    // Wingtra yaw/pitch/roll appear to be in radians; convert when value is within a 2π range
+    if (abs <= Math.PI * 2 + 1e-3) return (v as number) * 180 / Math.PI;
+    return v as number;
+  };
+
+  const parseWingtraGeotags = useCallback((payload: any): { poses: PoseMeters[]; cameraKey: string | null; camera: CameraModel | null; sourceLabel: string } | null => {
+    if (!payload || !Array.isArray(payload.flights)) return null;
+    const flights = payload.flights;
+    const pickByName = (name: string) => flights.find((f: any) => String(f?.name || '').toLowerCase() === name);
+    const chosen = pickByName('processedforward') || pickByName('raw') || flights[0];
+    if (!chosen || !Array.isArray(chosen.geotag)) return null;
+
+    const poses: PoseMeters[] = [];
+    chosen.geotag.forEach((g: any, idx: number) => {
+      const coord = g.coordinate;
+      if (!Array.isArray(coord) || coord.length < 2) return;
+      const lat = toNumber(coord[0]);
+      const lon = toNumber(coord[1]);
+      const alt = toNumber(coord[2]) ?? 0;
+      if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
+      const { x, y } = wgs84ToWebMercator(lat as number, lon as number);
+      const yawDeg = radMaybeDegToDeg(toNumber(g.yaw));
+      const pitchDeg = radMaybeDegToDeg(toNumber(g.pitch));
+      const rollDeg = radMaybeDegToDeg(toNumber(g.roll));
+      poses.push({
+        id: (g.sequence ?? idx)?.toString?.() ?? `pose_${idx}`,
+        x,
+        y,
+        z: alt,
+        omega_deg: rollDeg ?? 0,
+        phi_deg: pitchDeg ?? 0,
+        kappa_deg: yawDeg ?? 0,
+      } as PoseMeters);
+    });
+
+    if (!poses.length) return null;
+    const cameraKey = matchCameraKeyFromName(typeof payload.model === 'string' ? payload.model : undefined);
+    const camera = cameraKey ? CAMERA_REGISTRY[cameraKey] : null;
+    const sourceLabel = String(chosen.name || (pickByName('processedforward') ? 'ProcessedForward' : 'Raw'));
+    return { poses, cameraKey, camera, sourceLabel };
+  }, [CAMERA_REGISTRY, matchCameraKeyFromName]);
+
+  const applyImportedPoses = useCallback((posesMeters: PoseMeters[], camera: CameraModel | null, cameraKey: string | null, sourceLabel: string) => {
+    setImportedPoses(posesMeters);
+    if (posesMeters.length) {
+      poseAreaRingRef.current = []; // force rebuild in compute via AOI function
+    }
+    if (camera) {
+      setCameraText(JSON.stringify(camera, null, 2));
+      setUseOverrideCamera(true);
+    }
+    setAutoGenerate(false);
+    setShowCameraPoints(true);
+    const cameraMsg = camera ? (cameraKey ? ` using ${cameraKey} camera.` : ' with camera intrinsics.') : '.';
+    toast({ title: "Imported poses", description: `${posesMeters.length} camera poses loaded (${sourceLabel})${cameraMsg}` });
+    onPosesImported?.(posesMeters.length);
+    setTimeout(()=>{ if (poseAreaRingRef.current.length>=4) { const api = mapRef.current; const map = api?.getMap?.(); if(map){ const ring=poseAreaRingRef.current; const lngs=ring.map(c=>c[0]); const lats=ring.map(c=>c[1]); map.fitBounds([[Math.min(...lngs), Math.min(...lats)],[Math.max(...lngs), Math.max(...lats)]], { padding:50, duration:800, maxZoom:16 }); } } }, 30);
+  }, [mapRef, onPosesImported]);
 
   const parseCameraOverride = useCallback((): CameraModel | null => {
     if (!useOverrideCamera) return null;
@@ -818,8 +905,22 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
     reader.onload = (evt) => {
       try {
         const text = evt.target?.result as string;
-        const posesWgs = extractPoses(text);
-        const djiCam = extractCameraModel(text);
+        const obj = JSON.parse(text);
+
+        // 1) Wingtra geotags (preferred when user selected Wingtra or auto-detected)
+        let wingtraResult: ReturnType<typeof parseWingtraGeotags> | null = null;
+        if (poseImportKind !== 'dji') {
+          wingtraResult = parseWingtraGeotags(obj);
+        }
+
+        if (wingtraResult) {
+          applyImportedPoses(wingtraResult.poses, wingtraResult.camera, wingtraResult.cameraKey, wingtraResult.sourceLabel || 'Wingtra');
+          return;
+        }
+
+        // 2) DJI OPF input_cameras.json
+        const posesWgs = extractPoses(obj);
+        const djiCam = extractCameraModel(obj);
         let matchedRegistryKey: string | null = null;
         if (djiCam) {
           // Try to match against known cameras (same dimensions + ~5% focal length tolerance)
@@ -829,41 +930,32 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
               if (relErr < 0.05) { matchedRegistryKey = key; break; }
             }
           }
-          if (matchedRegistryKey) {
-            console.log(`Matched DJI camera to registry key: ${matchedRegistryKey}`);
-            setCameraText(JSON.stringify(CAMERA_REGISTRY[matchedRegistryKey], null, 2));
-          } else {
-            setCameraText(JSON.stringify(djiCam, null, 2));
-          }
+          const camPayload = matchedRegistryKey ? CAMERA_REGISTRY[matchedRegistryKey] : djiCam;
+          setCameraText(JSON.stringify(camPayload, null, 2));
           // Auto‑enable override so imported intrinsics are actually used
           setUseOverrideCamera(true);
         }
         const posesMeters: PoseMeters[] = posesWgs.map((p, i) => {
           const { x, y } = wgs84ToWebMercator(p.lat, p.lon);
-            return { id: p.id ?? `pose_${i}`, x, y, z: p.alt ?? 0, omega_deg: p.roll ?? 0, phi_deg: p.pitch ?? 0, kappa_deg: p.yaw ?? 0 } as PoseMeters;
+          return { id: p.id ?? `pose_${i}`, x, y, z: p.alt ?? 0, omega_deg: p.roll ?? 0, phi_deg: p.pitch ?? 0, kappa_deg: p.yaw ?? 0 } as PoseMeters;
         });
-        setImportedPoses(posesMeters);
-        if (posesMeters.length) {
-          poseAreaRingRef.current = []; // force rebuild in compute via AOI function
-        }
-        setAutoGenerate(false);
-        setShowCameraPoints(true);
-        toast({ title: "Imported poses", description: `${posesMeters.length} camera poses loaded${djiCam ? (matchedRegistryKey ? ` using ${matchedRegistryKey} camera.` : ' with camera intrinsics.') : '.'}` });
-        onPosesImported?.(posesMeters.length);
-        setTimeout(()=>{ if (poseAreaRingRef.current.length>=4) { const api = mapRef.current; const map = api?.getMap?.(); if(map){ const ring=poseAreaRingRef.current; const lngs=ring.map(c=>c[0]); const lats=ring.map(c=>c[1]); map.fitBounds([[Math.min(...lngs), Math.min(...lats)],[Math.max(...lngs), Math.max(...lats)]], { padding:50, duration:800, maxZoom:16 }); } } }, 30);
+        applyImportedPoses(posesMeters, djiCam ?? null, matchedRegistryKey, 'DJI');
       } catch (error) {
-        toast({ variant: "destructive", title: "Invalid file", description: "Unable to parse DJI OPF input_cameras.json" });
+        toast({ variant: "destructive", title: "Invalid file", description: "Unable to parse Wingtra geotags or DJI OPF input_cameras.json" });
         onPosesImported?.(0);
       }
     };
     reader.readAsText(file);
     // Allow selecting the same file again by resetting the input element
     e.target.value = "";
-  }, [mapRef, onPosesImported, CAMERA_REGISTRY]);
+  }, [applyImportedPoses, parseWingtraGeotags, poseImportKind, CAMERA_REGISTRY, onPosesImported]);
 
   React.useEffect(()=>{
     if (onExposePoseImporter) {
-      onExposePoseImporter(()=>{ poseFileRef.current?.click(); });
+      onExposePoseImporter((mode?: 'dji' | 'wingtra') => {
+        setPoseImportKind(mode ?? 'auto');
+        poseFileRef.current?.click();
+      });
     }
   }, [onExposePoseImporter]);
 

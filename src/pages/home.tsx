@@ -33,8 +33,8 @@ export default function Home() {
   // Auto-run GSD analysis when flight lines are updated (already wired)
   const autoRunGSDRef = useRef<((opts?: { polygonId?: string; reason?: 'lines'|'spacing'|'alt'|'manual' }) => void) | null>(null);
   const clearGSDRef = useRef<(() => void) | null>(null);
-  // NEW: ref to open DJI camera JSON importer inside OverlapGSDPanel
-  const openDJIImporterRef = useRef<(() => void) | null>(null);
+  // NEW: ref to open pose JSON importer (DJI or Wingtra) inside OverlapGSDPanel
+  const openDJIImporterRef = useRef<((mode?: 'dji' | 'wingtra') => void) | null>(null);
   
   const terrainZoom = 15; // This is now a fallback - actual zoom is calculated dynamically
   const sampleStep = 1;
@@ -231,8 +231,11 @@ export default function Home() {
                 <DropdownMenuItem onSelect={() => mapRef.current?.openKmlFilePicker?.()}>
                   KML Polygons (.kml)
                 </DropdownMenuItem>
-                <DropdownMenuItem onSelect={() => openDJIImporterRef.current?.()}>
+                <DropdownMenuItem onSelect={() => openDJIImporterRef.current?.('dji')}>
                   DJI Camera JSON (input_cameras.json)
+                </DropdownMenuItem>
+                <DropdownMenuItem onSelect={() => openDJIImporterRef.current?.('wingtra')}>
+                  Wingtra Geotags (.json)
                 </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
