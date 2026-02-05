@@ -297,6 +297,7 @@ export default function Home() {
             frontOverlap: current.frontOverlap ?? 70,
             sideOverlap: current.sideOverlap ?? 70,
             cameraKey: current.cameraKey ?? 'MAP61_17MM',
+            cameraYawOffsetDeg: current.cameraYawOffsetDeg ?? 0,
             useCustomBearing: current.useCustomBearing ?? false,
             customBearingDeg: current.customBearingDeg ?? undefined,
           }}

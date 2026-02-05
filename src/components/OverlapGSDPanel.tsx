@@ -5,7 +5,7 @@ import { addOrUpdateTileOverlay, clearRunOverlays, clearAllOverlays } from "@/ov
 import type { CameraModel, PoseMeters, PolygonLngLatWithId, GSDStats, PolygonTileStats } from "@/overlap/types";
 import { lngLatToMeters } from "@/overlap/mercator";
 import { metersToLngLat } from "@/services/Projection";
-import { SONY_RX1R2, DJI_ZENMUSE_P1_24MM, ILX_LR1_INSPECT_85MM, MAP61_17MM, RGB61_24MM } from "@/domain/camera";
+import { SONY_RX1R2, DJI_ZENMUSE_P1_24MM, ILX_LR1_INSPECT_85MM, MAP61_17MM, RGB61_24MM, forwardSpacingRotated } from "@/domain/camera";
 import { sampleCameraPositionsOnFlightPath, build3DFlightPath } from "@/components/MapFlightDirection/utils/geometry";
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -23,7 +23,7 @@ type Props = {
   mapRef: React.RefObject<MapFlightDirectionAPI>;
   mapboxToken: string;
   /** Provide per‑polygon params (altitude/front/side) so we can compute per‑polygon photoSpacing. */
-  getPerPolygonParams?: () => Record<string, { altitudeAGL: number; frontOverlap: number; sideOverlap: number; cameraKey?: string }> ;
+  getPerPolygonParams?: () => Record<string, { altitudeAGL: number; frontOverlap: number; sideOverlap: number; cameraKey?: string; triggerDistanceM?: number }> ;
   onAutoRun?: (autoRunFn: (opts?: { polygonId?: string; reason?: 'lines'|'spacing'|'alt'|'manual' }) => void) => void;
   onClearExposed?: (clearFn: () => void) => void;
   // NEW: expose a method so parent (header) can trigger DJI / Wingtra pose JSON import
@@ -139,6 +139,11 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
   const computeSeqRef = useRef(0); // increment to invalidate in-flight computations
   const [clipInnerBufferM, setClipInnerBufferM] = useState(0);
   const [maxTiltDeg, setMaxTiltDeg] = useState(30); // NEW: max allowable camera tilt (deg from vertical)
+  const [minOverlapForGsd, setMinOverlapForGsd] = useState(3); // Minimum image overlap to consider GSD valid
+  const minOverlapForGsdRef = useRef(minOverlapForGsd);
+  React.useEffect(() => {
+    minOverlapForGsdRef.current = minOverlapForGsd;
+  }, [minOverlapForGsd]);
   // NEW: altitude strategy & min clearance & turn extension (synced with map API if available)
   const [altitudeModeUI, setAltitudeModeUI] = useState<'legacy' | 'min-clearance'>('legacy');
   const [minClearanceUI, setMinClearanceUI] = useState<number>(60);
@@ -193,12 +198,19 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
 
   const matchCameraKeyFromName = useCallback((name?: string | null): string | null => {
     if (!name) return null;
-    const target = name.toLowerCase();
+    const normalize = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, "");
+    const stripVersionSuffix = (s: string) => normalize(s).replace(/v\\d+$/g, "");
+    const target = normalize(name);
+    const targetStem = stripVersionSuffix(name);
     for (const [key, cam] of Object.entries(CAMERA_REGISTRY)) {
       const names = cam.names || [];
       if (names.some(n => {
-        const t = n.toLowerCase();
-        return t === target || target.includes(t) || t.includes(target);
+        const t = normalize(n);
+        const ts = stripVersionSuffix(n);
+        if (t === target) return true;
+        if (target.includes(t) || t.includes(target)) return true;
+        if (targetStem && ts && (targetStem === ts || targetStem.includes(ts) || ts.includes(targetStem))) return true;
+        return false;
       })) {
         return key;
       }
@@ -292,9 +304,15 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
 
   // Helper: per‑polygon spacing using that polygon's selected camera
   const photoSpacingFor = useCallback((polygonId: string, altitudeAGL: number, frontOverlap: number, paramsMap: any): number => {
+    const p = paramsMap?.[polygonId];
+    const explicit = p?.triggerDistanceM;
+    if (Number.isFinite(explicit) && (explicit as number) > 0) {
+      return explicit as number;
+    }
     const cam = effectiveCameraForPolygon(polygonId, paramsMap);
-    const groundHeight = (cam.h_px * cam.sy_m * altitudeAGL) / cam.f_m;
-    return groundHeight * (1 - frontOverlap / 100);
+    const yawOffset = p?.cameraYawOffsetDeg ?? 0;
+    const rotate90 = Math.round((((yawOffset % 180) + 180) % 180)) === 90;
+    return forwardSpacingRotated(cam, altitudeAGL, frontOverlap, rotate90);
   }, [effectiveCameraForPolygon]);
 
   // Accurate aggregation with tail trimming and fixed 8-bin histogram for display
@@ -414,6 +432,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
       const altForThisPoly = p?.altitudeAGL ?? altitudeAGL ?? 100;
       const front = p?.frontOverlap ?? 80;
       const spacingForward = photoSpacingFor(polygonId, altForThisPoly, front, paramsMap);
+      const yawOffset = p?.cameraYawOffsetDeg ?? 0;
 
       const mode = (api as any)?.getAltitudeMode ? (api as any).getAltitudeMode() : 'legacy';
       const minClr = (api as any)?.getMinClearance ? (api as any).getMinClearance() : 60;
@@ -437,14 +456,18 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
       };
       const filtered = ring && ring.length>=3 ? cameraPositions.filter(([lng,lat])=> inside(lng,lat,ring)) : cameraPositions;
 
+      const normalizeDeg = (d: number) => ((d % 360) + 360) % 360;
       filtered.forEach(([lng, lat, altMSL, yawDeg]) => {
         const [x, y] = lngLatToMeters(lng, lat);
+        // Align camera so image height (y-axis) is along flight direction; width is cross-track.
+        // yawDeg is bearing CW from North; kappa in our math is CCW about +Z.
+        const kappaDeg = normalizeDeg(-yawDeg + yawOffset);
         poses.push({
           id: `photo_${poseId++}`,
           x, y, z: altMSL,
           omega_deg: 0,
           phi_deg: 0,
-          kappa_deg: yawDeg,
+          kappa_deg: kappaDeg,
           polygonId // tag pose with polygon for per‑camera assignment
         });
       });
@@ -679,7 +702,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
         const tile = { z:t.z, x:t.x, y:t.y, size: tileData.width, data: freshData };
 
         // Always pass ALL polygons so each tile overlay is the union of all current areas
-        const res = await worker.runTile({ tile, polygons: polygonsForWorker, poses, cameras: camerasArr, poseCameraIndices: poseIdxArr, camera: (!camerasArr || camerasArr.length===0)? undefined : undefined, options: { clipInnerBufferM } } as any);
+        const res = await worker.runTile({ tile, polygons: polygonsForWorker, poses, cameras: camerasArr, poseCameraIndices: poseIdxArr, camera: (!camerasArr || camerasArr.length===0)? undefined : undefined, options: { clipInnerBufferM, minOverlapForGsd: minOverlapForGsdRef.current } } as any);
         // If a clear() or new compute() happened, stop applying results
         if (mySeq !== computeSeqRef.current) {
           break;
@@ -854,10 +877,6 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
     }
     if (autoTriesRef.current < 15) {
       autoTriesRef.current += 1;
-      // Helpful debug trace on first retry
-      if (autoTriesRef.current === 1) {
-        console.debug('[GSD auto-run] waiting:', { ready, havePolys, haveLines, reason: opts?.reason });
-      }
       if (autoRunTimeoutRef.current) clearTimeout(autoRunTimeoutRef.current);
       autoRunTimeoutRef.current = window.setTimeout(()=>{ if ((autoGenerate || importedPoses.length>0) && !running) autoRun(opts); }, 250);
     } else { autoTriesRef.current = 0; }
@@ -1226,6 +1245,22 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
             />
           </label>
           <label className="text-xs text-gray-600 block">Max tilt (deg)<input className="w-full border rounded px-2 py-1 text-xs" type="number" min={0} max={90} value={maxTiltDeg} onChange={e=>setMaxTiltDeg(Math.max(0, Math.min(90, parseFloat(e.target.value||'10'))))} /></label>
+          <label className="text-xs text-gray-600 block">
+            Min overlap for GSD (images)
+            <input
+              className="w-full border rounded px-2 py-1 text-xs"
+              type="number"
+              min={1}
+              max={10}
+              value={minOverlapForGsd}
+              onChange={(e)=>{
+                const v = Math.max(1, Math.min(10, Math.round(parseFloat(e.target.value || '3'))));
+                minOverlapForGsdRef.current = v;
+                setMinOverlapForGsd(v);
+                setTimeout(()=>{ compute(); }, 0);
+              }}
+            />
+          </label>
           {autoGenerate && <div className="text-xs text-gray-500">{parsePosesMeters()?.length || 0} poses generated</div>}
         </div>
       </div>

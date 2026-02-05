@@ -72,6 +72,8 @@ export type WorkerIn = {
     gsdMaxForPalette?: number; // meters per pixel for visualization clamp
     /** Optional: stop counting once overlap reaches this number (per pixel). Default: Infinity */
     maxOverlapNeeded?: number;
+    /** Minimum number of overlapping images required for GSD to be considered valid. Default: 4 */
+    minOverlapForGsd?: number;
     /** Optional: spatial grid resolution for pose indexing per-tile. Default: 8 */
     gridSize?: number;
     /**

@@ -15,6 +15,7 @@ import {
 } from '@/utils/terrainAspectHybrid';
 // Add EGM96 conversion for proper vertical datum handling
 import * as egm96 from 'egm96-universal';
+import type { CameraModel } from '@/domain/types';
 
 /**
  * Convert elevation from EGM96 geoid (Mapbox terrain) to WGS84 ellipsoid
@@ -108,20 +109,17 @@ export function queryMinMaxElevationAlongPolylineWGS84(
  * @returns Flight line spacing in meters
  */
 export function calculateFlightLineSpacing(
-  camera: { f_m: number; sx_m: number; w_px: number },
+  camera: CameraModel,
   altitudeAGL: number,
   sideOverlapPercent: number
 ): number {
   // Calculate ground sample distance (GSD)
   const gsd = (altitudeAGL * camera.sx_m) / camera.f_m;
-  
-  // Calculate sensor width on ground
+  // Cross-track footprint uses image width when width is sideways
   const sensorWidthGround = gsd * camera.w_px;
-  
   // Calculate spacing based on desired side overlap
   const overlapFraction = sideOverlapPercent / 100;
   const spacing = sensorWidthGround * (1 - overlapFraction);
-  
   return spacing;
 }
 

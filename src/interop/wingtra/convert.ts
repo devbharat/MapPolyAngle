@@ -56,10 +56,53 @@ const CAMERA_LIST: Array<{ key:string; model: CameraModel }> = [
 
 export function resolveCameraInfoFromWingtra(payloadName?: string, payloadKey?: string): { camera: CameraModel; key: string } {
   const candidates = Array.from(new Set([payloadName, payloadKey].filter(Boolean))) as string[];
+
+  const normalize = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, "");
+  const stripVersionSuffix = (s: string) => normalize(s).replace(/v\\d+$/g, "");
+  const matches = (candidate: string, name: string) => {
+    const cn = normalize(candidate);
+    const nn = normalize(name);
+    if (cn === nn) return true;
+    const cs = stripVersionSuffix(candidate);
+    const ns = stripVersionSuffix(name);
+    if (cs === ns && cs.length > 0) return true;
+    if (cn.includes(nn) || nn.includes(cn)) return true;
+    if (cs && ns && (cs.includes(ns) || ns.includes(cs))) return true;
+    return false;
+  };
+
+  // 1) Exact (case-sensitive) match against provided names
   for (const c of candidates) {
     for (const { key, model } of CAMERA_LIST) {
-      if (model.names?.includes(c)) {
+      if (model.names?.includes(c) || key === c) {
         return { camera: model, key };
+      }
+    }
+  }
+
+  // 2) Normalized exact match (case-insensitive, punctuation/whitespace removed)
+  for (const c of candidates) {
+    for (const { key, model } of CAMERA_LIST) {
+      const names = [key, ...(model.names || [])];
+      for (const n of names) {
+        if (matches(c, n)) {
+          return { camera: model, key };
+        }
+      }
+    }
+  }
+
+  // 3) Fallback: try to match partials after stripping trailing version suffixes
+  for (const c of candidates) {
+    const cs = stripVersionSuffix(c);
+    if (!cs) continue;
+    for (const { key, model } of CAMERA_LIST) {
+      const names = [key, ...(model.names || [])];
+      for (const n of names) {
+        const ns = stripVersionSuffix(n);
+        if (cs.includes(ns) || ns.includes(cs)) {
+          return { camera: model, key };
+        }
       }
     }
   }

@@ -22,6 +22,8 @@ export interface PolygonParams {
   frontOverlap: number;  // percent 0–95
   sideOverlap: number;   // percent 0–95
   cameraKey?: string;    // optional camera identifier
+  triggerDistanceM?: number; // optional: explicit trigger distance from import
+  cameraYawOffsetDeg?: number; // optional: rotate camera about Z (e.g. 90 to swap width/height)
   useCustomBearing?: boolean; // optional: user wants to specify bearing manually
   customBearingDeg?: number;  // bearing degrees CW from North
 }

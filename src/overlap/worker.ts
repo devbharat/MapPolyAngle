@@ -268,13 +268,26 @@ self.onmessage = (ev: MessageEvent<Msg>) => {
   let zMin = +Infinity; for (let i=0;i<elev.length;i++){ const ez=elev[i]; if (ez < zMin) zMin = ez; }
 
   // Precompute projection helpers
-  tx.pixelSize = (tx.maxX - tx.minX) / size;
+  const Rm = 6378137;
+  const pixSizeRaw = (tx.maxX - tx.minX) / size;
+  const minXRaw = tx.minX, maxYRaw = tx.maxY;
+  const xwColRaw = new Float64Array(size); const ywRowRaw = new Float64Array(size);
+  for (let c=0;c<size;c++) xwColRaw[c] = minXRaw + (c+0.5)*pixSizeRaw;
+  for (let r=0;r<size;r++) ywRowRaw[r] = maxYRaw - (r+0.5)*pixSizeRaw;
+  const cosLatPerRow = new Float64Array(size);
+  for (let r=0;r<size;r++){ const latRad=Math.atan(Math.sinh(ywRowRaw[r]/Rm)); cosLatPerRow[r]=Math.cos(latRad);}  
+
+  // Mercator scale correction (approx): convert x/y to local ground meters
+  const latCenter = Math.atan(Math.sinh(((tx.minY + tx.maxY) * 0.5) / Rm));
+  const scale = Math.cos(latCenter);
+  const minX = minXRaw * scale;
+  const maxX = tx.maxX * scale;
+  const minY = tx.minY * scale;
+  const maxY = tx.maxY * scale;
+  const pixSize = pixSizeRaw * scale;
   const xwCol = new Float64Array(size); const ywRow = new Float64Array(size);
-  const minX = tx.minX, maxY = tx.maxY, pixSize = tx.pixelSize;
   for (let c=0;c<size;c++) xwCol[c] = minX + (c+0.5)*pixSize;
   for (let r=0;r<size;r++) ywRow[r] = maxY - (r+0.5)*pixSize;
-  const Rm = 6378137; const cosLatPerRow = new Float64Array(size);
-  for (let r=0;r<size;r++){ const latRad=Math.atan(Math.sinh(ywRow[r]/Rm)); cosLatPerRow[r]=Math.cos(latRad);}  
 
   // Precompute normals & active indices
   const normals = new Float32Array(size*size*3);
@@ -283,7 +296,7 @@ self.onmessage = (ev: MessageEvent<Msg>) => {
       if (!polyMask[idx]) continue;
       const row=(idx/size)|0; const col=idx-row*size;
       // Adjust pixel spacing by cos(latitude) to better approximate ground spacing
-      const pixSizeGround = pixSize * cosLatPerRow[row];
+      const pixSizeGround = pixSizeRaw * cosLatPerRow[row];
       const n=normalFromDEM(elev,size,row,col,pixSizeGround);
       const base=idx*3; normals[base]=n[0]; normals[base+1]=n[1]; normals[base+2]=n[2];
       activeIdxs[w++]=idx;
@@ -313,14 +326,18 @@ self.onmessage = (ev: MessageEvent<Msg>) => {
                                   Rm[1],Rm[4],Rm[7],
                                   Rm[2],Rm[5],Rm[8] ]);      // world->camera
     // Estimate local ground at the pose location to compute AGL-based radius
-    const colP = Math.min(size - 1, Math.max(0, Math.floor((p.x - minX) / pixSize)));
-    const rowP = Math.min(size - 1, Math.max(0, Math.floor((maxY - p.y) / pixSize)));
+    const colP = Math.min(size - 1, Math.max(0, Math.floor((p.x - minXRaw) / pixSizeRaw)));
+    const rowP = Math.min(size - 1, Math.max(0, Math.floor((maxYRaw - p.y) / pixSizeRaw)));
     const zLocal = elev[rowP * size + colP];
     const H = Math.max(1.0, p.z - zLocal);
     const diagTan = camDiagTan[camIdx];
     const radius = H * diagTan * 1.25;
+    const xs = p.x * scale;
+    const ys = p.y * scale;
     prepared[i] = {
       ...p,
+      x: xs,
+      y: ys,
       R: new Float64Array([ Rm[0],Rm[1],Rm[2], Rm[3],Rm[4],Rm[5], Rm[6],Rm[7],Rm[8] ]),
       RT,
       radius,
@@ -333,7 +350,7 @@ self.onmessage = (ev: MessageEvent<Msg>) => {
   }
 
   // Stage-1 coarse cull vs tile box
-  const rectMinX = tx.minX, rectMaxX = tx.maxX, rectMinY = tx.minY, rectMaxY = tx.maxY;
+  const rectMinX = minX, rectMaxX = maxX, rectMinY = minY, rectMaxY = maxY;
   const candidateIdxs: number[] = [];
   for (let i=0;i<prepared.length;i++) {
     const p = prepared[i];
@@ -345,17 +362,17 @@ self.onmessage = (ev: MessageEvent<Msg>) => {
 
   // Spatial grid of candidate poses
   const gridSize = Math.max(2, Math.min(32, options?.gridSize ?? 8));
-  const cellW = (tx.maxX - tx.minX) / gridSize; const cellH = (tx.maxY - tx.minY) / gridSize;
+  const cellW = (maxX - minX) / gridSize; const cellH = (maxY - minY) / gridSize;
   const grid: number[][] = new Array(gridSize*gridSize); for (let i=0;i<grid.length;i++) grid[i]=[];
   for (let j=0;j<useIdxs.length;j++) {
     const i = useIdxs[j]; const p = prepared[i];
-    const minXb = Math.max(tx.minX, p.x - p.radius); const maxXb = Math.min(tx.maxX, p.x + p.radius);
-    const minYb = Math.max(tx.minY, p.y - p.radius); const maxYb = Math.min(tx.maxY, p.y + p.radius);
+    const minXb = Math.max(minX, p.x - p.radius); const maxXb = Math.min(maxX, p.x + p.radius);
+    const minYb = Math.max(minY, p.y - p.radius); const maxYb = Math.min(maxY, p.y + p.radius);
     if (minXb > maxXb || minYb > maxYb) continue;
-    const x0 = Math.max(0, Math.floor((minXb - tx.minX) / cellW));
-    const x1 = Math.min(gridSize - 1, Math.floor((maxXb - tx.minX) / cellW));
-    const y0 = Math.max(0, Math.floor((tx.maxY - maxYb) / cellH));
-    const y1 = Math.min(gridSize - 1, Math.floor((tx.maxY - minYb) / cellH));
+    const x0 = Math.max(0, Math.floor((minXb - minX) / cellW));
+    const x1 = Math.min(gridSize - 1, Math.floor((maxXb - minX) / cellW));
+    const y0 = Math.max(0, Math.floor((maxY - maxYb) / cellH));
+    const y1 = Math.min(gridSize - 1, Math.floor((maxY - minYb) / cellH));
     for (let gy=y0; gy<=y1; gy++) {
       const rowBase = gy*gridSize;
       for (let gx=x0; gx<=x1; gx++) grid[rowBase+gx].push(j);
@@ -373,9 +390,6 @@ self.onmessage = (ev: MessageEvent<Msg>) => {
   const poseHitsPerPoly: Array<Set<number>> = polyIds.map(()=> new Set<number>());
 
   const cosIncMin = 1e-3;
-  // DEBUG: Track camera heights for debug output
-  const debugCameraHeights = new Map<number, { poseId: string; heightAGL: number; terrainElev: number; cameraElev: number }>();
-  
   // Active pixel loop - now using consistent WGS84 ellipsoid heights for both terrain and poses
   for (let t=0; t<activeIdxs.length; t++) {
     const idx = activeIdxs[t];
@@ -391,17 +405,6 @@ self.onmessage = (ev: MessageEvent<Msg>) => {
       const dx2 = xw - p.x, dy2 = yw - p.y; if (dx2*dx2 + dy2*dy2 > p.radiusSq) continue;
       const camIdx = p.camIndex; const cam = camModels[camIdx];
       const camHit = camRayToPixel(cam, p.RT, p.x, p.y, p.z, xw, yw, zw); if (!camHit) continue;
-      
-      // DEBUG: Calculate and store camera height above ground for this pose
-      if (!debugCameraHeights.has(poseIdx)) {
-        const heightAGL = p.z - zw; // Camera elevation - terrain elevation = height AGL
-        debugCameraHeights.set(poseIdx, {
-          poseId: p.id || `pose_${poseIdx}`,
-          heightAGL: heightAGL,
-          terrainElev: zw,
-          cameraElev: p.z
-        });
-      }
       
       // --- Jacobian-based surface GSD (pinhole-correct) ---
       const vz = (zw - p.z);
@@ -463,22 +466,22 @@ self.onmessage = (ev: MessageEvent<Msg>) => {
     if (localOverlap > 0) { overlap[idx] = localOverlap; gsdMin[idx] = localMinG; }
   }
 
-  // DEBUG: Print camera heights (sample first 10 for brevity)
-  const heightEntries = Array.from(debugCameraHeights.values()).slice(0, 10);
-  if (heightEntries.length > 0) {
-    //console.log(`[Worker ${z}/${x}/${y}] Camera Heights (WGS84 ellipsoid):`);
-    heightEntries.forEach(({ poseId, heightAGL, terrainElev, cameraElev }) => {
-     //console.log(`  ${poseId}: ${heightAGL.toFixed(1)}m AGL (cam: ${cameraElev.toFixed(1)}m, terrain: ${terrainElev.toFixed(1)}m)`);
-    });
-  }
-
   // Enforce minimum overlap for GSD validity
-  const MIN_OVERLAP_FOR_GSD = 4;
-  for (let t=0;t<activeIdxs.length;t++){ const idx=activeIdxs[t]; if (overlap[idx]>0 && overlap[idx] < MIN_OVERLAP_FOR_GSD){ overlap[idx]=0; gsdMin[idx]=Number.POSITIVE_INFINITY; } }
+  const MIN_OVERLAP_FOR_GSD = Number.isFinite(options?.minOverlapForGsd)
+    ? Math.max(1, Math.round(options!.minOverlapForGsd as number))
+    : 4;
+  for (let t=0;t<activeIdxs.length;t++){
+    const idx = activeIdxs[t];
+    if (overlap[idx] > 0 && overlap[idx] < MIN_OVERLAP_FOR_GSD) {
+      overlap[idx] = 0;
+      gsdMin[idx] = Number.POSITIVE_INFINITY;
+    }
+  }
 
   // Union summaries
   let maxOverlap = 0, minGsd = Number.POSITIVE_INFINITY;
   for (let t=0;t<activeIdxs.length;t++){ const idx=activeIdxs[t]; const ov = overlap[idx]; if (ov>maxOverlap) maxOverlap=ov; const g=gsdMin[idx]; if (g>0 && isFinite(g) && g<minGsd) minGsd=g; }
+
 
   // Per-polygon stats
   const perPolygon: PolygonTileStats[] = [];

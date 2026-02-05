@@ -21,10 +21,10 @@ import {
   clearAllTriggerPoints
 } from './utils/mapbox-layers';
 import { update3DPathLayer, remove3DPathLayer, update3DCameraPointsLayer, remove3DCameraPointsLayer, update3DTriggerPointsLayer, remove3DTriggerPointsLayer } from './utils/deckgl-layers';
-import { build3DFlightPath, calculateFlightLineSpacing, calculateOptimalTerrainZoom, sampleCameraPositionsOnFlightPath } from './utils/geometry';
+import { build3DFlightPath, calculateOptimalTerrainZoom, sampleCameraPositionsOnFlightPath } from './utils/geometry';
 import { PolygonAnalysisResult, PolygonParams } from './types';
 import { parseKmlPolygons, calculateKmlBounds, extractKmlFromKmz } from '@/utils/kml';
-import { SONY_RX1R2, DJI_ZENMUSE_P1_24MM, ILX_LR1_INSPECT_85MM, MAP61_17MM, RGB61_24MM, forwardSpacing } from '@/domain/camera';
+import { SONY_RX1R2, DJI_ZENMUSE_P1_24MM, ILX_LR1_INSPECT_85MM, MAP61_17MM, RGB61_24MM, forwardSpacingRotated, lineSpacingRotated } from '@/domain/camera';
 import type { MapFlightDirectionAPI, ImportedFlightplanArea } from './api';
 import { fetchTilesForPolygon } from './utils/terrain';
 
@@ -160,7 +160,9 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
 
       const cameraKey = (params as any).cameraKey;
       const camera = cameraKey ? (CAMERA_REGISTRY as any)[cameraKey] || DEFAULT_CAMERA : DEFAULT_CAMERA;
-      const defaultSpacing = calculateFlightLineSpacing(camera, params.altitudeAGL, params.sideOverlap);
+      const yawOffset = params.cameraYawOffsetDeg ?? 0;
+      const rotate90 = Math.round((((yawOffset % 180) + 180) % 180)) === 90;
+      const defaultSpacing = lineSpacingRotated(camera, params.altitudeAGL, params.sideOverlap, rotate90);
 
       const customBearing = params.useCustomBearing && Number.isFinite(params.customBearingDeg)
         ? (((params.customBearingDeg ?? 0) % 360) + 360) % 360
@@ -230,7 +232,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       if (deckOverlayRef.current && fl.flightLines.length > 0) {
         const path3d = build3DFlightPath(fl.flightLines, tiles, fl.lineSpacing, { altitudeAGL: params.altitudeAGL, mode: altitudeMode, minClearance: minClearanceM, turnExtendM });
         update3DPathLayer(deckOverlayRef.current, polygonId, path3d, setDeckLayers);
-        const spacingForward = forwardSpacing(camera, params.altitudeAGL, params.frontOverlap);
+        const spacingForward = forwardSpacingRotated(camera, params.altitudeAGL, params.frontOverlap, rotate90);
         const samples = sampleCameraPositionsOnFlightPath(path3d, spacingForward, { includeTurns: false });
         const zOffset = 1;
         const ring = res.polygon.coordinates as [number,number][];
@@ -367,9 +369,11 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
 
         // Spacing: keep override spacing if present, otherwise recompute from params
         const cameraForPoly = params?.cameraKey ? (CAMERA_REGISTRY as any)[params.cameraKey] || DEFAULT_CAMERA : DEFAULT_CAMERA;
+        const yawOffset = params.cameraYawOffsetDeg ?? 0;
+        const rotate90 = Math.round((((yawOffset % 180) + 180) % 180)) === 90;
         const spacing =
           override?.lineSpacingM ??
-          calculateFlightLineSpacing(cameraForPoly, params.altitudeAGL, params.sideOverlap);
+          lineSpacingRotated(cameraForPoly, params.altitudeAGL, params.sideOverlap, rotate90);
 
         // Remove existing flight lines first to avoid Mapbox layer conflicts
         removeFlightLinesForPolygon(mapRef.current, result.polygonId);
@@ -397,7 +401,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           const path3d = build3DFlightPath(lines.flightLines, tiles, lines.lineSpacing, { altitudeAGL: params.altitudeAGL, mode: altitudeMode, minClearance: minClearanceM, turnExtendM });
           update3DPathLayer(deckOverlayRef.current, result.polygonId, path3d, setDeckLayers);
           // 3D trigger points sampled along the 3D path
-          const spacingForward = forwardSpacing(cameraForPoly, params.altitudeAGL, params.frontOverlap);
+          const spacingForward = forwardSpacingRotated(cameraForPoly, params.altitudeAGL, params.frontOverlap, rotate90);
           const samples = sampleCameraPositionsOnFlightPath(path3d, spacingForward, { includeTurns: false });
           const zOffset = 1; // lift triggers slightly above the path for visibility
           const ring = result.polygon.coordinates as [number,number][];
@@ -692,12 +696,26 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           newIds.push(id);
           newRings.push(item.ring as [number, number][]);
 
+          const cameraKey = item.cameraKey || imported.payloadCameraKey || 'SONY_RX1R2';
+          const cam = (CAMERA_REGISTRY as any)[cameraKey] || DEFAULT_CAMERA;
+          const swathW = (cam.w_px * cam.sx_m * item.altitudeAGL) / cam.f_m;
+          const swathH = (cam.h_px * cam.sy_m * item.altitudeAGL) / cam.f_m;
+          const spacingFromW = swathW * (1 - (item.sideOverlap ?? 70) / 100);
+          const spacingFromH = swathH * (1 - (item.sideOverlap ?? 70) / 100);
+          const fileSpacing = item.lineSpacingM;
+          const cameraYawOffsetDeg =
+            Number.isFinite(fileSpacing) && fileSpacing > 0
+              ? (Math.abs(fileSpacing - spacingFromW) <= Math.abs(fileSpacing - spacingFromH) ? 0 : 90)
+              : 0;
+
           const polygonState = {
             params: {
               altitudeAGL: item.altitudeAGL,
               frontOverlap: item.frontOverlap,
               sideOverlap: item.sideOverlap,
-              cameraKey: item.cameraKey || imported.payloadCameraKey || 'SONY_RX1R2', // use resolved camera from import
+              cameraKey,
+              triggerDistanceM: item.triggerDistanceM,
+              cameraYawOffsetDeg,
             },
             original: { bearingDeg: item.angleDeg, lineSpacingM: item.lineSpacingM },
             override: { bearingDeg: item.angleDeg, lineSpacingM: item.lineSpacingM, source: 'wingtra' as const }
@@ -723,10 +741,12 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
               angleDeg: item.angleDeg,
               lineSpacingM: item.lineSpacingM,
               triggerDistanceM: item.triggerDistanceM,
-              cameraKey: item.cameraKey || imported.payloadCameraKey || 'SONY_RX1R2',
+              cameraKey,
+              cameraYawOffsetDeg,
               source: 'wingtra'
             }
           });
+
         }
 
         setPolygonParams(prev => {
@@ -1130,7 +1150,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       getImportedOriginals: () => Object.fromEntries(importedOriginals),
       exportWingtraFlightPlan: () => {
         // Build area list from current state
-        const polys: Array<{ ring:[number,number][]; params: { altitudeAGL:number; frontOverlap:number; sideOverlap:number }; bearingDeg:number; lineSpacingM?:number; triggerDistanceM?:number }> = [];
+        const polys: Array<{ ring:[number,number][]; params: { altitudeAGL:number; frontOverlap:number; sideOverlap:number; triggerDistanceM?: number }; bearingDeg:number; lineSpacingM?:number; triggerDistanceM?:number }> = [];
         polygonParams.forEach((params, pid) => {
           const res = polygonResults.get(pid);
           const collection = drawRef.current?.getAll();
@@ -1140,7 +1160,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           const override = bearingOverrides.get(pid);
           const bearingDeg = override ? override.bearingDeg : (res?.result.contourDirDeg ?? 0);
           const lineSpacingM = override?.lineSpacingM || (polygonFlightLines.get(pid)?.lineSpacing);
-          polys.push({ ring: ring as any, params: { altitudeAGL: params.altitudeAGL, frontOverlap: params.frontOverlap, sideOverlap: params.sideOverlap }, bearingDeg, lineSpacingM, triggerDistanceM: undefined });
+          polys.push({ ring: ring as any, params: { altitudeAGL: params.altitudeAGL, frontOverlap: params.frontOverlap, sideOverlap: params.sideOverlap, triggerDistanceM: params.triggerDistanceM }, bearingDeg, lineSpacingM, triggerDistanceM: params.triggerDistanceM });
         });
         const areas = areasFromState(polys);
         let fp;

@@ -34,7 +34,7 @@ export const ILX_LR1_INSPECT_85MM: CameraModel = {
   sy_m: 23.8e-3 / 6336, // ≈3.756 µm
   w_px: 9504,
   h_px: 6336,
-  names: [ 'INSPECT', 'ILX-LR1 85mm', 'ILX_LR1_INSPECT_85MM', 'MAPSTARHighRes_v4' ],
+  names: [ 'INSPECT', 'ILX-LR1 85mm', 'ILX_LR1_INSPECT_85MM', 'MAPSTARHighRes', 'MAPSTARHighRes_v4', 'MAPSTARHighRes_v5' ],
 };
 
 // MAP61 17mm
@@ -44,7 +44,7 @@ export const MAP61_17MM: CameraModel = {
   sy_m: 23.8e-3 / 6336,
   w_px: 9504,
   h_px: 6336,
-  names: [ 'MAP61', 'MAP61 17mm', 'MAP61_17MM', 'MAPSTAROblique_v4' ],
+  names: [ 'MAP61', 'MAP61 17mm', 'MAP61_17MM', 'MAPSTAROblique', 'MAPSTAROblique_v4', 'MAPSTAROblique_v5' ],
 };
 
 // RGB61 24mm (36.0 x 24.0 mm sensor, 9504 x 6336, 24 mm lens)
@@ -55,7 +55,7 @@ export const RGB61_24MM: CameraModel = {
   sy_m: 24.0e-3 / 6336,
   w_px: 9504,
   h_px: 6336,
-  names: [ 'RGB61', 'RGB61 24mm', 'RGB61_24MM', 'RGB61_v4' ],
+  names: [ 'RGB61', 'RGB61 24mm', 'RGB61_24MM', 'RGB61_v4', 'RGB61_v5' ],
 };
 
 /**
@@ -68,11 +68,27 @@ export function forwardSpacing(
 ): number {
   // Ground sample distance (GSD)
   const gsd = (camera.sy_m * altitudeAGL) / camera.f_m;
-  
-  // Photo footprint in the forward direction
+  // Photo footprint in the forward direction (image height aligned with flight)
   const photoFootprintForward = camera.h_px * gsd;
-  
   // Forward spacing accounting for overlap
+  const overlapFraction = frontOverlapPct / 100;
+  return photoFootprintForward * (1 - overlapFraction);
+}
+
+/**
+ * Calculate forward spacing, optionally swapping width/height (rotate 90°).
+ */
+export function forwardSpacingRotated(
+  camera: CameraModel,
+  altitudeAGL: number,
+  frontOverlapPct: number,
+  rotate90: boolean
+): number {
+  const gsdX = (camera.sx_m * altitudeAGL) / camera.f_m;
+  const gsdY = (camera.sy_m * altitudeAGL) / camera.f_m;
+  const alongPx = rotate90 ? camera.w_px : camera.h_px;
+  const alongGsd = rotate90 ? gsdX : gsdY;
+  const photoFootprintForward = alongPx * alongGsd;
   const overlapFraction = frontOverlapPct / 100;
   return photoFootprintForward * (1 - overlapFraction);
 }
@@ -87,11 +103,27 @@ export function lineSpacing(
 ): number {
   // Ground sample distance (GSD)
   const gsd = (camera.sx_m * altitudeAGL) / camera.f_m;
-  
-  // Photo footprint in the side direction
+  // Photo footprint in the side direction (image width aligned cross-track)
   const photoFootprintSide = camera.w_px * gsd;
-  
   // Line spacing accounting for overlap
+  const overlapFraction = sideOverlapPct / 100;
+  return photoFootprintSide * (1 - overlapFraction);
+}
+
+/**
+ * Calculate line spacing, optionally swapping width/height (rotate 90°).
+ */
+export function lineSpacingRotated(
+  camera: CameraModel,
+  altitudeAGL: number,
+  sideOverlapPct: number,
+  rotate90: boolean
+): number {
+  const gsdX = (camera.sx_m * altitudeAGL) / camera.f_m;
+  const gsdY = (camera.sy_m * altitudeAGL) / camera.f_m;
+  const acrossPx = rotate90 ? camera.h_px : camera.w_px;
+  const acrossGsd = rotate90 ? gsdY : gsdX;
+  const photoFootprintSide = acrossPx * acrossGsd;
   const overlapFraction = sideOverlapPct / 100;
   return photoFootprintSide * (1 - overlapFraction);
 }

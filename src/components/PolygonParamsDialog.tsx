@@ -29,6 +29,9 @@ export default function PolygonParamsDialog({
   const [showAdvanced, setShowAdvanced] = React.useState<boolean>(false);
   const [useCustomBearing, setUseCustomBearing] = React.useState<boolean>(defaults?.useCustomBearing ?? false);
   const [customBearingDeg, setCustomBearingDeg] = React.useState<number>(defaults?.customBearingDeg ?? 0);
+  const [rotateCamera90, setRotateCamera90] = React.useState<boolean>(
+    Math.round((((defaults?.cameraYawOffsetDeg ?? 0) % 180) + 180) % 180) === 90
+  );
 
   // map keys to models (could be lifted up later if needed)
   const cameraOptions: Array<{ key:string; model:any; label:string }> = [
@@ -47,9 +50,11 @@ export default function PolygonParamsDialog({
       setCameraKey(defaults?.cameraKey ?? "MAP61_17MM");
       setUseCustomBearing(defaults?.useCustomBearing ?? false);
       setCustomBearingDeg(defaults?.customBearingDeg ?? 0);
-      setShowAdvanced(defaults?.useCustomBearing ?? false);
+      const rotate = Math.round((((defaults?.cameraYawOffsetDeg ?? 0) % 180) + 180) % 180) === 90;
+      setRotateCamera90(rotate);
+      setShowAdvanced(!!(defaults?.useCustomBearing) || rotate);
     }
-  }, [open, defaults?.altitudeAGL, defaults?.frontOverlap, defaults?.sideOverlap, defaults?.cameraKey, defaults?.useCustomBearing, defaults?.customBearingDeg]);
+  }, [open, defaults?.altitudeAGL, defaults?.frontOverlap, defaults?.sideOverlap, defaults?.cameraKey, defaults?.useCustomBearing, defaults?.customBearingDeg, defaults?.cameraYawOffsetDeg]);
 
   if (!open || !polygonId) return null;
 
@@ -117,6 +122,17 @@ export default function PolygonParamsDialog({
                 />
                 Use custom flight direction
               </label>
+              <label className="flex items-center gap-2 text-xs text-gray-600">
+                <input
+                  type="checkbox"
+                  checked={rotateCamera90}
+                  onChange={(e) => {
+                    setRotateCamera90(e.target.checked);
+                    if (e.target.checked) setShowAdvanced(true);
+                  }}
+                />
+                Rotate camera 90° (swap width/height)
+              </label>
               <label className="text-xs text-gray-600 block">
                 Flight direction (° clockwise from North)
                 <input
@@ -147,6 +163,7 @@ export default function PolygonParamsDialog({
                   frontOverlap,
                   sideOverlap,
                   cameraKey,
+                  cameraYawOffsetDeg: rotateCamera90 ? 90 : 0,
                   useCustomBearing,
                   customBearingDeg: useCustomBearing ? normalizedBearing : undefined,
                 };
@@ -162,15 +179,16 @@ export default function PolygonParamsDialog({
                 onClick={() => {
                   const normalizedBearing = ((customBearingDeg % 360) + 360) % 360;
                   const payload: PolygonParams = {
-                    altitudeAGL,
-                    frontOverlap,
-                    sideOverlap,
-                    cameraKey,
-                    useCustomBearing,
-                    customBearingDeg: useCustomBearing ? normalizedBearing : undefined,
-                  };
-                  onSubmitAll(payload);
-                }}
+                  altitudeAGL,
+                  frontOverlap,
+                  sideOverlap,
+                  cameraKey,
+                  cameraYawOffsetDeg: rotateCamera90 ? 90 : 0,
+                  useCustomBearing,
+                  customBearingDeg: useCustomBearing ? normalizedBearing : undefined,
+                };
+                onSubmitAll(payload);
+              }}
                 title="Apply these parameters to all remaining polygons awaiting setup"
               >
                 Apply All
