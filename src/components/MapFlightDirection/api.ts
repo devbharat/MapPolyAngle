@@ -41,6 +41,7 @@ export interface MapFlightDirectionAPI {
 
   // Flight planning
   applyPolygonParams(polygonId: string, params: FlightParams): void;
+  applyPolygonParamsBatch(updates: Array<{ polygonId: string; params: FlightParams }>): void;
   applyParamsToAllPending(params: FlightParams): void; // bulk apply same params to queued polygons
   getFlightLines(): Map<string, { 
     flightLines: number[][][]; 

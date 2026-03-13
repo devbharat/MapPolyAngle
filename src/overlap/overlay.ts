@@ -94,6 +94,45 @@ function encodeGsdToImage(gsd: Float32Array, size: number, gsdMin = 0.005, gsdMa
   return canvas;
 }
 
+function smoothDensityForDisplay(density: Float32Array, size: number): Float32Array {
+  const smoothed = new Float32Array(density.length);
+  const kernel = [
+    1, 2, 1,
+    2, 4, 2,
+    1, 2, 1,
+  ];
+
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const index = y * size + x;
+      const value = density[index];
+      if (!(value > 0) || !Number.isFinite(value)) continue;
+
+      let weightedSum = 0;
+      let totalWeight = 0;
+
+      for (let ky = -1; ky <= 1; ky++) {
+        const ny = y + ky;
+        if (ny < 0 || ny >= size) continue;
+        for (let kx = -1; kx <= 1; kx++) {
+          const nx = x + kx;
+          if (nx < 0 || nx >= size) continue;
+          const neighborIndex = ny * size + nx;
+          const neighbor = density[neighborIndex];
+          if (!(neighbor > 0) || !Number.isFinite(neighbor)) continue;
+          const weight = kernel[(ky + 1) * 3 + (kx + 1)];
+          weightedSum += neighbor * weight;
+          totalWeight += weight;
+        }
+      }
+
+      smoothed[index] = totalWeight > 0 ? weightedSum / totalWeight : value;
+    }
+  }
+
+  return smoothed;
+}
+
 function encodeDensityToImage(density: Float32Array, size: number, densityMin = 0, densityMax = 200): HTMLCanvasElement {
   const canvas = document.createElement("canvas");
   canvas.width = size;
@@ -102,16 +141,18 @@ function encodeDensityToImage(density: Float32Array, size: number, densityMin = 
   const img = ctx.createImageData(size, size);
   const lo = Math.max(0, densityMin);
   const hi = Math.max(lo + 1e-6, densityMax);
+  const displayDensity = smoothDensityForDisplay(density, size);
 
   for (let i = 0, j = 0; i < density.length; i++, j += 4) {
-    const value = density[i];
-    if (!(value > 0) || !Number.isFinite(value)) {
+    const rawValue = density[i];
+    if (!(rawValue > 0) || !Number.isFinite(rawValue)) {
       img.data[j] = 0;
       img.data[j + 1] = 0;
       img.data[j + 2] = 0;
       img.data[j + 3] = 0;
       continue;
     }
+    const value = displayDensity[i];
     // Invert density coloring so low density is worse/red and high density is better/blue.
     const t = 1 - Math.max(0, Math.min(1, (value - lo) / (hi - lo)));
     const [r, g, b] = heatmapColor(t);

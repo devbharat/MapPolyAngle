@@ -177,6 +177,12 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
     setTurnExtendUI(ext);
   }, [mapRef]);
 
+  const getMergedParamsMap = useCallback(() => {
+    const externalParams = getPerPolygonParams?.() ?? {};
+    const internalParams = mapRef.current?.getPerPolygonParams?.() ?? {};
+    return { ...externalParams, ...internalParams };
+  }, [getPerPolygonParams, mapRef]);
+
   // Helper function to generate user-friendly polygon names
   const getPolygonDisplayName = useCallback((polygonId: string): { displayName: string; shortId: string } => {
     if (polygonId === '__POSES__') return { displayName: 'Imported Poses Area', shortId: 'poses' };
@@ -437,10 +443,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
     const api = mapRef.current;
     if (!api?.getFlightLines || !api?.getPolygonTiles) return [];
 
-    // MERGE: internal Map params (from importer / dialog) + external overrides from Home
-    const internalParams = api.getPerPolygonParams?.() ?? {};
-    const externalParams = getPerPolygonParams?.() ?? {};
-    const paramsMap = { ...internalParams, ...externalParams };
+    const paramsMap = getMergedParamsMap();
 
     const flightLinesMap = api.getFlightLines();
     const tilesMap = api.getPolygonTiles();
@@ -497,7 +500,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
       });
     }
     return poses;
-  }, [getPerPolygonParams, mapRef, photoSpacingFor, turnExtendUI]);
+  }, [getMergedParamsMap, mapRef, photoSpacingFor, turnExtendUI]);
 
   const parsePosesMeters = useCallback((): PoseMeters[] | null => {
     const api = mapRef.current;
@@ -675,12 +678,10 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
    *  - a single polygon (opts.polygonId provided), or
    *  - all polygons (default)
    */
-  const compute = useCallback(async (opts?: { polygonId?: string }) => {
+  const compute = useCallback(async (opts?: { polygonId?: string; suppressMapNotReadyToast?: boolean }) => {
     const mySeq = ++computeSeqRef.current;
     const api = mapRef.current;
-    const internalParams = api?.getPerPolygonParams?.() ?? {};
-    const externalParams = getPerPolygonParams?.() ?? {};
-    const paramsMap = { ...internalParams, ...externalParams };
+    const paramsMap = getMergedParamsMap();
     const overrideCam = parseCameraOverride();
 
     const perPolyCam: Record<string, CameraModel> = {};
@@ -773,11 +774,13 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
 
     const map: mapboxgl.Map | undefined = mapRef.current?.getMap?.();
     if (!map || !map.isStyleLoaded?.()) {
-      toast({
-        variant: "destructive",
-        title: "Map not ready",
-        description: "Please wait for the map to load completely."
-      });
+      if (!opts?.suppressMapNotReadyToast) {
+        toast({
+          variant: "destructive",
+          title: "Map not ready",
+          description: "Please wait for the map to load completely."
+        });
+      }
       return;
     }
 
@@ -1034,7 +1037,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
       lidarWorker?.terminate();
       setRunning(false);
     }
-  }, [CAMERA_REGISTRY, aggregateMetricStats, buildLidarStrips, cameraText, clipInnerBufferM, getPerPolygonParams, getPolygons, importedPoses, isLidarPayload, mapRef, mapboxToken, opacity, parseCameraOverride, parsePosesMeters, showCameraPoints, showGsd, showOverlap, zoom]);
+  }, [CAMERA_REGISTRY, aggregateMetricStats, buildLidarStrips, cameraText, clipInnerBufferM, getMergedParamsMap, getPolygons, importedPoses, isLidarPayload, mapRef, mapboxToken, opacity, parseCameraOverride, parsePosesMeters, showCameraPoints, showGsd, showOverlap, zoom]);
 
   // Auto-run function that can be called externally
   const autoRun = useCallback(async (opts?: { polygonId?: string; reason?: 'lines'|'spacing'|'alt'|'manual' }) => {
@@ -1043,15 +1046,13 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
     const map = api?.getMap?.();
     const ready = !!map?.isStyleLoaded?.();
     const poses = parsePosesMeters();
-    const internalParams = api?.getPerPolygonParams?.() ?? {};
-    const externalParams = getPerPolygonParams?.() ?? {};
-    const paramsMap = { ...internalParams, ...externalParams };
+    const paramsMap = getMergedParamsMap();
 
     // Poses-only mode auto-run
     if (!autoGenerate && importedPoses.length > 0) {
       if (ready) {
         autoTriesRef.current = 0;
-        compute();
+        compute({ suppressMapNotReadyToast: true });
         return;
       }
     }
@@ -1083,7 +1084,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
       autoTriesRef.current = 0;
       // Recompute from scratch; defer one tick for state flush after edits/deletes
       // Always defer one tick to allow React state updates (lines/tiles) to flush
-      setTimeout(()=> compute(), 0);
+      setTimeout(() => compute({ polygonId: opts?.polygonId, suppressMapNotReadyToast: true }), 0);
       return;
     }
     if (autoTriesRef.current < 15) {
@@ -1091,7 +1092,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
       if (autoRunTimeoutRef.current !== null) clearTimeout(autoRunTimeoutRef.current);
       autoRunTimeoutRef.current = window.setTimeout(()=>{ if ((autoGenerate || importedPoses.length>0) && !running) autoRun(opts); }, 250);
     } else { autoTriesRef.current = 0; }
-  }, [running, autoGenerate, importedPoses, compute, getPerPolygonParams, isLidarPayload, mapRef, parsePosesMeters]);
+  }, [running, autoGenerate, importedPoses, compute, getMergedParamsMap, isLidarPayload, mapRef, parsePosesMeters]);
 
   // Provide autoRun function to parent component - register immediately and on changes
   React.useEffect(() => {
@@ -1247,7 +1248,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
     if (overallStats.density?.count) cards.push({ metricKind: 'density', stats: overallStats.density });
     return cards;
   }, [overallStats]);
-  const displayParamsMap = { ...(mapRef.current?.getPerPolygonParams?.() ?? {}), ...(getPerPolygonParams?.() ?? {}) };
+  const displayParamsMap = getMergedParamsMap();
   const lidarPolygonIds = (mapRef.current?.getPolygonsWithIds?.() ?? [])
     .map((polygon) => polygon.id || 'unknown')
     .filter((polygonId) => isLidarPayload(polygonId, displayParamsMap));
@@ -1281,17 +1282,31 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
     }
 
     const api = mapRef.current;
-    const paramsMap = { ...(api?.getPerPolygonParams?.() ?? {}), ...(getPerPolygonParams?.() ?? {}) };
-    for (const polygonId of lidarPolygonIds) {
-      const currentParams = paramsMap[polygonId];
-      if (!currentParams) continue;
-      api?.applyPolygonParams?.(polygonId, {
-        ...currentParams,
-        maxLidarRangeM: nextRange,
-      });
+    const paramsMap = getMergedParamsMap();
+    const updates = lidarPolygonIds
+      .map((polygonId) => {
+        const currentParams = paramsMap[polygonId];
+        if (!currentParams) return null;
+        return {
+          polygonId,
+          params: {
+            ...currentParams,
+            maxLidarRangeM: nextRange,
+          },
+        };
+      })
+      .filter((update): update is { polygonId: string; params: any } => update !== null);
+    if (updates.length === 0) return;
+
+    if (api?.applyPolygonParamsBatch) {
+      api.applyPolygonParamsBatch(updates);
+    } else {
+      for (const update of updates) {
+        api?.applyPolygonParams?.(update.polygonId, update.params);
+      }
     }
     setBulkLidarRangeInput(String(nextRange));
-  }, [bulkLidarRangeInput, getPerPolygonParams, lidarPolygonIds, lidarRangeSharedValue, mapRef]);
+  }, [bulkLidarRangeInput, getMergedParamsMap, lidarPolygonIds, lidarRangeSharedValue, mapRef]);
 
   return (
     <div className="backdrop-blur-md bg-white/95 rounded-md border p-3 space-y-3">

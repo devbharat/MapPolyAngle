@@ -332,6 +332,26 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       });
     }, [polygonResults, polygonTiles, onFlightLinesUpdated, altitudeMode, minClearanceM, turnExtendM]);
 
+    const applyPolygonParamsBatch = useCallback((updates: Array<{ polygonId: string; params: PolygonParams }>) => {
+      const latestByPolygon = new Map<string, PolygonParams>();
+      for (const update of updates) {
+        if (!update?.polygonId || !update?.params) continue;
+        latestByPolygon.set(update.polygonId, update.params);
+      }
+      if (latestByPolygon.size === 0) return;
+
+      const prevSuppress = suppressFlightLineEventsRef.current;
+      suppressFlightLineEventsRef.current = true;
+      latestByPolygon.forEach((params, polygonId) => {
+        applyPolygonParams(polygonId, params, { skipEvent: true, skipQueue: true });
+      });
+      suppressFlightLineEventsRef.current = prevSuppress;
+
+      if (!prevSuppress) {
+        onFlightLinesUpdated?.(latestByPolygon.size === 1 ? Array.from(latestByPolygon.keys())[0] : '__all__');
+      }
+    }, [applyPolygonParams, onFlightLinesUpdated]);
+
     // Rebuild 3D paths when altitude mode, minimum clearance, or turn extension changes
     useEffect(() => {
       if (!deckOverlayRef.current) return;
@@ -1282,6 +1302,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         if (deckOverlayRef.current) remove3DCameraPointsLayer(deckOverlayRef.current, polygonId, setDeckLayers);
       },
       applyPolygonParams,
+      applyPolygonParamsBatch,
       // expose bulk apply helper
       applyParamsToAllPending,
       getPerPolygonParams: () => Object.fromEntries(polygonParams),
@@ -1350,7 +1371,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       },
     }), [
       polygonResults, polygonFlightLines, polygonTiles, polygonParams,
-      cancelAllAnalyses, applyPolygonParams, cleanupPolygonState, editPolygonBoundary,
+      cancelAllAnalyses, applyPolygonParams, applyPolygonParamsBatch, cleanupPolygonState, editPolygonBoundary,
       bearingOverrides, importedOriginals,
       importKmlFromText, importWingtraFromText,
       optimizePolygonDirection, revertPolygonToImportedDirection, runFullAnalysis,
