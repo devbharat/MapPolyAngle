@@ -347,13 +347,14 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
 
     for (const s of valid) {
       totalCount += s.count;
-      totalArea += (s.totalAreaM2 || 0);
-      weightedSum += s.mean * s.count; // Use original accurate means
+      const areaWeight = (s.totalAreaM2 && s.totalAreaM2 > 0) ? s.totalAreaM2 : s.count;
+      totalArea += areaWeight;
+      weightedSum += s.mean * areaWeight;
       if (s.min < globalMin) globalMin = s.min;
       if (s.max > globalMax) globalMax = s.max;
     }
 
-    const accurateMean = totalCount > 0 ? weightedSum / totalCount : 0;
+    const accurateMean = totalArea > 0 ? weightedSum / totalArea : 0;
 
     // Merge histograms into 8 uniform bins across [globalMin, globalMax]
     const span = globalMax - globalMin;

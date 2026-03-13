@@ -138,7 +138,8 @@ function calculateDensityStats(
   activeIdxs: Uint32Array,
   pixelAreaEquator: number,
   size: number,
-  cosLatPerRow: Float64Array
+  cosLatPerRow: Float64Array,
+  includeZeroDensity: boolean = false
 ): DensityStats {
   let count = 0;
   let sum = 0;
@@ -148,13 +149,18 @@ function calculateDensityStats(
 
   for (let i = 0; i < activeIdxs.length; i++) {
     const idx = activeIdxs[i];
-    const value = density[idx];
-    if (!(value > 0 && Number.isFinite(value))) continue;
-    count++;
-    sum += value;
+    const rawValue = density[idx];
+    const value = includeZeroDensity
+      ? ((Number.isFinite(rawValue) && rawValue > 0) ? rawValue : 0)
+      : rawValue;
+    if (!(includeZeroDensity || (value > 0 && Number.isFinite(value)))) continue;
+    if (!Number.isFinite(value)) continue;
     const row = (idx / size) | 0;
     const cosPhi = cosLatPerRow[row];
-    totalAreaM2 += pixelAreaEquator * cosPhi * cosPhi;
+    const areaM2 = pixelAreaEquator * cosPhi * cosPhi;
+    count++;
+    sum += value * areaM2;
+    totalAreaM2 += areaM2;
     if (value < min) min = value;
     if (value > max) max = value;
   }
@@ -163,7 +169,7 @@ function calculateDensityStats(
     return { min: 0, max: 0, mean: 0, count: 0, totalAreaM2: 0, histogram: [] };
   }
 
-  const mean = sum / count;
+  const mean = totalAreaM2 > 0 ? (sum / totalAreaM2) : 0;
   const MAX_BINS = 20;
   const histogram = new Array<{ bin: number; count: number; areaM2?: number }>(MAX_BINS);
   for (let i = 0; i < MAX_BINS; i++) histogram[i] = { bin: 0, count: 0, areaM2: 0 };
@@ -177,8 +183,12 @@ function calculateDensityStats(
     const binSize = span / MAX_BINS;
     for (let i = 0; i < activeIdxs.length; i++) {
       const idx = activeIdxs[i];
-      const value = density[idx];
-      if (!(value > 0 && Number.isFinite(value))) continue;
+      const rawValue = density[idx];
+      const value = includeZeroDensity
+        ? ((Number.isFinite(rawValue) && rawValue > 0) ? rawValue : 0)
+        : rawValue;
+      if (!(includeZeroDensity || (value > 0 && Number.isFinite(value)))) continue;
+      if (!Number.isFinite(value)) continue;
       let binIndex = Math.floor((value - min) / binSize);
       if (binIndex >= MAX_BINS) binIndex = MAX_BINS - 1;
       const row = (idx / size) | 0;
@@ -408,57 +418,62 @@ self.onmessage = (ev: MessageEvent<Msg>) => {
     }
     if (polysHere.length === 0) continue;
 
-    const bestByPass = new Map<number, { density: number; distSq: number }>();
-
-    for (let i = 0; i < cellList.length; i++) {
-      const strip = prepared[cellList[i]];
-      const proj = pointToSegmentProjection(xw, yw, strip);
-      if (proj.distSq > strip.halfWidthSq) continue;
-      const sensorZ = Number.isFinite(strip.z1) && Number.isFinite(strip.z2)
-        ? (strip.z1 as number) + proj.t * ((strip.z2 as number) - (strip.z1 as number))
-        : Number.NaN;
-      const zw = elev[idx];
-      const heightAboveGround = Number.isFinite(sensorZ) ? (sensorZ - zw) : Number.NaN;
-      const halfFovTan = strip.halfFovTan ?? 1;
-      const localHalfWidth = Number.isFinite(heightAboveGround) && heightAboveGround > 0
-        ? Math.max(0.01, heightAboveGround * halfFovTan)
-        : strip.halfWidthM;
-      if (!(localHalfWidth > 0)) continue;
-      const crossTrack = Math.abs((xw - proj.px) * strip.perpX + (yw - proj.py) * strip.perpY);
-      if (crossTrack > localHalfWidth) continue;
-      if (Number.isFinite(sensorZ) && !(sensorZ > zw)) continue;
-      const vx = xw - proj.px;
-      const vy = yw - proj.py;
-      const vz = zw - (Number.isFinite(sensorZ) ? sensorZ : zw);
-      const range = Math.hypot(vx, vy, vz);
-      if (!(range > 0)) continue;
-      const maxRangeM = strip.maxRangeM ?? Number.POSITIVE_INFINITY;
-      if (range > maxRangeM) continue;
-      const nb = idx * 3;
-      const nx = normals[nb];
-      const ny = normals[nb + 1];
-      const nz = normals[nb + 2];
-      const cosInc = -(nx * (vx / range) + ny * (vy / range) + nz * (vz / range));
-      if (!(cosInc > 1e-3)) continue;
-      const effectivePointRate = strip.effectivePointRate ?? 0;
-      const speedMps = strip.speedMps ?? 0;
-      const localDensityContribution = (effectivePointRate > 0 && speedMps > 0)
-        ? (effectivePointRate / (speedMps * (2 * localHalfWidth))) * cosInc
-        : strip.densityPerPass;
-      const passIndex = strip.passIndex ?? strip.index;
-      const existing = bestByPass.get(passIndex);
-      if (!existing || proj.distSq < existing.distSq) {
-        bestByPass.set(passIndex, { density: localDensityContribution, distSq: proj.distSq });
-      }
-    }
-
     let localOverlap = 0;
     let localDensity = 0;
-    bestByPass.forEach((entry, passIndex) => {
-      localOverlap += 1;
-      localDensity += entry.density;
-      for (let p = 0; p < polysHere.length; p++) hitLinesPerPolygon[polysHere[p]].add(passIndex);
-    });
+    for (let p = 0; p < polysHere.length; p++) {
+      const polyIndex = polysHere[p];
+      const polygonId = polyIds[polyIndex];
+      const bestByPass = new Map<number, { density: number; distSq: number }>();
+
+      for (let i = 0; i < cellList.length; i++) {
+        const strip = prepared[cellList[i]];
+        if (strip.polygonId && strip.polygonId !== polygonId) continue;
+        const proj = pointToSegmentProjection(xw, yw, strip);
+        if (proj.distSq > strip.halfWidthSq) continue;
+        const sensorZ = Number.isFinite(strip.z1) && Number.isFinite(strip.z2)
+          ? (strip.z1 as number) + proj.t * ((strip.z2 as number) - (strip.z1 as number))
+          : Number.NaN;
+        const zw = elev[idx];
+        const heightAboveGround = Number.isFinite(sensorZ) ? (sensorZ - zw) : Number.NaN;
+        const halfFovTan = strip.halfFovTan ?? 1;
+        const localHalfWidth = Number.isFinite(heightAboveGround) && heightAboveGround > 0
+          ? Math.max(0.01, heightAboveGround * halfFovTan)
+          : strip.halfWidthM;
+        if (!(localHalfWidth > 0)) continue;
+        const crossTrack = Math.abs((xw - proj.px) * strip.perpX + (yw - proj.py) * strip.perpY);
+        if (crossTrack > localHalfWidth) continue;
+        if (Number.isFinite(sensorZ) && !(sensorZ > zw)) continue;
+        const vx = xw - proj.px;
+        const vy = yw - proj.py;
+        const vz = zw - (Number.isFinite(sensorZ) ? sensorZ : zw);
+        const range = Math.hypot(vx, vy, vz);
+        if (!(range > 0)) continue;
+        const maxRangeM = strip.maxRangeM ?? Number.POSITIVE_INFINITY;
+        if (range > maxRangeM) continue;
+        const nb = idx * 3;
+        const nx = normals[nb];
+        const ny = normals[nb + 1];
+        const nz = normals[nb + 2];
+        const cosInc = -(nx * (vx / range) + ny * (vy / range) + nz * (vz / range));
+        if (!(cosInc > 1e-3)) continue;
+        const effectivePointRate = strip.effectivePointRate ?? 0;
+        const speedMps = strip.speedMps ?? 0;
+        const localDensityContribution = (effectivePointRate > 0 && speedMps > 0)
+          ? (effectivePointRate / (speedMps * (2 * localHalfWidth))) * cosInc
+          : strip.densityPerPass;
+        const passIndex = strip.passIndex ?? strip.index;
+        const existing = bestByPass.get(passIndex);
+        if (!existing || proj.distSq < existing.distSq) {
+          bestByPass.set(passIndex, { density: localDensityContribution, distSq: proj.distSq });
+        }
+      }
+
+      bestByPass.forEach((entry, passIndex) => {
+        localOverlap += 1;
+        localDensity += entry.density;
+        hitLinesPerPolygon[polyIndex].add(passIndex);
+      });
+    }
 
     if (localOverlap > 0) {
       overlap[idx] = localOverlap;
@@ -489,7 +504,16 @@ self.onmessage = (ev: MessageEvent<Msg>) => {
     for (let i = 0, w = 0; i < mask.length; i++) {
       if (mask[i] && density[i] > 0 && Number.isFinite(density[i])) activePolygonPixels[w++] = i;
     }
-    const stats = calculateDensityStats(density, activePolygonPixels, pixelAreaEquator, size, cosLatPerRow);
+    let polygonPixelCount = 0;
+    for (let i = 0; i < mask.length; i++) {
+      if (mask[i]) polygonPixelCount++;
+    }
+    const polygonPixels = new Uint32Array(polygonPixelCount);
+    for (let i = 0, w = 0; i < mask.length; i++) {
+      if (mask[i]) polygonPixels[w++] = i;
+    }
+
+    const stats = calculateDensityStats(density, polygonPixels, pixelAreaEquator, size, cosLatPerRow, true);
     const hitSet = hitLinesPerPolygon[p];
     const hitLineIds = new Uint32Array(hitSet.size);
     let w = 0;
@@ -498,13 +522,13 @@ self.onmessage = (ev: MessageEvent<Msg>) => {
     });
     perPolygon.push({
       polygonId: polyIds[p],
-      activePixelCount: stats.count,
+      activePixelCount: activePolygonPixels.length,
       densityStats: stats,
       hitLineIds,
     });
   }
 
-  const densityStats = calculateDensityStats(density, activeIdxs, pixelAreaEquator, size, cosLatPerRow);
+  const densityStats = calculateDensityStats(density, activeIdxs, pixelAreaEquator, size, cosLatPerRow, true);
   const ret: Ret = {
     z,
     x,

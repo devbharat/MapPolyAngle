@@ -178,7 +178,8 @@ function readCameraItemParams(
 
 function readLidarItemParams(
   it: WingtraAreaItem,
-  lidar: LidarModel
+  lidar: LidarModel,
+  cruiseSpeedMps?: number
 ): {
   altitudeAGL: number;
   frontOverlap: number;
@@ -194,7 +195,9 @@ function readLidarItemParams(
   const altitudeAGL = it.grid.altitude ?? 100;
   const frontOverlap = it.camera.imageFrontalOverlap ?? 0;
   const sideOverlap = it.camera.imageSideOverlap ?? 50;
-  const speedMps = lidar.defaultSpeedMps;
+  const speedMps = Number.isFinite(cruiseSpeedMps) && (cruiseSpeedMps as number) > 0
+    ? (cruiseSpeedMps as number)
+    : lidar.defaultSpeedMps;
   const lidarReturnMode: LidarReturnMode = 'single';
   const mappingFovDeg = lidar.effectiveHorizontalFovDeg;
   const maxLidarRangeM = DEFAULT_LIDAR_MAX_RANGE_M;
@@ -231,6 +234,7 @@ export function importWingtraFlightPlan(
   const angleConv = opts?.angleConvention ?? "northCW";
   const payloadName = fp.flightPlan.payload;
   const payloadKey  = (fp.flightPlan as any).payloadUniqueString as string | undefined;
+  const cruiseSpeedMps = Number(fp.flightPlan.cruiseSpeed);
   const payloadInfo = resolvePayloadInfoFromWingtra(payloadName, payloadKey);
 
   const items: ImportedArea[] = [];
@@ -245,7 +249,7 @@ export function importWingtraFlightPlan(
     // Polygon conversion: Wingtra uses [lat, lon]; app uses [lng, lat]
     const ring = (area.polygon || []).map(toLngLat);
     if (payloadInfo.payloadKind === 'lidar') {
-      const params = readLidarItemParams(area, payloadInfo.lidar);
+      const params = readLidarItemParams(area, payloadInfo.lidar, cruiseSpeedMps);
       items.push({
         id: `wingtra-${idx++}`,
         ring,
