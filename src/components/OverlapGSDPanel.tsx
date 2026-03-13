@@ -25,6 +25,7 @@ type Props = {
   mapboxToken: string;
   /** Provide per‑polygon params (altitude/front/side) so we can compute per‑polygon photoSpacing. */
   getPerPolygonParams?: () => Record<string, { altitudeAGL: number; frontOverlap: number; sideOverlap: number; cameraKey?: string; triggerDistanceM?: number; payloadKind?: 'camera' | 'lidar'; lidarKey?: string; speedMps?: number; lidarReturnMode?: 'single' | 'dual' | 'triple'; mappingFovDeg?: number; maxLidarRangeM?: number; pointDensityPtsM2?: number }> ;
+  onEditPolygonParams?: (polygonId: string) => void;
   onAutoRun?: (autoRunFn: (opts?: { polygonId?: string; reason?: 'lines'|'spacing'|'alt'|'manual' }) => void) => void;
   onClearExposed?: (clearFn: () => void) => void;
   // NEW: expose a method so parent (header) can trigger DJI / Wingtra pose JSON import
@@ -95,7 +96,7 @@ function metersBoundsToLngLatRing(minX:number,minY:number,maxX:number,maxY:numbe
   return [a,b,c,d,a];
 }
 
-export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAutoRun, onClearExposed, onExposePoseImporter, onPosesImported, polygonAnalyses, overrides, importedOriginals, selectedPolygonId: controlledSelectedId, onSelectPolygon }: Props) {
+export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEditPolygonParams, onAutoRun, onClearExposed, onExposePoseImporter, onPosesImported, polygonAnalyses, overrides, importedOriginals, selectedPolygonId: controlledSelectedId, onSelectPolygon }: Props) {
   const CAMERA_REGISTRY: Record<string, CameraModel> = useMemo(()=>({
     SONY_RX1R2,
     DJI_ZENMUSE_P1_24MM,
@@ -1223,6 +1224,50 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
     return cards;
   }, [overallStats]);
   const displayParamsMap = { ...(mapRef.current?.getPerPolygonParams?.() ?? {}), ...(getPerPolygonParams?.() ?? {}) };
+  const lidarPolygonIds = (mapRef.current?.getPolygonsWithIds?.() ?? [])
+    .map((polygon) => polygon.id || 'unknown')
+    .filter((polygonId) => isLidarPayload(polygonId, displayParamsMap));
+  const lidarRangeValues = lidarPolygonIds.map((polygonId) => {
+    const value = displayParamsMap[polygonId]?.maxLidarRangeM;
+    return Number.isFinite(value) ? value : DEFAULT_LIDAR_MAX_RANGE_M;
+  });
+  const lidarRangeMixed = lidarRangeValues.length > 1 && lidarRangeValues.some((value) => Math.abs(value - lidarRangeValues[0]) > 1e-6);
+  const lidarRangeSharedValue = lidarRangeValues.length > 0 && !lidarRangeMixed ? String(lidarRangeValues[0]) : '';
+  const [bulkLidarRangeInput, setBulkLidarRangeInput] = useState<string>(String(DEFAULT_LIDAR_MAX_RANGE_M));
+
+  React.useEffect(() => {
+    if (lidarPolygonIds.length === 0) {
+      setBulkLidarRangeInput(String(DEFAULT_LIDAR_MAX_RANGE_M));
+      return;
+    }
+    setBulkLidarRangeInput(lidarRangeSharedValue);
+  }, [lidarPolygonIds.join('|'), lidarRangeSharedValue]);
+
+  const applyBulkLidarRange = useCallback((rawValue?: string) => {
+    if (lidarPolygonIds.length === 0) return;
+    const nextRange = parseFloat(rawValue ?? bulkLidarRangeInput);
+    if (!(nextRange > 0)) {
+      toast({
+        variant: 'destructive',
+        title: 'Invalid lidar range',
+        description: 'Enter a max lidar range greater than 0 meters.',
+      });
+      setBulkLidarRangeInput(lidarRangeSharedValue);
+      return;
+    }
+
+    const api = mapRef.current;
+    const paramsMap = { ...(api?.getPerPolygonParams?.() ?? {}), ...(getPerPolygonParams?.() ?? {}) };
+    for (const polygonId of lidarPolygonIds) {
+      const currentParams = paramsMap[polygonId];
+      if (!currentParams) continue;
+      api?.applyPolygonParams?.(polygonId, {
+        ...currentParams,
+        maxLidarRangeM: nextRange,
+      });
+    }
+    setBulkLidarRangeInput(String(nextRange));
+  }, [bulkLidarRangeInput, getPerPolygonParams, lidarPolygonIds, lidarRangeSharedValue, mapRef]);
 
   return (
     <div className="backdrop-blur-md bg-white/95 rounded-md border p-3 space-y-3">
@@ -1303,6 +1348,22 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
                   </div>
 
                   <div className="flex flex-wrap gap-2">
+                    {!isPoseArea && (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        className="h-7 px-2 text-xs"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setSelection(polygonId);
+                          onEditPolygonParams?.(polygonId);
+                        }}
+                        title="Edit flight parameters for this area"
+                      >
+                        Edit setup
+                      </Button>
+                    )}
+
                     {!isPoseArea && (
                       <Button
                         size="sm"
@@ -1522,6 +1583,32 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onAu
               }}
             />
           </label>
+          {lidarPolygonIds.length > 0 && (
+            <label className="text-xs text-gray-600 block">
+              Max lidar range for all areas (m)
+              <input
+                className="w-full border rounded px-2 py-1 text-xs"
+                type="number"
+                min={1}
+                step={1}
+                value={bulkLidarRangeInput}
+                placeholder={lidarRangeMixed ? 'Mixed' : undefined}
+                onChange={(e) => setBulkLidarRangeInput(e.target.value)}
+                onBlur={(e) => applyBulkLidarRange(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault();
+                    applyBulkLidarRange((e.target as HTMLInputElement).value);
+                  }
+                }}
+              />
+              <span className="block mt-1 text-[11px] text-gray-500">
+                {lidarRangeMixed
+                  ? `Different values are set across ${lidarPolygonIds.length} lidar areas. Enter one value and press Enter or click away to apply it to all.`
+                  : `Applies to all ${lidarPolygonIds.length} lidar area${lidarPolygonIds.length === 1 ? '' : 's'}.`}
+              </span>
+            </label>
+          )}
           <label className="text-xs text-gray-600 block">Max tilt (deg)<input className="w-full border rounded px-2 py-1 text-xs" type="number" min={0} max={90} value={maxTiltDeg} onChange={e=>setMaxTiltDeg(Math.max(0, Math.min(90, parseFloat(e.target.value||'10'))))} /></label>
           <label className="text-xs text-gray-600 block">
             Min overlap for GSD (images)

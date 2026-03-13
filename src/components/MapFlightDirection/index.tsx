@@ -676,10 +676,25 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       const draw = drawRef.current as any;
       if (!draw) return;
 
+      const normalizedRing = (() => {
+        const coords = Array.isArray(ring) ? ring.filter((coord): coord is [number, number] => (
+          Array.isArray(coord) &&
+          coord.length >= 2 &&
+          Number.isFinite(coord[0]) &&
+          Number.isFinite(coord[1])
+        )) : [];
+        if (coords.length < 3) return null;
+        const [firstLng, firstLat] = coords[0];
+        const [lastLng, lastLat] = coords[coords.length - 1];
+        if (firstLng === lastLng && firstLat === lastLat) return coords;
+        return [...coords, [firstLng, firstLat]];
+      })();
+      if (!normalizedRing) return;
+
       const feature = {
         type: 'Feature',
         properties: { name: name || '', ...(extraProps || {}) },
-        geometry: { type: 'Polygon', coordinates: [ring] },
+        geometry: { type: 'Polygon', coordinates: [normalizedRing] },
       };
 
       const id = draw.add(feature);

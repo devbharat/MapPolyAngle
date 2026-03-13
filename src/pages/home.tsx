@@ -81,6 +81,11 @@ export default function Home() {
     setParamsDialog({ open: true, polygonId });
   }, []);
 
+  const handleEditPolygonParams = useCallback((polygonId: string) => {
+    setSelectedPolygonId(polygonId);
+    setParamsDialog({ open: true, polygonId });
+  }, []);
+
   const handleApplyParams = useCallback((params: PolygonParams) => {
     const polygonId = paramsDialog.polygonId!;
     mapRef.current?.applyPolygonParams?.(polygonId, params);
@@ -354,6 +359,7 @@ export default function Home() {
                   mapRef={mapRef} 
                   mapboxToken={mapboxToken} 
                   getPerPolygonParams={() => paramsByPolygon}
+                  onEditPolygonParams={handleEditPolygonParams}
                   onAutoRun={handleAutoRunReceived}
                   onClearExposed={handleClearReceived}
                   onExposePoseImporter={(fn)=>{ openDJIImporterRef.current = fn; }}
