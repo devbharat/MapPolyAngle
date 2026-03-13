@@ -25,6 +25,11 @@ function getLineColor(quality?: string) {
   }
 }
 
+function getDrawLayerAnchor(map: MapboxMap): string | undefined {
+  const layers = map.getStyle().layers || [];
+  return layers.find((layer) => layer.id.startsWith('gl-draw-'))?.id;
+}
+
 export function addFlightLinesForPolygon(
   map: MapboxMap,
   polygonId: string,
@@ -118,6 +123,7 @@ export function addFlightLinesForPolygon(
     map.setPaintProperty(layerId, 'line-opacity', 0.8);
     map.setPaintProperty(layerId, 'line-width', 0.5);
   } else {
+    const beforeId = getDrawLayerAnchor(map);
     map.addLayer({
       id: layerId,
       type: 'line',
@@ -131,7 +137,7 @@ export function addFlightLinesForPolygon(
         'line-width': 0.5,
         'line-opacity': 0.8,
       },
-    });
+    }, beforeId);
   }
 
   if (flightLines.length === 0) {
@@ -223,7 +229,7 @@ export function addTriggerPointsForPolygon(
       'circle-stroke-width': 1,
       'circle-stroke-color': '#ffffff'
     }
-  });
+  }, getDrawLayerAnchor(map));
 
   map.addLayer({
     id: labelLayerId,
@@ -241,7 +247,7 @@ export function addTriggerPointsForPolygon(
       'text-halo-color': '#ffffff',
       'text-halo-width': 0.75
     }
-  });
+  }, getDrawLayerAnchor(map));
 }
 
 export function removeTriggerPointsForPolygon(map: MapboxMap, polygonId: string) {

@@ -21,13 +21,31 @@ export interface CameraModel {
   names?: string[];    // canonical & alias names (exact matches to Wingtra payload strings)
 }
 
+export type PayloadKind = 'camera' | 'lidar';
+export type LidarReturnMode = 'single' | 'dual' | 'triple';
+
+export interface LidarModel {
+  key: string;
+  defaultSpeedMps: number;
+  effectiveHorizontalFovDeg: number;
+  effectivePointRates: Record<LidarReturnMode, number>;
+  names?: string[];
+}
+
 export interface FlightParams {
+  payloadKind?: PayloadKind; // defaults to 'camera' for legacy polygons
   altitudeAGL: number;  // altitude above ground level in meters
-  frontOverlap: number; // front overlap percentage (0–95)
+  frontOverlap: number; // front overlap percentage (0–95); 0 for lidar payloads
   sideOverlap: number;  // side overlap percentage (0–95)
   cameraKey?: string;   // optional camera identifier (maps to models in domain/camera)
+  lidarKey?: string;    // optional lidar identifier (maps to models in domain/lidar)
   triggerDistanceM?: number; // optional: explicit trigger distance from import
   cameraYawOffsetDeg?: number; // optional: rotate camera about Z (e.g. 90 to swap width/height)
+  speedMps?: number;    // lidar cruise speed, defaults to the payload model default
+  lidarReturnMode?: LidarReturnMode; // lidar return mode used for density estimates
+  mappingFovDeg?: number; // lidar mapping sector in degrees; Wingtra lidar defaults to 90
+  maxLidarRangeM?: number; // lidar slant range limit for valid returns; beyond this is treated as no-data
+  pointDensityPtsM2?: number; // imported or computed lidar density estimate
   useCustomBearing?: boolean; // optional manual bearing flag
   customBearingDeg?: number;  // optional manual bearing degrees clockwise from north
 }

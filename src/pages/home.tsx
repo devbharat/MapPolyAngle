@@ -94,19 +94,27 @@ export default function Home() {
   }, []);
 
   const handleFlightLinesUpdated = useCallback((which: string | '__all__') => {
-    // trigger GSD recompute
+    const api = mapRef.current;
+    const polygons = api?.getPolygonsWithIds?.() ?? [];
+
+    if (api) {
+      setImportedOriginals(api.getImportedOriginals?.() ?? {});
+      setOverrides(api.getBearingOverrides?.() ?? {});
+      const mapParams = api.getPerPolygonParams?.() ?? {};
+      setParamsByPolygon(mapParams as any);
+    }
+
+    if (polygons.length === 0 && importedPoseCount === 0) {
+      clearGSDRef.current?.();
+      setSelectedPolygonId(null);
+      return;
+    }
+
     if (autoRunGSDRef.current) {
       if (which === '__all__') autoRunGSDRef.current({ reason: 'spacing' });
       else autoRunGSDRef.current({ polygonId: which, reason: 'lines' });
     }
-    // refresh imported/override state from Map
-    if (mapRef.current) {
-      setImportedOriginals(mapRef.current.getImportedOriginals?.() ?? {});
-      setOverrides(mapRef.current.getBearingOverrides?.() ?? {});
-      const mapParams = mapRef.current.getPerPolygonParams?.() ?? {};
-      setParamsByPolygon(mapParams as any);
-    }
-  }, []);
+  }, [importedPoseCount]);
 
   // Handler to receive the auto-run function from OverlapGSDPanel
   const handleAutoRunReceived = useCallback((autoRunFn: (opts?: { polygonId?: string; reason?: 'lines'|'spacing'|'alt'|'manual' }) => void) => {
@@ -293,11 +301,18 @@ export default function Home() {
             setParamsDialog({ open: false, polygonId: null });
           }}
           defaults={{
+            payloadKind: current.payloadKind ?? 'camera',
             altitudeAGL: current.altitudeAGL ?? 100,
-            frontOverlap: current.frontOverlap ?? 70,
+            frontOverlap: current.frontOverlap ?? ((current.payloadKind ?? 'camera') === 'lidar' ? 0 : 70),
             sideOverlap: current.sideOverlap ?? 70,
             cameraKey: current.cameraKey ?? 'MAP61_17MM',
+            lidarKey: current.lidarKey,
             cameraYawOffsetDeg: current.cameraYawOffsetDeg ?? 0,
+            speedMps: current.speedMps,
+            lidarReturnMode: current.lidarReturnMode,
+            mappingFovDeg: current.mappingFovDeg,
+            maxLidarRangeM: current.maxLidarRangeM,
+            pointDensityPtsM2: current.pointDensityPtsM2,
             useCustomBearing: current.useCustomBearing ?? false,
             customBearingDeg: current.customBearingDeg ?? undefined,
           }}

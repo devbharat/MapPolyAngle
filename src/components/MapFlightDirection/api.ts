@@ -29,6 +29,7 @@ export interface MapFlightDirectionAPI {
   // Core map operations
   clearAllDrawings(): void;
   clearPolygon(polygonId: string): void;
+  editPolygonBoundary(polygonId: string): void;
   startPolygonDrawing(): void;
   getMap(): MapboxMap | undefined;
 
