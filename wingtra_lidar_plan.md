@@ -162,3 +162,5 @@ Status legend:
 - Fixed pass overcounting in the terrain-aware lidar worker:
   - segments from the same flight line are now collapsed to a single pass contribution per pixel
   - histogram and "Flight lines" counts now track actual sweep lines instead of polyline segments
+- Preview deployment check:
+  - pushing a small follow-up commit on `feature/wingtra-lidar-density` to confirm Vercel auto-deploys branch updates
