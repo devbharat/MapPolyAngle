@@ -80,7 +80,11 @@ export class LidarDensityWorker {
         resolve(e.data);
       };
       this.worker.addEventListener("message", onMsg as any, { once: true });
-      this.worker.postMessage(args, [args.tile.data.buffer]);
+      const transfers: Transferable[] = [args.tile.data.buffer];
+      if (args.demTile?.data?.buffer && args.demTile.data.buffer !== args.tile.data.buffer) {
+        transfers.push(args.demTile.data.buffer);
+      }
+      this.worker.postMessage(args, transfers);
     });
   }
   terminate() { this.worker.terminate(); }

@@ -28,6 +28,12 @@ export type TileRGBA = {
   data: Uint8ClampedArray;  // RGBA (Terrain-RGB)
 };
 
+export type PaddedDemTileRGBA = {
+  size: number;
+  padTiles: number;
+  data: Uint8ClampedArray;
+};
+
 export type GSDStats = {
   min: number;
   max: number;
@@ -77,6 +83,7 @@ export type LidarStripMeters = {
   x2: number;
   y2: number;
   z2?: number;
+  plannedAltitudeAGL?: number;
   halfWidthM: number;
   densityPerPass: number;
   speedMps?: number;
@@ -130,6 +137,7 @@ export type WorkerOut = TileResult & {
 
 export type LidarWorkerIn = {
   tile: TileRGBA;
+  demTile?: PaddedDemTileRGBA;
   polygons: PolygonLngLatWithId[];
   strips: LidarStripMeters[];
   options?: {

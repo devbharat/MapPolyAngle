@@ -108,6 +108,14 @@ function smoothDensityForDisplay(density: Float32Array, size: number): Float32Ar
       const value = density[index];
       if (!(value > 0) || !Number.isFinite(value)) continue;
 
+      // Keep tile borders raw. The blur is applied tile-by-tile, so smoothing the
+      // outermost pixels creates visible seams where adjacent tiles cannot share
+      // neighborhood samples.
+      if (x === 0 || y === 0 || x === size - 1 || y === size - 1) {
+        smoothed[index] = value;
+        continue;
+      }
+
       let weightedSum = 0;
       let totalWeight = 0;
 

@@ -603,6 +603,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
             x2,
             y2,
             z2: end[2],
+            plannedAltitudeAGL: altitudeAGL,
             halfWidthM: maxHalfWidth,
             densityPerPass,
             speedMps,
@@ -874,6 +875,57 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
       };
     };
 
+    const normalizeTileRef = (tileRef: { z: number; x: number; y: number }) => {
+      const tilesPerAxis = 1 << tileRef.z;
+      const wrappedX = ((tileRef.x % tilesPerAxis) + tilesPerAxis) % tilesPerAxis;
+      const clampedY = Math.max(0, Math.min(tilesPerAxis - 1, tileRef.y));
+      return { z: tileRef.z, x: wrappedX, y: clampedY };
+    };
+
+    const getLidarTileWithHalo = async (tileRef: { z: number; x: number; y: number }, padTiles = 1) => {
+      const center = await getTile(tileRef);
+      if (padTiles <= 0) return center;
+
+      const offsets: Array<{ dx: number; dy: number; tileRef: { z: number; x: number; y: number } }> = [];
+      for (let dy = -padTiles; dy <= padTiles; dy++) {
+        for (let dx = -padTiles; dx <= padTiles; dx++) {
+          offsets.push({
+            dx,
+            dy,
+            tileRef: normalizeTileRef({ z: tileRef.z, x: tileRef.x + dx, y: tileRef.y + dy }),
+          });
+        }
+      }
+
+      const neighborTiles = await Promise.all(offsets.map((entry) => getTile(entry.tileRef)));
+      const tileSize = center.tile.size;
+      const span = padTiles * 2 + 1;
+      const demSize = tileSize * span;
+      const demData = new Uint8ClampedArray(demSize * demSize * 4);
+
+      for (let i = 0; i < offsets.length; i++) {
+        const { dx, dy } = offsets[i];
+        const srcTile = neighborTiles[i].tile;
+        const offsetX = (dx + padTiles) * tileSize;
+        const offsetY = (dy + padTiles) * tileSize;
+        for (let row = 0; row < tileSize; row++) {
+          const srcStart = row * tileSize * 4;
+          const dstStart = ((offsetY + row) * demSize + offsetX) * 4;
+          demData.set(srcTile.data.subarray(srcStart, srcStart + tileSize * 4), dstStart);
+        }
+      }
+
+      return {
+        cacheKey: center.cacheKey,
+        tile: center.tile,
+        demTile: {
+          size: demSize,
+          padTiles,
+          data: demData,
+        },
+      };
+    };
+
     const upsertTileStats = (cacheKey: string, stats: PolygonTileStats[] | undefined) => {
       if (!stats) return;
       for (const polyStats of stats) {
@@ -920,9 +972,10 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
         const lidarTiles = collectTiles(lidarSourcePolygons);
         const { strips: lidarStrips, densityPaletteMax } = buildLidarStrips(paramsMap);
         for (const tileRef of lidarTiles) {
-          const { cacheKey, tile } = await getTile(tileRef);
+          const { cacheKey, tile, demTile } = await getLidarTileWithHalo(tileRef, 1);
           const res = await lidarWorker.runTile({
             tile,
+            demTile,
             polygons: lidarPolygons,
             strips: lidarStrips,
             options: { clipInnerBufferM },

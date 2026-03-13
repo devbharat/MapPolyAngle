@@ -362,12 +362,12 @@ function intersectRayWithTileXYBounds(
 
 function intersectBeamWithDem(
   dem: Float32Array,
-  size: number,
-  minX: number,
-  maxX: number,
-  minY: number,
-  maxY: number,
-  maxYOrigin: number,
+  demSize: number,
+  demMinX: number,
+  demMaxX: number,
+  demMinY: number,
+  demMaxY: number,
+  demMaxYOrigin: number,
   pixelSize: number,
   sx: number,
   sy: number,
@@ -375,9 +375,9 @@ function intersectBeamWithDem(
   dir: [number, number, number],
   maxRangeM: number,
   stepM: number
-): { x: number; y: number; z: number; row: number; col: number; idx: number } | null {
+) : { x: number; y: number; z: number } | null {
   if (!(dir[2] < -1e-6)) return null;
-  const boundsHit = intersectRayWithTileXYBounds(sx, sy, dir[0], dir[1], minX, maxX, minY, maxY, maxRangeM);
+  const boundsHit = intersectRayWithTileXYBounds(sx, sy, dir[0], dir[1], demMinX, demMaxX, demMinY, demMaxY, maxRangeM);
   if (!boundsHit) return null;
 
   const startS = boundsHit.sEnter;
@@ -388,7 +388,7 @@ function intersectBeamWithDem(
     const x = sx + dir[0] * s;
     const y = sy + dir[1] * s;
     const z = sz + dir[2] * s;
-    const terrainZ = sampleDemBilinear(dem, size, minX, maxYOrigin, pixelSize, x, y);
+    const terrainZ = sampleDemBilinear(dem, demSize, demMinX, demMaxYOrigin, pixelSize, x, y);
     if (!Number.isFinite(terrainZ)) return Number.NaN;
     return z - terrainZ;
   };
@@ -397,9 +397,11 @@ function intersectBeamWithDem(
   let prevF = evalSignedHeight(prevS);
   if (!Number.isFinite(prevF)) return null;
   if (prevF <= 0) {
-    const hit = pointToPixelIndex(size, minX, maxYOrigin, pixelSize, sx + dir[0] * prevS, sy + dir[1] * prevS);
-    if (!hit) return null;
-    return { x: sx + dir[0] * prevS, y: sy + dir[1] * prevS, z: sz + dir[2] * prevS, row: hit.row, col: hit.col, idx: hit.idx };
+    // If the beam is already below terrain when it enters this tile, the first
+    // terrain hit happened in a neighboring tile. Returning a hit at the tile
+    // edge creates artificial seams exactly on tile boundaries.
+    if (startS > 1e-6) return null;
+    return { x: sx + dir[0] * prevS, y: sy + dir[1] * prevS, z: sz + dir[2] * prevS };
   }
 
   for (let s = startS + stepM; s <= endS + 1e-6; s += stepM) {
@@ -429,9 +431,7 @@ function intersectBeamWithDem(
       const x = sx + dir[0] * hitS;
       const y = sy + dir[1] * hitS;
       const z = sz + dir[2] * hitS;
-      const hit = pointToPixelIndex(size, minX, maxYOrigin, pixelSize, x, y);
-      if (!hit) return null;
-      return { x, y, z, row: hit.row, col: hit.col, idx: hit.idx };
+      return { x, y, z };
     }
     prevS = currS;
     prevF = currF;
@@ -483,10 +483,19 @@ function emptyResult(z: number, x: number, y: number, size: number): Ret {
 }
 
 self.onmessage = (ev: MessageEvent<Msg>) => {
-  const { tile, polygons, strips, options } = ev.data;
+  const { tile, demTile, polygons, strips, options } = ev.data;
   const { z, x, y, size, data } = tile;
 
   const tileBounds = tileMetersBounds(z, x, y);
+  const tileWidthM = tileBounds.maxX - tileBounds.minX;
+  const demPadTiles = Math.max(0, demTile?.padTiles ?? 0);
+  const demSize = demTile?.size ?? size;
+  const demBounds = {
+    minX: tileBounds.minX - demPadTiles * tileWidthM,
+    minY: tileBounds.minY - demPadTiles * tileWidthM,
+    maxX: tileBounds.maxX + demPadTiles * tileWidthM,
+    maxY: tileBounds.maxY + demPadTiles * tileWidthM,
+  };
   const clipM = Math.max(0, options?.clipInnerBufferM ?? 0);
   const pixM = (tileBounds.maxX - tileBounds.minX) / size;
   const radiusPx = clipM > 0 ? Math.max(1, Math.ceil(clipM / pixM)) : 0;
@@ -500,8 +509,9 @@ self.onmessage = (ev: MessageEvent<Msg>) => {
     return;
   }
 
-  const elevEGM96 = decodeTerrainRGBToElev(data, size);
-  const elev = convertElevationsToWGS84Ellipsoid(elevEGM96, size, tileBounds);
+  const demData = demTile?.data ?? data;
+  const elevEGM96 = decodeTerrainRGBToElev(demData, demSize);
+  const elev = convertElevationsToWGS84Ellipsoid(elevEGM96, demSize, demBounds);
 
   const Rm = 6378137;
   const pixSizeRaw = (tx.maxX - tx.minX) / size;
@@ -522,6 +532,10 @@ self.onmessage = (ev: MessageEvent<Msg>) => {
   const maxX = tx.maxX * scale;
   const minY = tx.minY * scale;
   const maxY = tx.maxY * scale;
+  const demMinX = demBounds.minX * scale;
+  const demMaxX = demBounds.maxX * scale;
+  const demMinY = demBounds.minY * scale;
+  const demMaxY = demBounds.maxY * scale;
   const pixSize = pixSizeRaw * scale;
   const xwCol = new Float64Array(size);
   const ywRow = new Float64Array(size);
@@ -652,8 +666,10 @@ self.onmessage = (ev: MessageEvent<Msg>) => {
       const sx = strip.x1s + strip.dx * t;
       const sy = strip.y1s + strip.dy * t;
       const sz = z1 + (z2 - z1) * t;
-      const terrainUnderSensor = sampleDemBilinear(elev, size, minX, maxY, pixSize, sx, sy);
-      const localAltitudeAGL = Number.isFinite(terrainUnderSensor) ? (sz - terrainUnderSensor) : Number.NaN;
+      const terrainUnderSensor = sampleDemBilinear(elev, demSize, demMinX, demMaxY, pixSize, sx, sy);
+      const localAltitudeAGL = Number.isFinite(terrainUnderSensor)
+        ? (sz - terrainUnderSensor)
+        : (Number.isFinite(strip.plannedAltitudeAGL) ? strip.plannedAltitudeAGL! : Number.NaN);
 
       for (let azimuthIndex = 0; azimuthIndex < azimuthSampleCount; azimuthIndex++) {
         const azimuthFraction = azimuthSampleCount === 1 ? 0.5 : azimuthIndex / (azimuthSampleCount - 1);
@@ -690,12 +706,12 @@ self.onmessage = (ev: MessageEvent<Msg>) => {
 
           const hit = intersectBeamWithDem(
             elev,
-            size,
-            minX,
-            maxX,
-            minY,
-            maxY,
-            maxY,
+            demSize,
+            demMinX,
+            demMaxX,
+            demMinY,
+            demMaxY,
+            demMaxY,
             pixSize,
             sx,
             sy,
@@ -705,18 +721,20 @@ self.onmessage = (ev: MessageEvent<Msg>) => {
             stepM
           );
           if (!hit) continue;
-          if (!polyMask[hit.idx]) continue;
+          const hitPixel = pointToPixelIndex(size, minX, maxY, pixSize, hit.x, hit.y);
+          if (!hitPixel) continue;
+          if (!polyMask[hitPixel.idx]) continue;
 
-          const areaM2 = pixelAreaByRow[hit.row];
+          const areaM2 = pixelAreaByRow[hitPixel.row];
           const densityContribution = areaM2 > 0 ? ((beamWeight * channelWeight) / areaM2) : 0;
           if (!(densityContribution > 0)) continue;
-          density[hit.idx] += densityContribution;
-          if (density[hit.idx] > maxDensity) maxDensity = density[hit.idx];
+          density[hitPixel.idx] += densityContribution;
+          if (density[hitPixel.idx] > maxDensity) maxDensity = density[hitPixel.idx];
 
-          if (lastPassSeen[hit.idx] !== passIndex) {
-            lastPassSeen[hit.idx] = passIndex;
-            overlap[hit.idx] += 1;
-            if (overlap[hit.idx] > maxOverlap) maxOverlap = overlap[hit.idx];
+          if (lastPassSeen[hitPixel.idx] !== passIndex) {
+            lastPassSeen[hitPixel.idx] = passIndex;
+            overlap[hitPixel.idx] += 1;
+            if (overlap[hitPixel.idx] > maxOverlap) maxOverlap = overlap[hitPixel.idx];
           }
           hitLinesPerPolygon[polyIndex].add(passIndex);
         }
