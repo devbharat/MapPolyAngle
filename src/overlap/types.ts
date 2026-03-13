@@ -35,6 +35,8 @@ export type GSDStats = {
   histogram: { bin: number; count: number; areaM2?: number }[]; // per-bin area in m^2
 };
 
+export type DensityStats = GSDStats;
+
 export type PolygonLngLat = { ring: [number, number][] }; // single-ring polygon
 
 // Allow passing polygon IDs so we can report per‑polygon stats deterministically
@@ -44,9 +46,12 @@ export type PolygonLngLatWithId = { id?: string; ring: [number, number][] };
 export type PolygonTileStats = {
   polygonId: string;
   activePixelCount: number;
-  gsdStats: GSDStats;
+  gsdStats?: GSDStats;
+  densityStats?: DensityStats;
   /** Set of global pose indices (in the 'poses' array) that saw this polygon in this tile */
-  hitPoseIds: Uint32Array;
+  hitPoseIds?: Uint32Array;
+  /** Set of global strip indices (in the 'strips' array) that intersected this polygon in this tile */
+  hitLineIds?: Uint32Array;
 };
 
 export type TileResult = {
@@ -56,6 +61,27 @@ export type TileResult = {
   overlap: Uint16Array;
   gsdMin: Float32Array;
   gsdStats?: GSDStats; // Per-tile GSD statistics
+  density?: Float32Array;
+  maxDensity?: number;
+  densityStats?: DensityStats;
+};
+
+export type LidarStripMeters = {
+  id?: string;
+  polygonId?: string;
+  x1: number;
+  y1: number;
+  z1?: number;
+  x2: number;
+  y2: number;
+  z2?: number;
+  halfWidthM: number;
+  densityPerPass: number;
+  speedMps?: number;
+  effectivePointRate?: number;
+  halfFovTan?: number;
+  maxRangeM?: number;
+  passIndex?: number;
 };
 
 export type WorkerIn = {
@@ -87,5 +113,18 @@ export type WorkerIn = {
 
 export type WorkerOut = TileResult & {
   /** Per‑polygon stats for this tile (empty if no active pixels fell in any polygon) */
+  perPolygon?: PolygonTileStats[];
+};
+
+export type LidarWorkerIn = {
+  tile: TileRGBA;
+  polygons: PolygonLngLatWithId[];
+  strips: LidarStripMeters[];
+  options?: {
+    clipInnerBufferM?: number;
+  };
+};
+
+export type LidarWorkerOut = TileResult & {
   perPolygon?: PolygonTileStats[];
 };

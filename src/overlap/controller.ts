@@ -1,4 +1,4 @@
-import type { CameraModel, PoseMeters, PolygonLngLat, TileResult, WorkerOut } from "./types";
+import type { CameraModel, PoseMeters, PolygonLngLat, WorkerOut, LidarWorkerOut } from "./types";
 import { lngLatToTile, tileCornersLngLat } from "./mercator";
 
 export async function fetchTerrainRGBA(
@@ -63,6 +63,24 @@ export class OverlapWorker {
       };
       this.worker.addEventListener("message", onMsg as any, { once: true });
       this.worker.postMessage(args, [args.tile.data.buffer]); // transfer tile RGBA buffer
+    });
+  }
+  terminate() { this.worker.terminate(); }
+}
+
+export class LidarDensityWorker {
+  private worker: Worker;
+  constructor() {
+    this.worker = new Worker(new URL("./lidar-worker.ts", import.meta.url), { type: "module" });
+  }
+  runTile(args: any) {
+    return new Promise<LidarWorkerOut>((resolve) => {
+      const onMsg = (e: MessageEvent<LidarWorkerOut>) => {
+        this.worker.removeEventListener("message", onMsg as any);
+        resolve(e.data);
+      };
+      this.worker.addEventListener("message", onMsg as any, { once: true });
+      this.worker.postMessage(args, [args.tile.data.buffer]);
     });
   }
   terminate() { this.worker.terminate(); }

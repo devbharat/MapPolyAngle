@@ -94,8 +94,49 @@ function encodeGsdToImage(gsd: Float32Array, size: number, gsdMin = 0.005, gsdMa
   return canvas;
 }
 
+function encodeDensityToImage(density: Float32Array, size: number, densityMin = 0, densityMax = 200): HTMLCanvasElement {
+  const canvas = document.createElement("canvas");
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext("2d", { willReadFrequently: true })!;
+  const img = ctx.createImageData(size, size);
+  const lo = Math.max(0, densityMin);
+  const hi = Math.max(lo + 1e-6, densityMax);
+
+  for (let i = 0, j = 0; i < density.length; i++, j += 4) {
+    const value = density[i];
+    if (!(value > 0) || !Number.isFinite(value)) {
+      img.data[j] = 0;
+      img.data[j + 1] = 0;
+      img.data[j + 2] = 0;
+      img.data[j + 3] = 0;
+      continue;
+    }
+    // Invert density coloring so low density is worse/red and high density is better/blue.
+    const t = 1 - Math.max(0, Math.min(1, (value - lo) / (hi - lo)));
+    const [r, g, b] = heatmapColor(t);
+    img.data[j] = r;
+    img.data[j + 1] = g;
+    img.data[j + 2] = b;
+    img.data[j + 3] = 200;
+  }
+
+  ctx.putImageData(img, 0, 0);
+  return canvas;
+}
+
 export function addOrUpdateTileOverlay(
-  map: mapboxgl.Map, result: TileResult, opts: { kind: "overlap"|"gsd"; runId: string; opacity?: number; gsdMax?: number; gsdMin?: number }
+  map: mapboxgl.Map,
+  result: TileResult,
+  opts: {
+    kind: "overlap" | "pass" | "gsd" | "density";
+    runId: string;
+    opacity?: number;
+    gsdMax?: number;
+    gsdMin?: number;
+    densityMax?: number;
+    densityMin?: number;
+  }
 ) {
   const idBase = `ogsd-${opts.runId}-${opts.kind}-${result.z}-${result.x}-${result.y}`;
   const sourceId = idBase;
@@ -104,8 +145,10 @@ export function addOrUpdateTileOverlay(
   const corners = tileCornersForImageSource(result.z, result.x, result.y);
 
   let canvas: HTMLCanvasElement;
-  if (opts.kind === "overlap") {
+  if (opts.kind === "overlap" || opts.kind === "pass") {
     canvas = encodeOverlapToImage(result.overlap, result.size, result.maxOverlap || 1);
+  } else if (opts.kind === "density") {
+    canvas = encodeDensityToImage(result.density ?? new Float32Array(result.size * result.size), result.size, opts.densityMin ?? 0, opts.densityMax ?? Math.max(1, result.maxDensity ?? 1));
   } else {
     canvas = encodeGsdToImage(result.gsdMin, result.size, opts.gsdMin ?? 0.005, opts.gsdMax ?? 0.05);
   }
