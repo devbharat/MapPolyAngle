@@ -6,8 +6,8 @@ import type { CameraModel, PoseMeters, PolygonLngLatWithId, GSDStats, PolygonTil
 import { lngLatToMeters } from "@/overlap/mercator";
 import { metersToLngLat } from "@/services/Projection";
 import { SONY_RX1R2, DJI_ZENMUSE_P1_24MM, ILX_LR1_INSPECT_85MM, MAP61_17MM, RGB61_24MM, forwardSpacingRotated } from "@/domain/camera";
-import { DEFAULT_LIDAR_MAX_RANGE_M, getLidarModel, lidarDeliverableDensity, lidarSinglePassDensity, lidarSwathWidth } from "@/domain/lidar";
-import { sampleCameraPositionsOnFlightPath, build3DFlightPath, queryMinMaxElevationAlongPolylineWGS84 } from "@/components/MapFlightDirection/utils/geometry";
+import { DEFAULT_LIDAR_MAX_RANGE_M, getLidarMappingFovDeg, getLidarModel, lidarDeliverableDensity, lidarSinglePassDensity, lidarSwathWidth } from "@/domain/lidar";
+import { sampleCameraPositionsOnFlightPath, build3DFlightPath, extendFlightLineForTurnRunout, queryMinMaxElevationAlongPolylineWGS84 } from "@/components/MapFlightDirection/utils/geometry";
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -55,6 +55,10 @@ type OverallMetricStats = {
   gsd: GSDStats | null;
   density: GSDStats | null;
 };
+
+function lidarComparisonLabel(mode?: 'first-return' | 'all-returns') {
+  return mode === 'all-returns' ? 'All returns' : 'First return';
+}
 
 // Helper function to calculate polygon area in acres
 function calculatePolygonAreaAcres(ring: [number, number][]): number {
@@ -540,10 +544,16 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
       const tiles = tilesMap.get(polygonId) || [];
       const model = getLidarModel(params.lidarKey);
       const altitudeAGL = params.altitudeAGL ?? lineData.altitudeAGL ?? altitude;
-      const mappingFovDeg = params.mappingFovDeg ?? model.effectiveHorizontalFovDeg;
+      const mappingFovDeg = getLidarMappingFovDeg(model, params.mappingFovDeg);
       const speedMps = params.speedMps ?? model.defaultSpeedMps;
       const returnMode = params.lidarReturnMode ?? 'single';
-      const maxLidarRangeM = params.maxLidarRangeM ?? DEFAULT_LIDAR_MAX_RANGE_M;
+      const maxLidarRangeM = params.maxLidarRangeM ?? model.defaultMaxRangeM ?? DEFAULT_LIDAR_MAX_RANGE_M;
+      const frameRateHz = params.lidarFrameRateHz ?? model.defaultFrameRateHz;
+      const azimuthSectorCenterDeg = params.lidarAzimuthSectorCenterDeg ?? model.defaultAzimuthSectorCenterDeg ?? 0;
+      const boresightYawDeg = params.lidarBoresightYawDeg ?? model.boresightYawDeg ?? 0;
+      const boresightPitchDeg = params.lidarBoresightPitchDeg ?? model.boresightPitchDeg ?? 0;
+      const boresightRollDeg = params.lidarBoresightRollDeg ?? model.boresightRollDeg ?? 0;
+      const comparisonMode = params.lidarComparisonMode ?? 'first-return';
       const swathWidth = lidarSwathWidth(altitudeAGL, mappingFovDeg);
       const densityPerPass = lidarSinglePassDensity(model, altitudeAGL, speedMps, returnMode, mappingFovDeg);
       const halfFovTan = Math.tan((mappingFovDeg * Math.PI) / 360);
@@ -558,11 +568,13 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
         const sourceLine = sourceLines[lineIndex];
         if (!Array.isArray(sourceLine) || sourceLine.length < 2) continue;
         const passIndex = globalPassIndex++;
+        const flownLine = lineIndex % 2 === 0 ? sourceLine : [...sourceLine].reverse();
+        const activeSweepLine = extendFlightLineForTurnRunout(flownLine, turnExtend);
         const sweepPath3d = build3DFlightPath(
-          [sourceLine],
+          [activeSweepLine],
           tiles,
           lineData.lineSpacing,
-          { altitudeAGL, mode: altitudeMode, minClearance, turnExtendM: turnExtend }
+          { altitudeAGL, mode: altitudeMode, minClearance, turnExtendM: 0 }
         )[0];
         if (!Array.isArray(sweepPath3d) || sweepPath3d.length < 2) continue;
 
@@ -595,6 +607,16 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
             halfFovTan,
             maxRangeM: maxLidarRangeM,
             passIndex,
+            frameRateHz,
+            nativeHorizontalFovDeg: model.nativeHorizontalFovDeg,
+            mappingFovDeg,
+            verticalAnglesDeg: model.verticalAnglesDeg,
+            returnMode,
+            comparisonMode,
+            azimuthSectorCenterDeg,
+            boresightYawDeg,
+            boresightPitchDeg,
+            boresightRollDeg,
           });
         }
       }
@@ -949,6 +971,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
           }
           const params = (paramsMap as any)[polygonId];
           const model = getLidarModel(params?.lidarKey);
+          const comparisonLabel = lidarComparisonLabel(params?.lidarComparisonMode);
           nextPerPolygon.set(polygonId, {
             polygonId,
             metricKind: 'density',
@@ -956,7 +979,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
             areaAcres,
             sampleCount: uniqueLineIds.size,
             sampleLabel: 'Flight lines',
-            sourceLabel: model.key,
+            sourceLabel: `${model.key} · ${comparisonLabel}`,
           });
           densitySummaries.push(aggregatedDensityStats);
           return;
@@ -1200,12 +1223,12 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
   const metricLabels = useCallback((metricKind: MetricKind) => {
     if (metricKind === 'density') {
       return {
-        title: 'Point Density',
+        title: 'Predicted Point Density',
         min: 'Min density',
         mean: 'Mean density',
         max: 'Max density',
         xAxis: 'Density (pts/m²)',
-        tooltipLabel: 'Density',
+        tooltipLabel: 'Predicted density',
       };
     }
     return {

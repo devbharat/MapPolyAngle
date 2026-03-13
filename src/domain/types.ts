@@ -23,12 +23,27 @@ export interface CameraModel {
 
 export type PayloadKind = 'camera' | 'lidar';
 export type LidarReturnMode = 'single' | 'dual' | 'triple';
+export type LidarComparisonMode = 'first-return' | 'all-returns';
 
 export interface LidarModel {
   key: string;
   defaultSpeedMps: number;
-  effectiveHorizontalFovDeg: number;
+  nativeHorizontalFovDeg: number;
+  mappingHorizontalFovDeg: number;
+  effectiveHorizontalFovDeg: number; // compatibility alias for the mapping sector
+  verticalFovMinDeg: number;
+  verticalFovMaxDeg: number;
+  verticalResolutionDeg: number;
+  verticalAnglesDeg: number[];
+  defaultFrameRateHz: number;
+  supportedFrameRatesHz: number[];
+  nativePointRates: Record<LidarReturnMode, number>;
   effectivePointRates: Record<LidarReturnMode, number>;
+  defaultAzimuthSectorCenterDeg?: number;
+  boresightYawDeg?: number;
+  boresightPitchDeg?: number;
+  boresightRollDeg?: number;
+  defaultMaxRangeM?: number;
   names?: string[];
 }
 
@@ -44,6 +59,12 @@ export interface FlightParams {
   speedMps?: number;    // lidar cruise speed, defaults to the payload model default
   lidarReturnMode?: LidarReturnMode; // lidar return mode used for density estimates
   mappingFovDeg?: number; // lidar mapping sector in degrees; Wingtra lidar defaults to 90
+  lidarFrameRateHz?: number; // lidar spin / frame rate used for beam sampling
+  lidarAzimuthSectorCenterDeg?: number; // center of the Wingtra mapping sector in sensor azimuth degrees
+  lidarBoresightYawDeg?: number; // optional yaw boresight correction for scan geometry
+  lidarBoresightPitchDeg?: number; // optional pitch boresight correction for scan geometry
+  lidarBoresightRollDeg?: number; // optional roll boresight correction for scan geometry
+  lidarComparisonMode?: LidarComparisonMode; // how predicted density should be compared to delivered LAS
   maxLidarRangeM?: number; // lidar slant range limit for valid returns; beyond this is treated as no-data
   pointDensityPtsM2?: number; // imported or computed lidar density estimate
   useCustomBearing?: boolean; // optional manual bearing flag

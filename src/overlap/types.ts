@@ -1,3 +1,5 @@
+import type { LidarComparisonMode, LidarReturnMode } from "@/domain/types";
+
 export type CameraModel = {
   f_m: number;      // focal length (meters)
   sx_m: number;     // pixel pitch x (meters)
@@ -82,6 +84,16 @@ export type LidarStripMeters = {
   halfFovTan?: number;
   maxRangeM?: number;
   passIndex?: number;
+  frameRateHz?: number;
+  nativeHorizontalFovDeg?: number;
+  mappingFovDeg?: number;
+  verticalAnglesDeg?: number[];
+  returnMode?: LidarReturnMode;
+  comparisonMode?: LidarComparisonMode;
+  azimuthSectorCenterDeg?: number;
+  boresightYawDeg?: number;
+  boresightPitchDeg?: number;
+  boresightRollDeg?: number;
 };
 
 export type WorkerIn = {

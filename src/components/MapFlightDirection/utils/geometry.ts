@@ -204,6 +204,29 @@ export function calculateOptimalLineSpacing(ring: number[][], bearingDeg: number
   return spacing;
 }
 
+export function extendFlightLineForTurnRunout(
+  line: number[][],
+  runoutM: number
+): number[][] {
+  if (!Array.isArray(line) || line.length < 2 || !(runoutM > 0)) return Array.isArray(line) ? [...line] : [];
+
+  const first = line[0] as [number, number];
+  const second = line[1] as [number, number];
+  const last = line[line.length - 1] as [number, number];
+  const penultimate = line[line.length - 2] as [number, number];
+
+  const startBearing = geoBearing([first[0], first[1]], [second[0], second[1]]);
+  const endBearing = geoBearing([penultimate[0], penultimate[1]], [last[0], last[1]]);
+  const startExtended = geoDestination([first[0], first[1]], (startBearing + 180) % 360, runoutM);
+  const endExtended = geoDestination([last[0], last[1]], endBearing, runoutM);
+
+  return [
+    [startExtended[0], startExtended[1]],
+    ...line,
+    [endExtended[0], endExtended[1]],
+  ];
+}
+
 function buildFillet(
   P0: [number, number, number],
   P2: [number, number, number],
