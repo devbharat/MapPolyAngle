@@ -3,7 +3,7 @@ import type mapboxgl from "mapbox-gl";
 import { LidarDensityWorker, OverlapWorker, fetchTerrainRGBA, tilesCoveringPolygon } from "@/overlap/controller";
 import { addOrUpdateTileOverlay, clearAllOverlays } from "@/overlap/overlay";
 import type { CameraModel, PoseMeters, PolygonLngLatWithId, GSDStats, PolygonTileStats, LidarStripMeters } from "@/overlap/types";
-import { lngLatToMeters } from "@/overlap/mercator";
+import { lngLatToMeters, tileMetersBounds } from "@/overlap/mercator";
 import { metersToLngLat } from "@/services/Projection";
 import { SONY_RX1R2, DJI_ZENMUSE_P1_24MM, ILX_LR1_INSPECT_85MM, MAP61_17MM, RGB61_24MM, forwardSpacingRotated } from "@/domain/camera";
 import { DEFAULT_LIDAR_MAX_RANGE_M, getLidarMappingFovDeg, getLidarModel, lidarDeliverableDensity, lidarSinglePassDensity, lidarSwathWidth } from "@/domain/lidar";
@@ -105,6 +105,27 @@ function ringsRoughlyEqual(a: [number, number][], b: [number, number][], toleran
   return true;
 }
 
+function lidarStripMayAffectTile(
+  strip: LidarStripMeters,
+  tileRef: { z: number; x: number; y: number }
+) {
+  const bounds = tileMetersBounds(tileRef.z, tileRef.x, tileRef.y);
+  const reachPadM = Math.max(
+    strip.halfWidthM ?? 0,
+    Number.isFinite(strip.maxRangeM ?? Number.NaN) ? strip.maxRangeM! : 0
+  );
+  const minXs = Math.min(strip.x1, strip.x2) - reachPadM;
+  const maxXs = Math.max(strip.x1, strip.x2) + reachPadM;
+  const minYs = Math.min(strip.y1, strip.y2) - reachPadM;
+  const maxYs = Math.max(strip.y1, strip.y2) + reachPadM;
+  return !(
+    maxXs < bounds.minX ||
+    minXs > bounds.maxX ||
+    maxYs < bounds.minY ||
+    minYs > bounds.maxY
+  );
+}
+
 // NEW: helper for synthetic ring conversion (Spherical Mercator meters -> lng/lat)
 const R_SYNTH = 6378137;
 function metersBoundsToLngLatRing(minX:number,minY:number,maxX:number,maxY:number):[number,number][] {
@@ -181,6 +202,8 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
   const autoTriesRef = useRef(0);
   const autoRunTimeoutRef = useRef<number | null>(null);
   const computeSeqRef = useRef(0); // increment to invalidate in-flight computations
+  const runningRef = useRef(false);
+  const suppressAutoRunUntilRef = useRef(0);
   const [clipInnerBufferM, setClipInnerBufferM] = useState(0);
   const [maxTiltDeg, setMaxTiltDeg] = useState(30); // NEW: max allowable camera tilt (deg from vertical)
   const [minOverlapForGsd, setMinOverlapForGsd] = useState(3); // Minimum image overlap to consider GSD valid
@@ -188,6 +211,9 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
   React.useEffect(() => {
     minOverlapForGsdRef.current = minOverlapForGsd;
   }, [minOverlapForGsd]);
+  React.useEffect(() => {
+    runningRef.current = running;
+  }, [running]);
   // NEW: altitude strategy & min clearance & turn extension (synced with map API if available)
   const [altitudeModeUI, setAltitudeModeUI] = useState<'legacy' | 'min-clearance'>('legacy');
   const [minClearanceUI, setMinClearanceUI] = useState<number>(60);
@@ -274,6 +300,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
     const selected = solutions[selectedIndex];
     if (!api?.applyTerrainPartitionSolution || !selected) return;
     setApplyingPartitionId(polygonId);
+    suppressAutoRunUntilRef.current = Date.now() + 5000;
     try {
       const result = await api.applyTerrainPartitionSolution(polygonId, selected.signature);
       if (result?.replaced) {
@@ -307,8 +334,10 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
           description: 'The selected partition could not be applied to this area.',
           variant: 'destructive',
         });
+        suppressAutoRunUntilRef.current = 0;
       }
     } catch (error) {
+      suppressAutoRunUntilRef.current = 0;
       toast({
         title: 'Partition apply failed',
         description: error instanceof Error ? error.message : 'Unable to apply the selected partition.',
@@ -952,12 +981,14 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
       try {
         const perRegionStats = new Map<string, GSDStats[]>();
         for (const tileRef of allTileRefs) {
+          const tileStrips = strips.filter((strip) => lidarStripMayAffectTile(strip, tileRef));
+          if (tileStrips.length === 0) continue;
           const { demTile, tile } = await getLidarTileWithHalo(tileRef, 1);
           const res = await worker.runTile({
             tile,
             demTile,
             polygons: virtualPolygons.map(({ id, ring }) => ({ id, ring })),
-            strips,
+            strips: tileStrips,
             options: { clipInnerBufferM },
           } as any);
           (res.perPolygon ?? []).forEach((polyStats) => {
@@ -1460,12 +1491,14 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
         const lidarTiles = collectTiles(lidarSourcePolygons);
         const { strips: lidarStrips, densityPaletteMax } = buildLidarStrips(paramsMap);
         for (const tileRef of lidarTiles) {
+          const tileStrips = lidarStrips.filter((strip) => lidarStripMayAffectTile(strip, tileRef));
+          if (tileStrips.length === 0) continue;
           const { cacheKey, tile, demTile } = await getLidarTileWithHalo(tileRef, 1);
           const res = await lidarWorker.runTile({
             tile,
             demTile,
-            polygons: lidarPolygons,
-            strips: lidarStrips,
+            polygons: lidarSourcePolygons,
+            strips: tileStrips,
             options: { clipInnerBufferM },
           } as any);
           if (mySeq !== computeSeqRef.current) break;
@@ -1583,6 +1616,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
   // Auto-run function that can be called externally
   const autoRun = useCallback(async (opts?: { polygonId?: string; reason?: 'lines'|'spacing'|'alt'|'manual' }) => {
     if (running) return;
+    if (suppressAutoRunUntilRef.current > Date.now()) return;
     const api = mapRef.current;
     const map = api?.getMap?.();
     const ready = !!map?.isStyleLoaded?.();
@@ -1645,8 +1679,9 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
         const entry = lines.get(id);
         return !!entry && Array.isArray(entry.flightLines) && entry.flightLines.length > 0;
       });
-      if (ready || Date.now() - startedAt >= deadlineMs) {
-        autoRun({ reason: 'manual' });
+      if ((ready || Date.now() - startedAt >= deadlineMs) && !runningRef.current) {
+        suppressAutoRunUntilRef.current = 0;
+        compute({ suppressMapNotReadyToast: true });
         return;
       }
       window.setTimeout(attempt, 150);
@@ -2025,6 +2060,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
                           e.stopPropagation();
                           setSelection(polygonId);
                           setSplittingPolygonId(polygonId);
+                          suppressAutoRunUntilRef.current = Date.now() + 5000;
                           try {
                             const result = await mapRef.current?.autoSplitPolygonByTerrain?.(polygonId);
                             if (result?.replaced && result.createdIds.length > 1) {
@@ -2041,6 +2077,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
                                 title: 'No split created',
                                 description: 'No useful terrain-face split was found for this area with the current rules.',
                               });
+                              suppressAutoRunUntilRef.current = 0;
                             }
                           } finally {
                             setSplittingPolygonId((current) => current === polygonId ? null : current);
