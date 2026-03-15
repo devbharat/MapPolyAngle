@@ -1635,6 +1635,11 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
     if (!autoGenerate) return; // nothing else to auto-run
 
     const rings: [number, number][][] = api?.getPolygons?.() ?? [];
+    const requiresGlobalRasterRefresh = !!(
+      opts?.polygonId &&
+      opts.reason &&
+      ['lines', 'spacing', 'alt'].includes(opts.reason)
+    );
     const fl = api?.getFlightLines?.();
     const haveLines = !!fl && (
       opts?.polygonId
@@ -1659,7 +1664,13 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
       autoTriesRef.current = 0;
       // Recompute from scratch; defer one tick for state flush after edits/deletes
       // Always defer one tick to allow React state updates (lines/tiles) to flush
-      setTimeout(() => compute({ polygonId: opts?.polygonId, suppressMapNotReadyToast: true }), 0);
+      setTimeout(
+        () => compute({
+          polygonId: requiresGlobalRasterRefresh ? undefined : opts?.polygonId,
+          suppressMapNotReadyToast: true,
+        }),
+        0,
+      );
       return;
     }
     if (autoTriesRef.current < 15) {
