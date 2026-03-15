@@ -283,7 +283,7 @@ function runFailingPolygonRegression() {
     atomBreakThreshold: 7,
   });
   assert.ok(solutions.length >= 1, "captured failing lidar polygon should now produce at least one practical partition");
-  const first = solutions[0];
+  const first = solutions.find((solution) => solution.isFirstPracticalSplit) ?? solutions[0];
   assert.ok(first.partition.regionCount >= 2 && first.partition.regionCount <= 4, "first practical split should stay coarse");
   assert.ok(first.largestRegionFraction < 0.7, "first practical split should not collapse to one giant parent-like region");
 }
@@ -338,6 +338,10 @@ function runExampleReferenceCase() {
     atomBreakThreshold: 7,
   });
   assert.ok(solutions.length >= 1, "reference terrain should yield at least one practical compact partition option");
+  assert.ok(
+    solutions.some((solution) => solution.partition.regionCount === 2),
+    "manual planning should preserve a direct two-region option when one exists",
+  );
   const fine = solutions[solutions.length - 1];
   assert.ok(fine.partition.regionCount >= 2 && fine.partition.regionCount <= 8, "reference-guided solution should remain a compact multi-area tessellation");
   const distinctFamilies = clusterDistinctBearings(fine.regions.map((region) => region.bearingDeg), 20);

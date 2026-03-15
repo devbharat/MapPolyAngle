@@ -1066,6 +1066,11 @@ type PartitionEvaluation = {
   boundaryBreakAlignment: number;
 };
 
+type FineSegmentationResult = {
+  selected: PartitionEvaluation;
+  bestByRegionCount: Map<number, PartitionEvaluation>;
+};
+
 const QUALITY_HEAVY_TRADEOFF = 0.92;
 const MAX_SEGMENTATION_ITERATIONS = 10;
 const MAX_SEED_VARIANTS = 3;
@@ -2063,7 +2068,7 @@ function buildFineSegmentation(
   params: FlightParams,
   candidateBearings: number[],
   options: Required<TerrainAtomizationOptions>,
-) {
+): FineSegmentationResult | null {
   const atomMap = buildAtomMap(graph);
   const adjacencyLookup = buildAdjacencyLookup(graph.adjacency);
   const seedVariants = buildSeedVariants(graph, atomMap, options);
@@ -2109,6 +2114,30 @@ function buildFineSegmentation(
     if (!existing || candidate.totalScore < existing.totalScore) deduped.set(signature, candidate);
   }
   const candidatePool = [...deduped.values()];
+  const bestByRegionCount = new Map<number, PartitionEvaluation>();
+  for (const candidate of candidatePool) {
+    if (!isPracticalPartitionEvaluation(candidate, options.minAreaM2)) continue;
+    if (candidate.largestRegionFraction >= 0.92) continue;
+    const count = candidate.regions.length;
+    const existing = bestByRegionCount.get(count);
+    if (!existing) {
+      bestByRegionCount.set(count, candidate);
+      continue;
+    }
+    const candidateBetter =
+      candidate.largestRegionFraction < existing.largestRegionFraction - 1e-9 ||
+      (
+        Math.abs(candidate.largestRegionFraction - existing.largestRegionFraction) <= 1e-9 &&
+        (
+          candidate.partition.normalizedQualityCost < existing.partition.normalizedQualityCost - 1e-9 ||
+          (
+            Math.abs(candidate.partition.normalizedQualityCost - existing.partition.normalizedQualityCost) <= 1e-9 &&
+            candidate.totalScore < existing.totalScore
+          )
+        )
+      );
+    if (candidateBetter) bestByRegionCount.set(count, candidate);
+  }
   const practical = candidatePool.filter((candidate) => (
     isPracticalPartitionEvaluation(candidate, options.minAreaM2) &&
     candidate.largestRegionFraction < 0.88 &&
@@ -2124,7 +2153,8 @@ function buildFineSegmentation(
     if (b.regions.length !== a.regions.length) return b.regions.length - a.regions.length;
     return a.totalScore - b.totalScore;
   });
-  return ranked[0] ?? null;
+  const selected = ranked[0] ?? null;
+  return selected ? { selected, bestByRegionCount } : null;
 }
 
 function tokenSplitSatisfied(solution: PartitionEvaluation) {
@@ -2135,7 +2165,7 @@ function tokenSplitSatisfied(solution: PartitionEvaluation) {
 
 function buildHierarchyFromFineSegmentation(
   parentRing: Ring,
-  fine: PartitionEvaluation,
+  fineResult: FineSegmentationResult,
   guidance: TerrainGuidanceField,
   atomMap: Map<string, TerrainAtom>,
   adjacencyLookup: Map<string, TerrainAtomAdjacency[]>,
@@ -2144,8 +2174,8 @@ function buildHierarchyFromFineSegmentation(
   candidateBearings: number[],
   options: Required<TerrainAtomizationOptions>,
 ) {
-  const hierarchy: PartitionEvaluation[] = [fine];
-  let current = fine;
+  const hierarchy: PartitionEvaluation[] = [fineResult.selected];
+  let current = fineResult.selected;
 
   while (current.regions.length > 1) {
     const regionAdjacency = buildRegionAdjacency(current.assignments, adjacencyLookup);
@@ -2197,16 +2227,57 @@ function buildHierarchyFromFineSegmentation(
       solution.largestRegionFraction < 0.82
     ));
   }
-  if (firstPracticalIndex < 0) return [];
-  return ordered
-    .slice(firstPracticalIndex)
-    .filter((solution) => solution.regions.length > 1)
-    .map((solution, index, visible) => buildFrontierSolution(
-      solution,
-      index,
-      index === 0,
-      visible.length <= 1 ? 0.5 : index / (visible.length - 1),
-    ));
+  const visibleHierarchy = firstPracticalIndex < 0
+    ? [] as PartitionEvaluation[]
+    : ordered.slice(firstPracticalIndex).filter((solution) => solution.regions.length > 1);
+  const firstPracticalSignature = visibleHierarchy.length > 0
+    ? buildSolutionSignature(visibleHierarchy[0].regions)
+    : null;
+
+  const byRegionCount = new Map<number, PartitionEvaluation>();
+  const consider = (solution: PartitionEvaluation) => {
+    if (solution.regions.length <= 1) return;
+    const count = solution.regions.length;
+    const existing = byRegionCount.get(count);
+    if (!existing) {
+      byRegionCount.set(count, solution);
+      return;
+    }
+    const solutionBetter =
+      solution.largestRegionFraction < existing.largestRegionFraction - 1e-9 ||
+      (
+        Math.abs(solution.largestRegionFraction - existing.largestRegionFraction) <= 1e-9 &&
+        (
+          solution.partition.normalizedQualityCost < existing.partition.normalizedQualityCost - 1e-9 ||
+          (
+            Math.abs(solution.partition.normalizedQualityCost - existing.partition.normalizedQualityCost) <= 1e-9 &&
+            solution.totalScore < existing.totalScore
+          )
+        )
+      );
+    if (solutionBetter) byRegionCount.set(count, solution);
+  };
+
+  visibleHierarchy.forEach(consider);
+  fineResult.bestByRegionCount.forEach((solution, count) => {
+    if (count === 2 || !byRegionCount.has(count)) consider(solution);
+  });
+
+  const visible = [...byRegionCount.values()].sort((a, b) => {
+    if (a.regions.length !== b.regions.length) return a.regions.length - b.regions.length;
+    if (a.largestRegionFraction !== b.largestRegionFraction) return a.largestRegionFraction - b.largestRegionFraction;
+    if (a.partition.normalizedQualityCost !== b.partition.normalizedQualityCost) {
+      return a.partition.normalizedQualityCost - b.partition.normalizedQualityCost;
+    }
+    return a.totalScore - b.totalScore;
+  });
+  if (visible.length === 0) return [];
+  return visible.map((solution, index) => buildFrontierSolution(
+    solution,
+    index,
+    firstPracticalSignature != null && buildSolutionSignature(solution.regions) === firstPracticalSignature,
+    visible.length <= 1 ? 0.5 : index / (visible.length - 1),
+  ));
 }
 
 function buildHeuristicFallbackSolutions(
