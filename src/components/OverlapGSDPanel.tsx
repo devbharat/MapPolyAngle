@@ -3,7 +3,7 @@ import type mapboxgl from "mapbox-gl";
 import { LidarDensityWorker, OverlapWorker, fetchTerrainRGBA, tilesCoveringPolygon } from "@/overlap/controller";
 import { addOrUpdateTileOverlay, clearRunOverlays, clearAllOverlays } from "@/overlap/overlay";
 import type { CameraModel, PoseMeters, PolygonLngLatWithId, GSDStats, PolygonTileStats, LidarStripMeters } from "@/overlap/types";
-import { lngLatToMeters } from "@/overlap/mercator";
+import { lngLatToMeters, tileMetersBounds } from "@/overlap/mercator";
 import { metersToLngLat } from "@/services/Projection";
 import { SONY_RX1R2, DJI_ZENMUSE_P1_24MM, ILX_LR1_INSPECT_85MM, MAP61_17MM, RGB61_24MM, forwardSpacingRotated } from "@/domain/camera";
 import { DEFAULT_LIDAR_MAX_RANGE_M, getLidarMappingFovDeg, getLidarModel, lidarDeliverableDensity, lidarSinglePassDensity, lidarSwathWidth } from "@/domain/lidar";
@@ -85,6 +85,26 @@ function calculatePolygonAreaAcres(ring: [number, number][]): number {
   return areaSquareMeters / 4046.8564224;
 }
 
+function lidarStripMayAffectTile(
+  strip: LidarStripMeters,
+  tileRef: { z: number; x: number; y: number }
+) {
+  const bounds = tileMetersBounds(tileRef.z, tileRef.x, tileRef.y);
+  const reachPadM = Math.max(
+    strip.halfWidthM ?? 0,
+    Number.isFinite(strip.maxRangeM ?? Number.NaN) ? strip.maxRangeM! : 0
+  );
+  const minXs = Math.min(strip.x1, strip.x2) - reachPadM;
+  const maxXs = Math.max(strip.x1, strip.x2) + reachPadM;
+  const minYs = Math.min(strip.y1, strip.y2) - reachPadM;
+  const maxYs = Math.max(strip.y1, strip.y2) + reachPadM;
+  return !(
+    maxXs < bounds.minX ||
+    minXs > bounds.maxX ||
+    maxYs < bounds.minY ||
+    minYs > bounds.maxY
+  );
+}
 // NEW: helper for synthetic ring conversion (Spherical Mercator meters -> lng/lat)
 const R_SYNTH = 6378137;
 function metersBoundsToLngLatRing(minX:number,minY:number,maxX:number,maxY:number):[number,number][] {
@@ -972,12 +992,14 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
         const lidarTiles = collectTiles(lidarSourcePolygons);
         const { strips: lidarStrips, densityPaletteMax } = buildLidarStrips(paramsMap);
         for (const tileRef of lidarTiles) {
+          const tileStrips = lidarStrips.filter((strip) => lidarStripMayAffectTile(strip, tileRef));
+          if (tileStrips.length === 0) continue;
           const { cacheKey, tile, demTile } = await getLidarTileWithHalo(tileRef, 1);
           const res = await lidarWorker.runTile({
             tile,
             demTile,
-            polygons: lidarPolygons,
-            strips: lidarStrips,
+            polygons: lidarSourcePolygons,
+            strips: tileStrips,
             options: { clipInnerBufferM },
           } as any);
           if (mySeq !== computeSeqRef.current) break;
