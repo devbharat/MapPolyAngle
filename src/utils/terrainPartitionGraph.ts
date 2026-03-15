@@ -231,25 +231,83 @@ function featureToSingleRing(feature: any): Ring | null {
 function unionFeatures(a: any, b: any) {
   const unionFn = (turf as any).union;
   if (typeof unionFn !== "function") return null;
-  return unionFn.length >= 2
-    ? unionFn(a, b)
-    : unionFn(turf.featureCollection([a, b]));
+  const attempt = (left: any, right: any) => (
+    unionFn.length >= 2
+      ? unionFn(left, right)
+      : unionFn(turf.featureCollection([left, right]))
+  );
+  try {
+    return attempt(a, b);
+  } catch {
+    try {
+      return attempt(normalizePolygonFeature(a), normalizePolygonFeature(b));
+    } catch {
+      return null;
+    }
+  }
 }
 
 function intersectFeatures(a: any, b: any) {
   const intersectFn = (turf as any).intersect;
   if (typeof intersectFn !== "function") return null;
-  return intersectFn.length >= 2
-    ? intersectFn(a, b)
-    : intersectFn(turf.featureCollection([a, b]));
+  const attempt = (left: any, right: any) => (
+    intersectFn.length >= 2
+      ? intersectFn(left, right)
+      : intersectFn(turf.featureCollection([left, right]))
+  );
+  try {
+    return attempt(a, b);
+  } catch {
+    try {
+      return attempt(normalizePolygonFeature(a), normalizePolygonFeature(b));
+    } catch {
+      return null;
+    }
+  }
 }
 
 function differenceFeatures(a: any, b: any) {
   const differenceFn = (turf as any).difference;
   if (typeof differenceFn !== "function") return null;
-  return differenceFn.length >= 2
-    ? differenceFn(a, b)
-    : differenceFn(turf.featureCollection([a, b]));
+  const attempt = (left: any, right: any) => (
+    differenceFn.length >= 2
+      ? differenceFn(left, right)
+      : differenceFn(turf.featureCollection([left, right]))
+  );
+  try {
+    return attempt(a, b);
+  } catch {
+    try {
+      return attempt(normalizePolygonFeature(a), normalizePolygonFeature(b));
+    } catch {
+      return null;
+    }
+  }
+}
+
+function normalizePolygonFeature(feature: any) {
+  if (!feature?.geometry) return feature;
+  let next = feature;
+  try {
+    next = turf.cleanCoords(next as any);
+  } catch {}
+  try {
+    const truncateFn = (turf as any).truncate;
+    if (typeof truncateFn === "function") {
+      next = truncateFn(next, { precision: 10, coordinates: 2, mutate: false });
+    }
+  } catch {}
+  try {
+    const bufferFn = (turf as any).buffer;
+    if (typeof bufferFn === "function" && (next.geometry?.type === "Polygon" || next.geometry?.type === "MultiPolygon")) {
+      const repaired = bufferFn(next, 0, { units: "meters" });
+      if (repaired?.geometry) next = repaired;
+    }
+  } catch {}
+  try {
+    next = turf.cleanCoords(next as any);
+  } catch {}
+  return next;
 }
 
 function featureToRings(feature: any): Ring[] {

@@ -66,6 +66,30 @@ type ExactPartitionPreview = {
   sampleLabel: string;
 };
 
+function statsTotalAreaM2(stats: GSDStats) {
+  if (stats.totalAreaM2 && stats.totalAreaM2 > 0) return stats.totalAreaM2;
+  return stats.histogram.reduce((sum, bin) => sum + (bin.areaM2 || 0), 0);
+}
+
+function histogramAreaBelow(stats: GSDStats, threshold: number) {
+  return stats.histogram.reduce((sum, bin) => (
+    bin.bin <= threshold ? sum + (bin.areaM2 || 0) : sum
+  ), 0);
+}
+
+function histogramQuantile(stats: GSDStats, q: number) {
+  const bins = [...stats.histogram].sort((a, b) => a.bin - b.bin);
+  const totalArea = statsTotalAreaM2(stats);
+  if (!(totalArea > 0) || bins.length === 0) return 0;
+  const target = Math.max(0, Math.min(1, q)) * totalArea;
+  let cumulative = 0;
+  for (const bin of bins) {
+    cumulative += bin.areaM2 || 0;
+    if (cumulative >= target) return bin.bin;
+  }
+  return bins[bins.length - 1]?.bin ?? 0;
+}
+
 function lidarComparisonLabel(mode?: 'first-return' | 'all-returns') {
   return mode === 'all-returns' ? 'All returns' : 'First return';
 }
@@ -249,56 +273,16 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
     };
   }, [mapRef]);
 
-  const loadTerrainPartitionOptions = useCallback(async (polygonId: string) => {
-    const api = mapRef.current;
-    if (!api?.getTerrainPartitionSolutions) return;
-    setLoadingPartitionOptionsId(polygonId);
-    try {
-      const solutions = await api.getTerrainPartitionSolutions(polygonId);
-      setPartitionOptionsByPolygon((prev) => ({ ...prev, [polygonId]: solutions }));
-      setExactPartitionPreviewByKey((prev) => {
-        const next = { ...prev };
-        Object.keys(next).forEach((key) => {
-          if (key.startsWith(`${polygonId}:`)) delete next[key];
-        });
-        return next;
-      });
-      setPartitionSelectionByPolygon((prev) => {
-        if (solutions.length === 0) return prev;
-        const currentIndex = prev[polygonId];
-        if (Number.isInteger(currentIndex) && currentIndex! >= 0 && currentIndex! < solutions.length) {
-          return prev;
-        }
-        const defaultIndex = Math.max(
-          0,
-          solutions.findIndex((solution) => solution.isFirstPracticalSplit),
-        );
-        return { ...prev, [polygonId]: defaultIndex };
-      });
-      if (solutions.length === 0) {
-        toast({
-          title: 'No partition options',
-          description: 'This area does not currently produce more than one practical terrain partition.',
-          variant: 'destructive',
-        });
-      }
-    } catch (error) {
-      toast({
-        title: 'Partition planning failed',
-        description: error instanceof Error ? error.message : 'Unable to compute terrain partition options.',
-        variant: 'destructive',
-      });
-    } finally {
-      setLoadingPartitionOptionsId((current) => (current === polygonId ? null : current));
-    }
-  }, [mapRef]);
-
-  const applyTerrainPartitionOption = useCallback(async (polygonId: string) => {
+  const applyTerrainPartitionOption = useCallback(async (
+    polygonId: string,
+    overrideIndex?: number,
+    overrideSolution?: TerrainPartitionSolutionPreview,
+  ) => {
     const api = mapRef.current;
     const solutions = partitionOptionsByPolygon[polygonId] ?? [];
-    const selectedIndex = partitionSelectionByPolygon[polygonId] ?? 0;
-    const selected = solutions[selectedIndex];
-    if (!api?.applyTerrainPartitionSolution || !selected) return;
+    const selectedIndex = overrideIndex ?? partitionSelectionByPolygon[polygonId] ?? 0;
+    const selected = overrideSolution ?? solutions[selectedIndex];
+    if (!api?.applyTerrainPartitionSolution || !selected) return { replaced: false, createdIds: [] as string[] };
     setApplyingPartitionId(polygonId);
     suppressAutoRunUntilRef.current = Date.now() + 5000;
     try {
@@ -328,6 +312,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
           title: 'Partition applied',
           description: `Created ${result.createdIds.length} terrain-aligned areas from this polygon.`,
         });
+        return result;
       } else {
         toast({
           title: 'Partition not applied',
@@ -335,6 +320,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
           variant: 'destructive',
         });
         suppressAutoRunUntilRef.current = 0;
+        return { replaced: false, createdIds: [] as string[] };
       }
     } catch (error) {
       suppressAutoRunUntilRef.current = 0;
@@ -343,6 +329,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
         description: error instanceof Error ? error.message : 'Unable to apply the selected partition.',
         variant: 'destructive',
       });
+      return { replaced: false, createdIds: [] as string[] };
     } finally {
       setApplyingPartitionId((current) => (current === polygonId ? null : current));
     }
@@ -1107,6 +1094,140 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
     aggregateMetricStats,
   ]);
 
+  const getOrComputeExactPartitionPreview = useCallback(async (
+    polygonId: string,
+    solution: TerrainPartitionSolutionPreview,
+  ) => {
+    const previewKey = `${polygonId}:${solution.signature}`;
+    const cached = exactPartitionPreviewByKey[previewKey];
+    if (cached) return cached;
+    const preview = await evaluatePartitionOptionExact(polygonId, solution);
+    setExactPartitionPreviewByKey((prev) => ({ ...prev, [previewKey]: preview }));
+    return preview;
+  }, [evaluatePartitionOptionExact, exactPartitionPreviewByKey]);
+
+  const scoreLidarPartitionPreview = useCallback((
+    polygonId: string,
+    solution: TerrainPartitionSolutionPreview,
+    preview: ExactPartitionPreview,
+    fastestMissionTimeSec: number,
+  ) => {
+    const params = getMergedParamsMap()[polygonId];
+    if (!params || preview.metricKind !== 'density') {
+      return { score: solution.normalizedQualityCost, holeFraction: 0, lowFraction: 0 };
+    }
+    const model = getLidarModel(params.lidarKey);
+    const mappingFovDeg = getLidarMappingFovDeg(model, params.mappingFovDeg);
+    const speedMps = params.speedMps ?? model.defaultSpeedMps;
+    const returnMode = params.lidarReturnMode ?? 'single';
+    const targetDensityPtsM2 = params.pointDensityPtsM2
+      ?? lidarDeliverableDensity(
+        model,
+        params.altitudeAGL ?? altitude,
+        params.sideOverlap ?? sideOverlap,
+        speedMps,
+        returnMode,
+        mappingFovDeg,
+      );
+    const totalAreaM2 = Math.max(1, statsTotalAreaM2(preview.stats));
+    const holeThreshold = Math.max(5, targetDensityPtsM2 * 0.2);
+    const weakThreshold = Math.max(holeThreshold + 1e-6, targetDensityPtsM2 * 0.7);
+    const q10 = histogramQuantile(preview.stats, 0.1);
+    const q25 = histogramQuantile(preview.stats, 0.25);
+    const holeFraction = histogramAreaBelow(preview.stats, holeThreshold) / totalAreaM2;
+    const lowFraction = histogramAreaBelow(preview.stats, weakThreshold) / totalAreaM2;
+    const q10Deficit = Math.max(0, 1 - q10 / Math.max(1e-6, targetDensityPtsM2));
+    const q25Deficit = Math.max(0, 1 - q25 / Math.max(1e-6, targetDensityPtsM2));
+    const meanDeficit = Math.max(0, 1 - preview.stats.mean / Math.max(1e-6, targetDensityPtsM2));
+    const relativeTimePenalty = fastestMissionTimeSec > 0
+      ? Math.max(0, solution.totalMissionTimeSec / fastestMissionTimeSec - 1)
+      : 0;
+    const regionPenalty = Math.max(0, solution.regionCount - 1) * 0.035;
+    const score =
+      4.2 * holeFraction +
+      2.4 * lowFraction +
+      1.9 * q10Deficit +
+      1.2 * q25Deficit +
+      0.8 * meanDeficit +
+      0.18 * relativeTimePenalty +
+      regionPenalty;
+    return { score, holeFraction, lowFraction };
+  }, [altitude, getMergedParamsMap, sideOverlap]);
+
+  const chooseBestExactLidarPartitionIndex = useCallback(async (
+    polygonId: string,
+    solutions: TerrainPartitionSolutionPreview[],
+  ) => {
+    if (solutions.length === 0) return 0;
+    const fastestMissionTimeSec = solutions.reduce(
+      (best, solution) => Math.min(best, solution.totalMissionTimeSec),
+      Number.POSITIVE_INFINITY,
+    );
+    let bestIndex = 0;
+    let bestScore = Number.POSITIVE_INFINITY;
+    for (let index = 0; index < solutions.length; index++) {
+      const solution = solutions[index];
+      try {
+        const preview = await evaluatePartitionOptionExact(polygonId, solution);
+        setExactPartitionPreviewByKey((prev) => ({ ...prev, [`${polygonId}:${solution.signature}`]: preview }));
+        const { score } = scoreLidarPartitionPreview(polygonId, solution, preview, fastestMissionTimeSec);
+        if (score < bestScore - 1e-9) {
+          bestScore = score;
+          bestIndex = index;
+        }
+      } catch {
+        // Ignore failed exact evaluations and keep surrogate ordering as fallback.
+      }
+    }
+    return bestIndex;
+  }, [evaluatePartitionOptionExact, scoreLidarPartitionPreview]);
+
+  const loadTerrainPartitionOptions = useCallback(async (polygonId: string) => {
+    const api = mapRef.current;
+    if (!api?.getTerrainPartitionSolutions) return { solutions: [], defaultIndex: 0 };
+    setLoadingPartitionOptionsId(polygonId);
+    try {
+      const solutions = await api.getTerrainPartitionSolutions(polygonId);
+      const firstPracticalIndex = Math.max(
+        0,
+        solutions.findIndex((solution) => solution.isFirstPracticalSplit),
+      );
+      const currentIndex = partitionSelectionByPolygon[polygonId];
+      let selectedIndex = Number.isInteger(currentIndex) && currentIndex! >= 0 && currentIndex! < solutions.length
+        ? currentIndex!
+        : firstPracticalIndex;
+      setPartitionOptionsByPolygon((prev) => ({ ...prev, [polygonId]: solutions }));
+      setExactPartitionPreviewByKey((prev) => {
+        const next = { ...prev };
+        Object.keys(next).forEach((key) => {
+          if (key.startsWith(`${polygonId}:`)) delete next[key];
+        });
+        return next;
+      });
+      if (solutions.length > 1 && isLidarPayload(polygonId, getMergedParamsMap())) {
+        selectedIndex = await chooseBestExactLidarPartitionIndex(polygonId, solutions);
+      }
+      setPartitionSelectionByPolygon((prev) => ({ ...prev, [polygonId]: selectedIndex }));
+      if (solutions.length === 0) {
+        toast({
+          title: 'No partition options',
+          description: 'This area does not currently produce more than one practical terrain partition.',
+          variant: 'destructive',
+        });
+      }
+      return { solutions, defaultIndex: selectedIndex };
+    } catch (error) {
+      toast({
+        title: 'Partition planning failed',
+        description: error instanceof Error ? error.message : 'Unable to compute terrain partition options.',
+        variant: 'destructive',
+      });
+      return { solutions: [], defaultIndex: 0 };
+    } finally {
+      setLoadingPartitionOptionsId((current) => (current === polygonId ? null : current));
+    }
+  }, [chooseBestExactLidarPartitionIndex, getMergedParamsMap, isLidarPayload, mapRef, partitionSelectionByPolygon]);
+
   const previewExactPartitionOption = useCallback(async (polygonId: string) => {
     const solutions = partitionOptionsByPolygon[polygonId] ?? [];
     const selectedIndex = partitionSelectionByPolygon[polygonId] ?? 0;
@@ -1116,8 +1237,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
     if (exactPartitionPreviewByKey[previewKey]) return;
     setPreviewingPartitionKey(previewKey);
     try {
-      const preview = await evaluatePartitionOptionExact(polygonId, selected);
-      setExactPartitionPreviewByKey((prev) => ({ ...prev, [previewKey]: preview }));
+      await getOrComputeExactPartitionPreview(polygonId, selected);
     } catch (error) {
       toast({
         title: 'Exact preview failed',
@@ -1129,7 +1249,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
     }
   }, [
     exactPartitionPreviewByKey,
-    evaluatePartitionOptionExact,
+    getOrComputeExactPartitionPreview,
     partitionOptionsByPolygon,
     partitionSelectionByPolygon,
   ]);
@@ -2073,7 +2193,18 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
                           setSplittingPolygonId(polygonId);
                           suppressAutoRunUntilRef.current = Date.now() + 5000;
                           try {
-                            const result = await mapRef.current?.autoSplitPolygonByTerrain?.(polygonId);
+                            let result: { replaced: boolean; createdIds: string[] } | undefined;
+                            const api = mapRef.current;
+                            const isLidar = isLidarPayload(polygonId, getMergedParamsMap());
+                            if (isLidar && api?.getTerrainPartitionSolutions && api?.applyTerrainPartitionSolution) {
+                              const { solutions, defaultIndex } = await loadTerrainPartitionOptions(polygonId) ?? { solutions: [], defaultIndex: 0 };
+                              if (solutions.length > 0) {
+                                result = await applyTerrainPartitionOption(polygonId, defaultIndex, solutions[defaultIndex]);
+                              }
+                            }
+                            if (!result?.replaced) {
+                              result = await api?.autoSplitPolygonByTerrain?.(polygonId);
+                            }
                             if (result?.replaced && result.createdIds.length > 1) {
                               resetComputedAnalysisState();
                               setSelection(result.createdIds[0] ?? null);
