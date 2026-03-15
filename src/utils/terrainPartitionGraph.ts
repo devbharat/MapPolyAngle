@@ -244,6 +244,31 @@ function intersectFeatures(a: any, b: any) {
     : intersectFn(turf.featureCollection([a, b]));
 }
 
+function differenceFeatures(a: any, b: any) {
+  const differenceFn = (turf as any).difference;
+  if (typeof differenceFn !== "function") return null;
+  return differenceFn.length >= 2
+    ? differenceFn(a, b)
+    : differenceFn(turf.featureCollection([a, b]));
+}
+
+function featureToRings(feature: any): Ring[] {
+  if (!feature?.geometry) return [];
+  const cleaned = turf.cleanCoords(feature as any);
+  const geom = cleaned?.geometry;
+  if (!geom) return [];
+  if (geom.type === "Polygon") {
+    const ring = normalizeRing(geom.coordinates?.[0] as Ring);
+    return ring ? [ring] : [];
+  }
+  if (geom.type === "MultiPolygon") {
+    return (geom.coordinates as Ring[][])
+      .map((coords) => normalizeRing(coords[0] as Ring))
+      .filter((ring): ring is Ring => ring !== null);
+  }
+  return [];
+}
+
 function componentCellsToRing(cells: TerrainGuidanceCell[], gridStepM: number): Ring | null {
   if (cells.length === 0) return null;
   let merged: any = null;
@@ -1043,6 +1068,7 @@ type PartitionEvaluation = {
 
 const QUALITY_HEAVY_TRADEOFF = 0.92;
 const MAX_SEGMENTATION_ITERATIONS = 10;
+const MAX_SEED_VARIANTS = 3;
 
 function atomRegionSignature(atomIds: string[]) {
   return [...atomIds].sort().join(",");
@@ -1146,6 +1172,98 @@ function buildAdjacencyLookup(adjacency: TerrainAtomAdjacency[]) {
     byAtom.get(edge.atomB)!.push(edge);
   }
   return byAtom;
+}
+
+function completeRegionCoverage(
+  parentRing: Ring,
+  regions: InternalRegion[],
+  tiles: TerrainTile[],
+  params: FlightParams,
+  candidateBearings: number[],
+  options: Required<TerrainAtomizationOptions>,
+) {
+  const parentFeature = turf.polygon([parentRing]);
+  const parentArea = Math.max(1e-6, turf.area(parentFeature));
+  const regionFeatures = new Map<string, any>();
+  for (const region of regions) {
+    regionFeatures.set(region.regionId, turf.polygon([region.ring]));
+  }
+
+  let unionFeature: any = null;
+  for (const feature of regionFeatures.values()) {
+    unionFeature = unionFeature ? unionFeatures(unionFeature, feature) : feature;
+    if (!unionFeature) return null;
+  }
+
+  const uncovered = unionFeature ? differenceFeatures(parentFeature, unionFeature) : parentFeature;
+  const uncoveredRings = featureToRings(uncovered);
+  const uncoveredArea = uncoveredRings.reduce((sum, ring) => sum + ringAreaM2(ring), 0);
+  if (!(uncoveredArea > parentArea * 0.002)) return regions;
+
+  for (const gapRing of uncoveredRings) {
+    const gapFeature = turf.polygon([gapRing]);
+    const gapCentroidPoint = turf.centroid(gapFeature);
+    const gapCentroid = gapCentroidPoint.geometry.coordinates as [number, number];
+    let bestRegionId: string | null = null;
+    let bestDistance = Number.POSITIVE_INFINITY;
+
+    for (const region of regions) {
+      const currentFeature = regionFeatures.get(region.regionId);
+      if (!currentFeature) continue;
+      const merged = unionFeatures(currentFeature, gapFeature);
+      const mergedRing = featureToSingleRing(merged);
+      if (!mergedRing) continue;
+      const distance = turf.pointToLineDistance(
+        gapCentroidPoint,
+        turf.lineString(region.ring),
+        { units: "meters" },
+      );
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        bestRegionId = region.regionId;
+      }
+    }
+
+    if (!bestRegionId) {
+      for (const region of regions) {
+        const distance = turf.pointToLineDistance(
+          gapCentroidPoint,
+          turf.lineString(region.ring),
+          { units: "meters" },
+        );
+        if (distance < bestDistance) {
+          bestDistance = distance;
+          bestRegionId = region.regionId;
+        }
+      }
+    }
+
+    if (!bestRegionId) continue;
+    const currentFeature = regionFeatures.get(bestRegionId);
+    const merged = currentFeature ? unionFeatures(currentFeature, gapFeature) : gapFeature;
+    if (!merged) continue;
+    regionFeatures.set(bestRegionId, merged);
+  }
+
+  const rebuilt: InternalRegion[] = [];
+  for (const region of regions) {
+    const feature = regionFeatures.get(region.regionId);
+    const clipped = feature ? intersectFeatures(parentFeature, feature) : null;
+    const ring = featureToSingleRing(clipped ?? feature);
+    if (!ring) return null;
+    const objective = bestObjectiveForRing(ring, tiles, params, candidateBearings, options);
+    if (!objective) return null;
+    rebuilt.push({
+      ...region,
+      ring,
+      objective,
+      convexity: objective.regularization.convexity,
+      compactness: objective.regularization.compactness,
+      centroidLngLat: turf.centroid(turf.polygon([ring])).geometry.coordinates as [number, number],
+    });
+  }
+
+  return rebuilt;
 }
 
 function mergeAtomRings(atomIds: string[], atomMap: Map<string, TerrainAtom>) {
@@ -1256,6 +1374,13 @@ function weightedCentroidForAtoms(atomIds: string[], atomMap: Map<string, Terrai
   return [sumLng / total, sumLat / total];
 }
 
+function atomPriorityScore(atom: TerrainAtom) {
+  return atom.areaM2 *
+    (0.3 + 0.7 * atom.meanConfidence) *
+    (1 + atom.internalDispersionDeg / 18) *
+    (0.7 + Math.min(1.2, atom.meanBreakStrength / 18));
+}
+
 function weightedBearingForAtoms(
   atomIds: string[],
   atomMap: Map<string, TerrainAtom>,
@@ -1308,6 +1433,12 @@ function buildGuidanceModes(
   return selected;
 }
 
+function buildPriorityAtoms(graph: TerrainAtomGraph) {
+  return [...graph.atoms]
+    .filter((atom) => Number.isFinite(atom.dominantBearingDeg))
+    .sort((a, b) => atomPriorityScore(b) - atomPriorityScore(a));
+}
+
 function buildSeedSequence(
   graph: TerrainAtomGraph,
   atomMap: Map<string, TerrainAtom>,
@@ -1317,12 +1448,7 @@ function buildSeedSequence(
   const maxSeedCount = Math.min(8, options.maxHierarchyRegions, graph.atoms.length);
   const minSeedDistanceM = Math.max(graph.guidance.gridStepM * 1.5, Math.sqrt(totalAreaM2) * 0.12);
   const modes = buildGuidanceModes(graph, maxSeedCount, options.minModeSeparationDeg);
-  const byPriority = [...graph.atoms]
-    .filter((atom) => Number.isFinite(atom.dominantBearingDeg))
-    .sort((a, b) => (
-      b.areaM2 * (0.35 + 0.65 * b.meanConfidence) * (1 + b.internalDispersionDeg / 24) -
-      a.areaM2 * (0.35 + 0.65 * a.meanConfidence) * (1 + a.internalDispersionDeg / 24)
-    ));
+  const byPriority = buildPriorityAtoms(graph);
   const chosen: RegionSeed[] = [];
   const chosenAtoms = new Set<string>();
 
@@ -1365,6 +1491,111 @@ function buildSeedSequence(
   }
 
   return chosen;
+}
+
+function buildSpatialSeedSequence(
+  graph: TerrainAtomGraph,
+  options: Required<TerrainAtomizationOptions>,
+) {
+  const byPriority = buildPriorityAtoms(graph);
+  const totalAreaM2 = Math.max(1, graph.guidance.areaM2);
+  const maxSeedCount = Math.min(8, options.maxHierarchyRegions, graph.atoms.length);
+  const polygonScaleM = Math.max(1, Math.sqrt(totalAreaM2));
+  const chosen: RegionSeed[] = [];
+
+  if (byPriority.length === 0) return chosen;
+
+  const first = byPriority[0];
+  chosen.push({
+    regionId: "seed-1",
+    atomId: first.id,
+    angleDeg: first.dominantBearingDeg ?? 0,
+    centroidLngLat: first.centroidLngLat,
+  });
+
+  while (chosen.length < maxSeedCount) {
+    let best: TerrainAtom | null = null;
+    let bestScore = Number.NEGATIVE_INFINITY;
+    for (const atom of byPriority) {
+      if (chosen.some((seed) => seed.atomId === atom.id)) continue;
+      const minDistance = Math.min(
+        ...chosen.map((seed) => distanceMetersBetweenLngLat(seed.centroidLngLat, atom.centroidLngLat)),
+      );
+      const minBearingDelta = Math.min(
+        ...chosen.map((seed) => axialAngleDeltaDeg(seed.angleDeg, atom.dominantBearingDeg ?? seed.angleDeg)),
+      );
+      const score =
+        Math.min(2.2, minDistance / Math.max(graph.guidance.gridStepM * 2, polygonScaleM * 0.18)) +
+        0.9 * Math.min(1.8, minBearingDelta / Math.max(12, options.minModeSeparationDeg)) +
+        0.45 * Math.min(1.5, atom.internalDispersionDeg / 20) +
+        0.35 * Math.min(1.5, atom.meanBreakStrength / 18) +
+        0.25 * Math.min(1.5, atomPriorityScore(atom) / Math.max(1, atomPriorityScore(byPriority[0])));
+      if (score > bestScore) {
+        bestScore = score;
+        best = atom;
+      }
+    }
+    if (!best) break;
+    chosen.push({
+      regionId: `seed-${chosen.length + 1}`,
+      atomId: best.id,
+      angleDeg: best.dominantBearingDeg ?? 0,
+      centroidLngLat: best.centroidLngLat,
+    });
+  }
+
+  return chosen;
+}
+
+function buildBreakHotspotSeedSequence(
+  graph: TerrainAtomGraph,
+  options: Required<TerrainAtomizationOptions>,
+) {
+  const maxSeedCount = Math.min(8, options.maxHierarchyRegions, graph.atoms.length);
+  const totalAreaM2 = Math.max(1, graph.guidance.areaM2);
+  const polygonScaleM = Math.max(1, Math.sqrt(totalAreaM2));
+  const minSeedDistanceM = Math.max(graph.guidance.gridStepM * 1.25, polygonScaleM * 0.1);
+  const ranked = [...graph.atoms]
+    .filter((atom) => Number.isFinite(atom.dominantBearingDeg))
+    .sort((a, b) => (
+      (b.meanBreakStrength * (0.35 + 0.65 * b.meanConfidence) * (1 + b.internalDispersionDeg / 18) * Math.sqrt(Math.max(1, b.areaM2))) -
+      (a.meanBreakStrength * (0.35 + 0.65 * a.meanConfidence) * (1 + a.internalDispersionDeg / 18) * Math.sqrt(Math.max(1, a.areaM2)))
+    ));
+  const chosen: RegionSeed[] = [];
+  for (const atom of ranked) {
+    if (chosen.length >= maxSeedCount) break;
+    const farEnough = chosen.every((seed) => (
+      distanceMetersBetweenLngLat(seed.centroidLngLat, atom.centroidLngLat) >= minSeedDistanceM ||
+      axialAngleDeltaDeg(seed.angleDeg, atom.dominantBearingDeg ?? seed.angleDeg) >= options.minModeSeparationDeg * 0.75
+    ));
+    if (!farEnough) continue;
+    chosen.push({
+      regionId: `seed-${chosen.length + 1}`,
+      atomId: atom.id,
+      angleDeg: atom.dominantBearingDeg ?? 0,
+      centroidLngLat: atom.centroidLngLat,
+    });
+  }
+  return chosen;
+}
+
+function buildSeedVariants(
+  graph: TerrainAtomGraph,
+  atomMap: Map<string, TerrainAtom>,
+  options: Required<TerrainAtomizationOptions>,
+) {
+  const candidates = [
+    buildSeedSequence(graph, atomMap, options),
+    buildSpatialSeedSequence(graph, options),
+    buildBreakHotspotSeedSequence(graph, options),
+  ]
+    .filter((variant) => variant.length >= 2);
+  const unique = new Map<string, RegionSeed[]>();
+  for (const variant of candidates) {
+    const signature = variant.map((seed) => seed.atomId).join("|");
+    if (!unique.has(signature)) unique.set(signature, variant);
+  }
+  return [...unique.values()].slice(0, MAX_SEED_VARIANTS);
 }
 
 function buildRegionStates(
@@ -1677,6 +1908,7 @@ function isPracticalPartitionEvaluation(
 }
 
 function buildPartitionEvaluationFromAssignments(
+  parentRing: Ring,
   assignments: Map<string, string>,
   atomMap: Map<string, TerrainAtom>,
   guidance: TerrainGuidanceField,
@@ -1696,9 +1928,11 @@ function buildPartitionEvaluationFromAssignments(
     .map(([regionId, atomIds]) => buildRegionFromAtomIds(regionId, atomIds, atomMap, guidance, tiles, params, candidateBearings, options, depth))
     .filter((region): region is InternalRegion => region !== null);
   if (regions.length !== grouped.size || regions.length === 0) return null;
-  const metrics = evaluatePartitionRegions(regions, assignments, adjacencyLookup, options);
+  const completedRegions = completeRegionCoverage(parentRing, regions, tiles, params, candidateBearings, options);
+  if (!completedRegions || completedRegions.length !== regions.length) return null;
+  const metrics = evaluatePartitionRegions(completedRegions, assignments, adjacencyLookup, options);
   return {
-    regions,
+    regions: completedRegions,
     assignments,
     partition: metrics.partition,
     totalScore: metrics.totalScore,
@@ -1832,43 +2066,65 @@ function buildFineSegmentation(
 ) {
   const atomMap = buildAtomMap(graph);
   const adjacencyLookup = buildAdjacencyLookup(graph.adjacency);
-  const seedSequence = buildSeedSequence(graph, atomMap, options);
-  if (seedSequence.length < 2) return null;
+  const seedVariants = buildSeedVariants(graph, atomMap, options);
+  if (seedVariants.length === 0) return null;
 
   const candidates: PartitionEvaluation[] = [];
   const scoringOptions = { ...options, tradeoff: Math.max(options.tradeoff, QUALITY_HEAVY_TRADEOFF) };
-  const maxK = Math.min(seedSequence.length, 8, graph.atoms.length);
+  const maxK = Math.min(
+    Math.max(...seedVariants.map((variant) => variant.length)),
+    8,
+    graph.atoms.length,
+  );
 
   for (let k = 2; k <= maxK; k++) {
-    const seeds = seedSequence.slice(0, k);
-    const assignments = segmentAtomsIntoRegions(graph, atomMap, adjacencyLookup, seeds, scoringOptions);
-    if (!assignments) continue;
-    const evaluation = buildPartitionEvaluationFromAssignments(
-      assignments,
-      atomMap,
-      graph.guidance,
-      adjacencyLookup,
-      tiles,
-      params,
-      candidateBearings,
-      scoringOptions,
-      0,
-    );
-    if (!evaluation) continue;
-    candidates.push(evaluation);
+    for (const seedVariant of seedVariants) {
+      if (seedVariant.length < k) continue;
+      const seeds = seedVariant.slice(0, k);
+      const assignments = segmentAtomsIntoRegions(graph, atomMap, adjacencyLookup, seeds, scoringOptions);
+      if (!assignments) continue;
+      const evaluation = buildPartitionEvaluationFromAssignments(
+        ring,
+        assignments,
+        atomMap,
+        graph.guidance,
+        adjacencyLookup,
+        tiles,
+        params,
+        candidateBearings,
+        scoringOptions,
+        0,
+      );
+      if (!evaluation) continue;
+      if (evaluation.largestRegionFraction > 0.965) continue;
+      candidates.push(evaluation);
+    }
   }
 
   if (candidates.length === 0) return null;
-  const bestScore = Math.min(...candidates.map((candidate) => candidate.totalScore));
-  const nearBest = candidates.filter((candidate) => candidate.totalScore <= bestScore * 1.18);
-  nearBest.sort((a, b) => {
-    if (b.regions.length !== a.regions.length) return b.regions.length - a.regions.length;
+  const deduped = new Map<string, PartitionEvaluation>();
+  for (const candidate of candidates) {
+    const signature = buildSolutionSignature(candidate.regions);
+    const existing = deduped.get(signature);
+    if (!existing || candidate.totalScore < existing.totalScore) deduped.set(signature, candidate);
+  }
+  const candidatePool = [...deduped.values()];
+  const practical = candidatePool.filter((candidate) => (
+    isPracticalPartitionEvaluation(candidate, options.minAreaM2) &&
+    candidate.largestRegionFraction < 0.88 &&
+    (tokenSplitSatisfied(candidate) || candidate.regions.length >= 3)
+  ));
+  const ranked = (practical.length > 0 ? practical : candidatePool).sort((a, b) => {
     if (a.partition.normalizedQualityCost !== b.partition.normalizedQualityCost) {
       return a.partition.normalizedQualityCost - b.partition.normalizedQualityCost;
     }
+    if (a.largestRegionFraction !== b.largestRegionFraction) {
+      return a.largestRegionFraction - b.largestRegionFraction;
+    }
+    if (b.regions.length !== a.regions.length) return b.regions.length - a.regions.length;
     return a.totalScore - b.totalScore;
   });
-  return nearBest[0] ?? candidates.sort((a, b) => a.totalScore - b.totalScore)[0] ?? null;
+  return ranked[0] ?? null;
 }
 
 function tokenSplitSatisfied(solution: PartitionEvaluation) {
@@ -1878,6 +2134,7 @@ function tokenSplitSatisfied(solution: PartitionEvaluation) {
 }
 
 function buildHierarchyFromFineSegmentation(
+  parentRing: Ring,
   fine: PartitionEvaluation,
   guidance: TerrainGuidanceField,
   atomMap: Map<string, TerrainAtom>,
@@ -1903,6 +2160,7 @@ function buildHierarchyFromFineSegmentation(
         if (regionId === edge.regionA || regionId === edge.regionB) nextAssignments.set(atomId, mergedRegionId);
       });
       const evaluation = buildPartitionEvaluationFromAssignments(
+        parentRing,
         nextAssignments,
         atomMap,
         guidance,
@@ -1959,54 +2217,146 @@ function buildHeuristicFallbackSolutions(
   candidateBearings: number[],
   options: Required<TerrainAtomizationOptions>,
 ) {
-  const heuristic = partitionPolygonByTerrainFaces(ring, tiles, params, {
-    forceAtLeastOneSplit: true,
-    maxPolygons: Math.min(options.maxHierarchyRegions, 6),
-    candidateAngleStepDeg: 10,
-    candidateOffsetFractions: [-0.45, -0.3, -0.15, 0, 0.15, 0.3, 0.45],
+  const atomMap = buildAtomMap(graph);
+  const adjacencyLookup = buildAdjacencyLookup(graph.adjacency);
+  const fallbackCandidates: PartitionEvaluation[] = [];
+  for (let maxPolygons = 2; maxPolygons <= Math.min(options.maxHierarchyRegions, 6); maxPolygons++) {
+    const heuristic = partitionPolygonByTerrainFaces(ring, tiles, params, {
+      forceAtLeastOneSplit: true,
+      maxPolygons,
+      candidateAngleStepDeg: 10,
+      candidateOffsetFractions: [-0.45, -0.3, -0.15, 0, 0.15, 0.3, 0.45],
+    });
+    if (heuristic.polygons.length <= 1) continue;
+
+    const assignments = new Map<string, string>();
+    const regionCenters = heuristic.polygons.map((poly) => {
+      const feature = turf.polygon([poly]);
+      const centroid = turf.centroid(feature);
+      return {
+        feature,
+        centroid: centroid.geometry.coordinates as [number, number],
+      };
+    });
+
+    for (const atom of graph.atoms) {
+      let regionIndex = regionCenters.findIndex((region) => turf.booleanPointInPolygon(turf.point(atom.centroidLngLat), region.feature));
+      if (regionIndex < 0) {
+        let best = Number.POSITIVE_INFINITY;
+        for (let index = 0; index < regionCenters.length; index++) {
+          const distance = distanceMetersBetweenLngLat(atom.centroidLngLat, regionCenters[index].centroid);
+          if (distance < best) {
+            best = distance;
+            regionIndex = index;
+          }
+        }
+      }
+      assignments.set(atom.id, `fallback-${regionIndex + 1}`);
+    }
+
+    const evaluation = buildPartitionEvaluationFromAssignments(
+      ring,
+      assignments,
+      atomMap,
+      graph.guidance,
+      adjacencyLookup,
+      tiles,
+      params,
+      candidateBearings,
+      options,
+      0,
+    );
+    if (!evaluation || evaluation.regions.length <= 1) continue;
+    const practicalEnough = (
+      evaluation.largestRegionFraction < 0.86 &&
+      (tokenSplitSatisfied(evaluation) || evaluation.regions.length >= 3) &&
+      isPracticalPartitionEvaluation(evaluation, options.minAreaM2)
+    );
+    if (!practicalEnough) continue;
+    fallbackCandidates.push(evaluation);
+  }
+  const deduped = new Map<string, PartitionEvaluation>();
+  for (const candidate of fallbackCandidates) {
+    const signature = buildSolutionSignature(candidate.regions);
+    const existing = deduped.get(signature);
+    if (!existing || candidate.totalScore < existing.totalScore) deduped.set(signature, candidate);
+  }
+  const ranked = [...deduped.values()].sort((a, b) => {
+    if (a.partition.normalizedQualityCost !== b.partition.normalizedQualityCost) {
+      return a.partition.normalizedQualityCost - b.partition.normalizedQualityCost;
+    }
+    if (a.largestRegionFraction !== b.largestRegionFraction) {
+      return a.largestRegionFraction - b.largestRegionFraction;
+    }
+    if (b.regions.length !== a.regions.length) return b.regions.length - a.regions.length;
+    return a.totalScore - b.totalScore;
   });
-  if (heuristic.polygons.length <= 1) return [];
+  return ranked.map((evaluation, index, visible) => buildFrontierSolution(
+    evaluation,
+    index,
+    index === 0,
+    visible.length <= 1 ? 0.5 : index / (visible.length - 1),
+  ));
+}
+
+function buildRefinedOptionsForRetry(
+  ring: Ring,
+  options: Required<TerrainAtomizationOptions>,
+): Required<TerrainAtomizationOptions> {
+  const areaM2 = ringAreaM2(ring);
+  const refinedGridStepM = options.gridStepM > 0
+    ? Math.max(40, options.gridStepM * 0.72)
+    : clamp(Math.sqrt(Math.max(areaM2, 1)) / 24, 40, 120);
+  const refinedSearchSampleStepM = options.searchSampleStepM > 0
+    ? Math.max(25, options.searchSampleStepM * 0.8)
+    : clamp(refinedGridStepM * 0.72, 25, 90);
+  return {
+    ...options,
+    gridStepM: refinedGridStepM,
+    searchSampleStepM: refinedSearchSampleStepM,
+    maxInitialAtoms: Math.max(options.maxInitialAtoms, Math.min(72, options.maxInitialAtoms * 2)),
+    atomDirectionMergeDeg: Math.max(10, options.atomDirectionMergeDeg - 2),
+    atomBreakThreshold: Math.max(5, options.atomBreakThreshold - 1),
+    minAtomCells: Math.max(1, options.minAtomCells - 1),
+  };
+}
+
+function runPartitionFrontierAttempt(
+  ring: Ring,
+  tiles: TerrainTile[],
+  params: FlightParams,
+  options: Required<TerrainAtomizationOptions>,
+) {
+  const graph = buildTerrainAtomGraph(ring, tiles, options);
+  if (graph.atoms.length < 2) return { graph, solutions: [] as FrontierSolution[] };
+
+  const candidateBearings = buildCandidateBearings(graph, options.candidateBearingStepDeg);
+  const fine = buildFineSegmentation(ring, graph, tiles, params, candidateBearings, options);
+  if (!fine) {
+    return {
+      graph,
+      solutions: buildHeuristicFallbackSolutions(ring, graph, tiles, params, candidateBearings, options),
+    };
+  }
 
   const atomMap = buildAtomMap(graph);
   const adjacencyLookup = buildAdjacencyLookup(graph.adjacency);
-  const assignments = new Map<string, string>();
-  const regionCenters = heuristic.polygons.map((poly) => {
-    const feature = turf.polygon([poly]);
-    const centroid = turf.centroid(feature);
-    return {
-      feature,
-      centroid: centroid.geometry.coordinates as [number, number],
-    };
-  });
-
-  for (const atom of graph.atoms) {
-    let regionIndex = regionCenters.findIndex((region) => turf.booleanPointInPolygon(turf.point(atom.centroidLngLat), region.feature));
-    if (regionIndex < 0) {
-      let best = Number.POSITIVE_INFINITY;
-      for (let index = 0; index < regionCenters.length; index++) {
-        const distance = distanceMetersBetweenLngLat(atom.centroidLngLat, regionCenters[index].centroid);
-        if (distance < best) {
-          best = distance;
-          regionIndex = index;
-        }
-      }
-    }
-    assignments.set(atom.id, `fallback-${regionIndex + 1}`);
-  }
-
-  const evaluation = buildPartitionEvaluationFromAssignments(
-    assignments,
-    atomMap,
+  const solutions = buildHierarchyFromFineSegmentation(
+    ring,
+    fine,
     graph.guidance,
+    atomMap,
     adjacencyLookup,
     tiles,
     params,
     candidateBearings,
     options,
-    0,
   );
-  if (!evaluation || evaluation.regions.length <= 1) return [];
-  return [buildFrontierSolution(evaluation, 0, true, 0.5)];
+  if (solutions.length > 0) return { graph, solutions };
+  return {
+    graph,
+    solutions: buildHeuristicFallbackSolutions(ring, graph, tiles, params, candidateBearings, options),
+  };
 }
 
 export function buildPartitionFrontier(
@@ -2016,33 +2366,20 @@ export function buildPartitionFrontier(
   options: TerrainAtomizationOptions = {},
 ): { graph: TerrainAtomGraph; solutions: FrontierSolution[] } {
   const opts = { ...DEFAULT_OPTIONS, ...options };
-  const graph = buildTerrainAtomGraph(ring, tiles, opts);
-  if (graph.atoms.length < 2) return { graph, solutions: [] };
-
-  const candidateBearings = buildCandidateBearings(graph, opts.candidateBearingStepDeg);
-  const fine = buildFineSegmentation(ring, graph, tiles, params, candidateBearings, opts);
-  if (!fine) {
-    return {
-      graph,
-      solutions: buildHeuristicFallbackSolutions(ring, graph, tiles, params, candidateBearings, opts),
-    };
+  const initialAttempt = runPartitionFrontierAttempt(ring, tiles, params, opts);
+  const initialSolutions = filterViableCoverageSolutions(ring, initialAttempt.solutions);
+  const needsRetry =
+    initialSolutions.length === 0 ||
+    initialSolutions.every((solution) => solution.largestRegionFraction > 0.9 || solution.partition.regionCount <= 1);
+  if (!needsRetry) {
+    return { graph: initialAttempt.graph, solutions: initialSolutions };
   }
 
-  const atomMap = buildAtomMap(graph);
-  const adjacencyLookup = buildAdjacencyLookup(graph.adjacency);
-  const solutions = buildHierarchyFromFineSegmentation(
-    fine,
-    graph.guidance,
-    atomMap,
-    adjacencyLookup,
-    tiles,
-    params,
-    candidateBearings,
-    opts,
-  );
-  if (solutions.length > 0) return { graph, solutions };
-  return {
-    graph,
-    solutions: buildHeuristicFallbackSolutions(ring, graph, tiles, params, candidateBearings, opts),
-  };
+  const refinedOpts = buildRefinedOptionsForRetry(ring, opts);
+  const refinedAttempt = runPartitionFrontierAttempt(ring, tiles, params, refinedOpts);
+  const refinedSolutions = filterViableCoverageSolutions(ring, refinedAttempt.solutions);
+  if (refinedSolutions.length > 0) {
+    return { graph: refinedAttempt.graph, solutions: refinedSolutions };
+  }
+  return { graph: initialAttempt.graph, solutions: initialSolutions };
 }
