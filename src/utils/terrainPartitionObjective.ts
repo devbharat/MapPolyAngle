@@ -59,6 +59,11 @@ export type RegionFlightTimeEstimate = {
   forwardSpacingM: number | null;
   lineCount: number;
   fragmentedLineCount: number;
+  fragmentedLineFraction: number;
+  interSegmentGapLengthM: number;
+  meanInterSegmentGapM: number;
+  maxInterSegmentGapM: number;
+  overflightTransitFraction: number;
   turnCount: number;
   totalFlightLineLengthM: number;
   meanLineLengthM: number;
@@ -114,6 +119,9 @@ export type RegionRegularizationEstimate = {
   aspectPenalty: number;
   convexityPenalty: number;
   compactnessPenalty: number;
+  fragmentedLinePenalty: number;
+  interSegmentGapPenalty: number;
+  overflightTransitPenalty: number;
   penalty: number;
   isHardInvalid: boolean;
 };
@@ -522,6 +530,7 @@ function estimateRegionFlightTime(
   const numLines = Math.max(1, Math.ceil(diagonal / Math.max(1, lineSpacingM)));
   const lengths: number[] = [];
   const terrainReliefs: number[] = [];
+  const interSegmentGaps: number[] = [];
   let fragmentedLineCount = 0;
 
   for (let i = -numLines; i <= numLines; i++) {
@@ -532,6 +541,7 @@ function estimateRegionFlightTime(
     const p2 = geoDestination([centerLng, centerLat], (bearingDeg + 180) % 360, extendDistance);
 
     let currentSegment: [number, number][] = [];
+    const completedSegments: Array<[[number, number], [number, number]]> = [];
     let segments = 0;
     const samples = 80;
     for (let sample = 0; sample <= samples; sample++) {
@@ -544,6 +554,7 @@ function estimateRegionFlightTime(
         segments += 1;
         const startPoint = currentSegment[0];
         const endPoint = currentSegment[currentSegment.length - 1];
+        completedSegments.push([startPoint, endPoint]);
         lengths.push(haversineDistance(startPoint, endPoint));
         const relief = sampleTerrainReliefAlongSegment(startPoint, endPoint, tiles);
         if (Number.isFinite(relief)) terrainReliefs.push(relief);
@@ -554,19 +565,29 @@ function estimateRegionFlightTime(
       segments += 1;
       const startPoint = currentSegment[0];
       const endPoint = currentSegment[currentSegment.length - 1];
+      completedSegments.push([startPoint, endPoint]);
       lengths.push(haversineDistance(startPoint, endPoint));
       const relief = sampleTerrainReliefAlongSegment(startPoint, endPoint, tiles);
       if (Number.isFinite(relief)) terrainReliefs.push(relief);
     }
-    if (segments > 1) fragmentedLineCount += segments - 1;
+    if (segments > 1) {
+      fragmentedLineCount += segments - 1;
+      for (let segmentIndex = 1; segmentIndex < completedSegments.length; segmentIndex++) {
+        const previous = completedSegments[segmentIndex - 1];
+        const current = completedSegments[segmentIndex];
+        interSegmentGaps.push(haversineDistance(previous[1], current[0]));
+      }
+    }
   }
 
   const shortLineThresholdM = Math.max(80, options.shortLineThresholdFactor * lineSpacingM);
   const lineCount = lengths.length;
+  const totalInterSegmentGapLengthM = interSegmentGaps.reduce((sum, value) => sum + value, 0);
   const turnCount = Math.max(0, lineCount - 1) + fragmentedLineCount;
   const totalFlightLineLengthM = lengths.reduce((sum, value) => sum + value, 0);
   const cruiseSpeedMps = defaultCruiseSpeedMps(params, options);
-  const sweepTimeSec = cruiseSpeedMps > 0 ? totalFlightLineLengthM / cruiseSpeedMps : 0;
+  const effectiveSweepLengthM = totalFlightLineLengthM + totalInterSegmentGapLengthM;
+  const sweepTimeSec = cruiseSpeedMps > 0 ? effectiveSweepLengthM / cruiseSpeedMps : 0;
   const turnTimeSec = turnCount * options.avgTurnSeconds + fragmentedLineCount * 4;
   const overheadTimeSec = options.perRegionOverheadSec;
 
@@ -575,6 +596,13 @@ function estimateRegionFlightTime(
     forwardSpacingM,
     lineCount,
     fragmentedLineCount,
+    fragmentedLineFraction: lineCount > 0 ? fragmentedLineCount / lineCount : 0,
+    interSegmentGapLengthM: totalInterSegmentGapLengthM,
+    meanInterSegmentGapM: mean(interSegmentGaps),
+    maxInterSegmentGapM: interSegmentGaps.length > 0 ? Math.max(...interSegmentGaps) : 0,
+    overflightTransitFraction: (totalFlightLineLengthM + totalInterSegmentGapLengthM) > 0
+      ? totalInterSegmentGapLengthM / (totalFlightLineLengthM + totalInterSegmentGapLengthM)
+      : 0,
     turnCount,
     totalFlightLineLengthM,
     meanLineLengthM: mean(lengths),
@@ -595,6 +623,7 @@ function evaluateRegularization(
   ring: Ring,
   areaM2: number,
   bearingDeg: number,
+  flightTime: RegionFlightTimeEstimate,
   lineSpacingM: number,
   options: Required<TerrainPartitionTradeoffOptions>,
 ): RegionRegularizationEstimate {
@@ -608,9 +637,26 @@ function evaluateRegularization(
   const aspectPenalty = Math.max(0, aspectRatio - options.maxAspectRatio) * 0.25;
   const convexityPenalty = Math.max(0, options.minConvexity - convexity) * 4;
   const compactnessPenalty = Math.max(0, compactness - 3) * 0.18;
+  const fragmentedLinePenalty = Math.min(2.5, flightTime.fragmentedLineFraction * 3.2 + flightTime.fragmentedLineCount / 8) * 0.65;
+  const interSegmentGapPenalty = Math.min(
+    3,
+    flightTime.interSegmentGapLengthM / Math.max(1, Math.max(perimeterM * 0.55, lineSpacingM * 8)),
+  ) * 0.9;
+  const overflightTransitPenalty = Math.min(2.5, flightTime.overflightTransitFraction * 5.5) * 0.75;
   const smallAreaPenalty = Math.max(0, options.minAreaM2 - areaM2) / Math.max(1, options.minAreaM2);
-  const penalty = widthPenalty * 2.5 + aspectPenalty + convexityPenalty + compactnessPenalty + smallAreaPenalty * 2;
-  const isHardInvalid = areaM2 < options.minAreaM2 * 0.5 || convexity < options.minConvexity * 0.5;
+  const penalty =
+    widthPenalty * 2.5 +
+    aspectPenalty +
+    convexityPenalty +
+    compactnessPenalty +
+    fragmentedLinePenalty +
+    interSegmentGapPenalty +
+    overflightTransitPenalty +
+    smallAreaPenalty * 2;
+  const isHardInvalid =
+    areaM2 < options.minAreaM2 * 0.5 ||
+    convexity < options.minConvexity * 0.5 ||
+    (convexity < 0.58 && flightTime.overflightTransitFraction > 0.18);
   return {
     areaM2,
     convexity,
@@ -623,6 +669,9 @@ function evaluateRegularization(
     aspectPenalty,
     convexityPenalty,
     compactnessPenalty,
+    fragmentedLinePenalty,
+    interSegmentGapPenalty,
+    overflightTransitPenalty,
     penalty,
     isHardInvalid,
   };
@@ -743,7 +792,7 @@ export function evaluateRegionOrientation(
   const areaM2 = guidance.areaM2;
   if (!(areaM2 > 0) || guidance.cells.length < 4) return null;
   const flightTime = estimateRegionFlightTime(normalized, bearingDeg, params, tiles, opts);
-  const regularization = evaluateRegularization(normalized, areaM2, bearingDeg, flightTime.lineSpacingM, opts);
+  const regularization = evaluateRegularization(normalized, areaM2, bearingDeg, flightTime, flightTime.lineSpacingM, opts);
   const quality = evaluateQuality(guidance, bearingDeg, params, flightTime);
   const normalizedTimeCost = flightTime.totalMissionTimeSec / 180;
   const totalCost =

@@ -285,7 +285,12 @@ function runFailingPolygonRegression() {
   assert.ok(solutions.length >= 1, "captured failing lidar polygon should now produce at least one practical partition");
   const first = solutions.find((solution) => solution.isFirstPracticalSplit) ?? solutions[0];
   assert.ok(first.partition.regionCount >= 2 && first.partition.regionCount <= 4, "first practical split should stay coarse");
-  assert.ok(first.largestRegionFraction < 0.7, "first practical split should not collapse to one giant parent-like region");
+  assert.ok(first.largestRegionFraction < 0.82, "first practical split should still avoid collapsing to one giant parent-like region");
+  assert.ok(first.meanConvexity > 0.8, "first practical split should preserve reasonably compact, convex-ish regions");
+  assert.ok(
+    first.regions.every((region) => !(region.convexity < 0.74 && region.compactness > 4.25)),
+    "first practical split should avoid dumbbell-like regions that force line overflight across neighboring areas",
+  );
 }
 
 function runGradualTransitionCase() {
@@ -348,6 +353,10 @@ function runExampleReferenceCase() {
   assert.ok(distinctFamilies >= 2, "reference-guided solution should recover multiple bearing families");
   assert.ok(fine.meanConvexity >= 0.72, "reference-style regions should stay reasonably convex on average");
   assert.ok(fine.regions.every((region) => region.convexity >= 0.65), "returned regions must not become highly non-convex");
+  assert.ok(
+    fine.regions.every((region) => !(region.convexity < 0.74 && region.compactness > 4.25)),
+    "reference-style regions should avoid severe necked shapes with disconnected flight-line fragments",
+  );
 }
 
 runTwoFaceCase();

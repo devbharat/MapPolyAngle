@@ -155,8 +155,44 @@ function runPartitionCombinationCase() {
   );
 }
 
+function runNonConvexBridgePenaltyCase() {
+  const tile = makeDemTile(256, 256, (lng, lat) => {
+    const [, my] = lngLatToMercatorMeters(lng, lat);
+    return 1250 + my * 0.0006;
+  });
+
+  const dumbbellRing: Ring = [
+    [0.291, -0.010],
+    [0.297, -0.010],
+    [0.297, -0.003],
+    [0.303, -0.003],
+    [0.303, -0.010],
+    [0.309, -0.010],
+    [0.309, 0.010],
+    [0.303, 0.010],
+    [0.303, 0.003],
+    [0.297, 0.003],
+    [0.297, 0.010],
+    [0.291, 0.010],
+    [0.291, -0.010],
+  ];
+
+  const alongLobes = evaluateRegionOrientation(dumbbellRing, [tile] as any, cameraParams, 0, { tradeoff: 0.35 });
+  const crossNeck = evaluateRegionOrientation(dumbbellRing, [tile] as any, cameraParams, 90, { tradeoff: 0.35 });
+  assert.ok(alongLobes && crossNeck, "dumbbell orientations should evaluate");
+  assert.ok(
+    crossNeck!.flightTime.overflightTransitFraction > alongLobes!.flightTime.overflightTransitFraction + 0.08,
+    "cross-neck bearing should require more off-region transit between disconnected line fragments",
+  );
+  assert.ok(
+    crossNeck!.regularization.penalty > alongLobes!.regularization.penalty + 0.25,
+    "cross-neck bearing should pay a higher non-convexity penalty",
+  );
+}
+
 runCameraQualityAndTimeCase();
 runLidarQualityCase();
 runPartitionCombinationCase();
+runNonConvexBridgePenaltyCase();
 
 console.log("terrain_partition_objective.test.ts passed");

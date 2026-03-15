@@ -1937,12 +1937,26 @@ function evaluatePartitionRegions(
   );
   const shapePenalty = regions.reduce((sum, region) => {
     const areaWeight = region.objective.regularization.areaM2 / totalAreaM2;
-    const convexityPenalty = Math.max(0, 0.72 - region.convexity) * 6;
-    const compactnessPenalty = Math.max(0, region.compactness - 3) * 0.3;
+    const convexityPenalty = Math.max(0, 0.76 - region.convexity) * 8;
+    const compactnessPenalty = Math.max(0, region.compactness - 2.8) * 0.65;
+    const neckPenalty = region.convexity < 0.78 && region.compactness > 4.2
+      ? (4.2 - Math.max(0, 0.92 - region.convexity) * 2) * Math.min(2.2, (region.compactness - 4.2) * 0.8)
+      : 0;
     const widthPenalty = region.objective.regularization.widthPenalty * 1.6;
-    const fragmentationPenalty = Math.min(2, region.objective.flightTime.fragmentedLineCount / 8) * 0.22;
+    const fragmentationPenalty = region.objective.regularization.fragmentedLinePenalty * 1.2;
+    const interSegmentGapPenalty = region.objective.regularization.interSegmentGapPenalty * 1.1;
+    const overflightPenalty = region.objective.regularization.overflightTransitPenalty * 1.15;
     const shortLinePenalty = region.objective.flightTime.shortLineFraction * 0.35;
-    return sum + areaWeight * (convexityPenalty + compactnessPenalty + widthPenalty + fragmentationPenalty + shortLinePenalty);
+    return sum + areaWeight * (
+      convexityPenalty +
+      compactnessPenalty +
+      neckPenalty +
+      widthPenalty +
+      fragmentationPenalty +
+      interSegmentGapPenalty +
+      overflightPenalty +
+      shortLinePenalty
+    );
   }, 0);
   const boundaryPenalty =
     0.08 * (internalBoundaryM / Math.max(1, Math.sqrt(totalAreaM2))) * (1.15 - 0.65 * boundaryBreakAlignment);
@@ -1965,7 +1979,9 @@ function isPracticalPartitionEvaluation(
   if (evaluation.regions.length <= 1) return false;
   return evaluation.regions.every((region) => (
     region.objective.regularization.areaM2 >= minAreaM2 &&
-    region.convexity >= 0.65 &&
+    region.convexity >= 0.7 &&
+    region.compactness <= 5.25 &&
+    !(region.convexity < 0.74 && region.compactness > 4.25) &&
     !region.objective.regularization.isHardInvalid
   ));
 }
