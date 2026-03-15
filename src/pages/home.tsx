@@ -11,6 +11,7 @@ import OverlapGSDPanel from "@/components/OverlapGSDPanel";
 import PolygonParamsDialog from "@/components/PolygonParamsDialog";
 import type { PolygonParams } from '@/components/MapFlightDirection/types';
 import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator } from '@/components/ui/dropdown-menu';
+import { toast } from "@/hooks/use-toast";
 
 export default function Home() {
   const isMobile = useIsMobile();
@@ -74,6 +75,11 @@ export default function Home() {
         return newSet;
       });
     }
+    toast({
+      variant: 'destructive',
+      title: 'Action failed',
+      description: error,
+    });
   }, []);
 
   // MapFlightDirection now calls us to request params per polygon

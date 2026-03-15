@@ -30,14 +30,11 @@ function getDrawLayerAnchor(map: MapboxMap): string | undefined {
   return layers.find((layer) => layer.id.startsWith('gl-draw-'))?.id;
 }
 
-export function addFlightLinesForPolygon(
-  map: MapboxMap,
-  polygonId: string,
+export function generateFlightLinesForPolygon(
   ring: number[][],
   bearingDeg: number,
   lineSpacingM: number,
-  quality?: string
-): { flightLines: number[][][]; lineSpacing: number } {
+): { flightLines: number[][][]; lineSpacing: number; bounds: ReturnType<typeof getPolygonBounds> } {
   const bounds = getPolygonBounds(ring);
   const lineSpacing = lineSpacingM;
   const flightLines: number[][][] = [];
@@ -93,6 +90,19 @@ export function addFlightLinesForPolygon(
       flightLines.push([startPoint, endPoint]);
     }
   }
+
+  return { flightLines, lineSpacing, bounds };
+}
+
+export function addFlightLinesForPolygon(
+  map: MapboxMap,
+  polygonId: string,
+  ring: number[][],
+  bearingDeg: number,
+  lineSpacingM: number,
+  quality?: string
+): { flightLines: number[][][]; lineSpacing: number } {
+  const { flightLines, lineSpacing, bounds } = generateFlightLinesForPolygon(ring, bearingDeg, lineSpacingM);
 
   const sourceId = `flight-lines-source-${polygonId}`;
   const layerId = `flight-lines-layer-${polygonId}`;

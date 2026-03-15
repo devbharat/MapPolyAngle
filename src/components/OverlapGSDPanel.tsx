@@ -1,19 +1,21 @@
 import React, { useCallback, useMemo, useRef, useState } from "react";
 import type mapboxgl from "mapbox-gl";
 import { LidarDensityWorker, OverlapWorker, fetchTerrainRGBA, tilesCoveringPolygon } from "@/overlap/controller";
-import { addOrUpdateTileOverlay, clearRunOverlays, clearAllOverlays } from "@/overlap/overlay";
+import { addOrUpdateTileOverlay, clearAllOverlays } from "@/overlap/overlay";
 import type { CameraModel, PoseMeters, PolygonLngLatWithId, GSDStats, PolygonTileStats, LidarStripMeters } from "@/overlap/types";
 import { lngLatToMeters } from "@/overlap/mercator";
 import { metersToLngLat } from "@/services/Projection";
 import { SONY_RX1R2, DJI_ZENMUSE_P1_24MM, ILX_LR1_INSPECT_85MM, MAP61_17MM, RGB61_24MM, forwardSpacingRotated } from "@/domain/camera";
 import { DEFAULT_LIDAR_MAX_RANGE_M, getLidarMappingFovDeg, getLidarModel, lidarDeliverableDensity, lidarSinglePassDensity, lidarSwathWidth } from "@/domain/lidar";
 import { sampleCameraPositionsOnFlightPath, build3DFlightPath, extendFlightLineForTurnRunout, queryMinMaxElevationAlongPolylineWGS84 } from "@/components/MapFlightDirection/utils/geometry";
+import { generateFlightLinesForPolygon } from "@/components/MapFlightDirection/utils/mapbox-layers";
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { toast } from "@/hooks/use-toast";
-import type { MapFlightDirectionAPI } from "@/components/MapFlightDirection/api";
+import type { MapFlightDirectionAPI, TerrainPartitionSolutionPreview } from "@/components/MapFlightDirection/api";
+import type { TerrainTile } from "@/domain/types";
 import { extractPoses, wgs84ToWebMercator, CameraPoseWGS84, extractCameraModel } from "@/utils/djiGeotags";
 import type { PolygonAnalysisResult } from "@/components/MapFlightDirection/types";
 // Turf types may be unresolved if TS can't find bundled types; cast as any.
@@ -56,6 +58,14 @@ type OverallMetricStats = {
   density: GSDStats | null;
 };
 
+type ExactPartitionPreview = {
+  metricKind: MetricKind;
+  stats: GSDStats;
+  regionCount: number;
+  sampleCount: number;
+  sampleLabel: string;
+};
+
 function lidarComparisonLabel(mode?: 'first-return' | 'all-returns') {
   return mode === 'all-returns' ? 'All returns' : 'First return';
 }
@@ -83,6 +93,16 @@ function calculatePolygonAreaAcres(ring: [number, number][]): number {
   
   // Convert to acres (1 acre = 4046.8564224 square meters)
   return areaSquareMeters / 4046.8564224;
+}
+
+function ringsRoughlyEqual(a: [number, number][], b: [number, number][], toleranceDeg = 1e-7) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (Math.abs(a[i][0] - b[i][0]) > toleranceDeg || Math.abs(a[i][1] - b[i][1]) > toleranceDeg) {
+      return false;
+    }
+  }
+  return true;
 }
 
 // NEW: helper for synthetic ring conversion (Spherical Mercator meters -> lng/lat)
@@ -125,6 +145,13 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
   const [overallStats, setOverallStats] = useState<OverallMetricStats>({ gsd: null, density: null });
   const [perPolygonStats, setPerPolygonStats] = useState<Map<string, PolygonMetricSummary>>(new Map());
   const [internalSelectedId, setInternalSelectedId] = useState<string | null>(null);
+  const [splittingPolygonId, setSplittingPolygonId] = useState<string | null>(null);
+  const [partitionOptionsByPolygon, setPartitionOptionsByPolygon] = useState<Record<string, TerrainPartitionSolutionPreview[]>>({});
+  const [partitionSelectionByPolygon, setPartitionSelectionByPolygon] = useState<Record<string, number>>({});
+  const [loadingPartitionOptionsId, setLoadingPartitionOptionsId] = useState<string | null>(null);
+  const [applyingPartitionId, setApplyingPartitionId] = useState<string | null>(null);
+  const [exactPartitionPreviewByKey, setExactPartitionPreviewByKey] = useState<Record<string, ExactPartitionPreview>>({});
+  const [previewingPartitionKey, setPreviewingPartitionKey] = useState<string | null>(null);
   const isControlled = controlledSelectedId !== undefined;
   const activeSelectedId = isControlled ? (controlledSelectedId ?? null) : internalSelectedId;
   const itemRefs = useRef<Map<string, HTMLDivElement>>(new Map());
@@ -195,6 +222,102 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
       shortId: polygonId.slice(0, 8)
     };
   }, [mapRef]);
+
+  const loadTerrainPartitionOptions = useCallback(async (polygonId: string) => {
+    const api = mapRef.current;
+    if (!api?.getTerrainPartitionSolutions) return;
+    setLoadingPartitionOptionsId(polygonId);
+    try {
+      const solutions = await api.getTerrainPartitionSolutions(polygonId);
+      setPartitionOptionsByPolygon((prev) => ({ ...prev, [polygonId]: solutions }));
+      setExactPartitionPreviewByKey((prev) => {
+        const next = { ...prev };
+        Object.keys(next).forEach((key) => {
+          if (key.startsWith(`${polygonId}:`)) delete next[key];
+        });
+        return next;
+      });
+      setPartitionSelectionByPolygon((prev) => {
+        if (solutions.length === 0) return prev;
+        const currentIndex = prev[polygonId];
+        if (Number.isInteger(currentIndex) && currentIndex! >= 0 && currentIndex! < solutions.length) {
+          return prev;
+        }
+        const defaultIndex = Math.max(
+          0,
+          solutions.findIndex((solution) => solution.isFirstPracticalSplit),
+        );
+        return { ...prev, [polygonId]: defaultIndex };
+      });
+      if (solutions.length === 0) {
+        toast({
+          title: 'No partition options',
+          description: 'This area does not currently produce more than one practical terrain partition.',
+          variant: 'destructive',
+        });
+      }
+    } catch (error) {
+      toast({
+        title: 'Partition planning failed',
+        description: error instanceof Error ? error.message : 'Unable to compute terrain partition options.',
+        variant: 'destructive',
+      });
+    } finally {
+      setLoadingPartitionOptionsId((current) => (current === polygonId ? null : current));
+    }
+  }, [mapRef]);
+
+  const applyTerrainPartitionOption = useCallback(async (polygonId: string) => {
+    const api = mapRef.current;
+    const solutions = partitionOptionsByPolygon[polygonId] ?? [];
+    const selectedIndex = partitionSelectionByPolygon[polygonId] ?? 0;
+    const selected = solutions[selectedIndex];
+    if (!api?.applyTerrainPartitionSolution || !selected) return;
+    setApplyingPartitionId(polygonId);
+    try {
+      const result = await api.applyTerrainPartitionSolution(polygonId, selected.signature);
+      if (result?.replaced) {
+        resetComputedAnalysisState();
+        setSelection(result.createdIds[0] ?? null);
+        rerunAnalysisForCreatedPolygons(result.createdIds);
+        setPartitionOptionsByPolygon((prev) => {
+          const next = { ...prev };
+          delete next[polygonId];
+          return next;
+        });
+        setPartitionSelectionByPolygon((prev) => {
+          const next = { ...prev };
+          delete next[polygonId];
+          return next;
+        });
+        setExactPartitionPreviewByKey((prev) => {
+          const next = { ...prev };
+          Object.keys(next).forEach((key) => {
+            if (key.startsWith(`${polygonId}:`)) delete next[key];
+          });
+          return next;
+        });
+        toast({
+          title: 'Partition applied',
+          description: `Created ${result.createdIds.length} terrain-aligned areas from this polygon.`,
+        });
+      } else {
+        toast({
+          title: 'Partition not applied',
+          description: 'The selected partition could not be applied to this area.',
+          variant: 'destructive',
+        });
+      }
+    } catch (error) {
+      toast({
+        title: 'Partition apply failed',
+        description: error instanceof Error ? error.message : 'Unable to apply the selected partition.',
+        variant: 'destructive',
+      });
+    } finally {
+      setApplyingPartitionId((current) => (current === polygonId ? null : current));
+    }
+  }, [mapRef, partitionOptionsByPolygon, partitionSelectionByPolygon]);
 
   // Helper function to highlight polygon on map
   const highlightPolygon = useCallback((polygonId: string) => {
@@ -341,6 +464,22 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
     const yawOffset = p?.cameraYawOffsetDeg ?? 0;
     const rotate90 = Math.round((((yawOffset % 180) + 180) % 180)) === 90;
     return forwardSpacingRotated(cam, altitudeAGL, frontOverlap, rotate90);
+  }, [effectiveCameraForPolygon]);
+
+  const lineSpacingFor = useCallback((polygonId: string, altitudeAGL: number, sideOverlap: number, paramsMap: any): number => {
+    const p = paramsMap?.[polygonId];
+    if ((p?.payloadKind ?? 'camera') === 'lidar') {
+      const model = getLidarModel(p?.lidarKey);
+      const mappingFovDeg = getLidarMappingFovDeg(model, p?.mappingFovDeg);
+      return lidarSwathWidth(altitudeAGL, mappingFovDeg) * (1 - sideOverlap / 100);
+    }
+    const cam = effectiveCameraForPolygon(polygonId, paramsMap);
+    const yawOffset = p?.cameraYawOffsetDeg ?? 0;
+    const rotate90 = Math.round((((yawOffset % 180) + 180) % 180)) === 90;
+    const groundWidth = rotate90
+      ? (cam.h_px * cam.sy_m * altitudeAGL) / cam.f_m
+      : (cam.w_px * cam.sx_m * altitudeAGL) / cam.f_m;
+    return groundWidth * (1 - sideOverlap / 100);
   }, [effectiveCameraForPolygon]);
 
   // Accurate aggregation with tail trimming and fixed 8-bin histogram for display
@@ -629,9 +768,345 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
     return { strips, densityPaletteMax: densityPaletteMax > 0 ? densityPaletteMax * 1.15 : 200 };
   }, [altitude, isLidarPayload, mapRef, turnExtendUI]);
 
+  const evaluatePartitionOptionExact = useCallback(async (
+    polygonId: string,
+    solution: TerrainPartitionSolutionPreview,
+  ): Promise<ExactPartitionPreview> => {
+    const api = mapRef.current;
+    const paramsMap = getMergedParamsMap();
+    const params = paramsMap[polygonId];
+    if (!params) throw new Error('Missing flight parameters for this polygon.');
+
+    const parentTiles = (api?.getPolygonTiles?.().get(polygonId) ?? []) as TerrainTile[];
+    if (!parentTiles.length) throw new Error('Terrain tiles are not available yet. Run analysis on this polygon first.');
+
+    const altitudeMode = (api as any)?.getAltitudeMode ? (api as any).getAltitudeMode() : altitudeModeUI;
+    const minClearance = (api as any)?.getMinClearance ? (api as any).getMinClearance() : minClearanceUI;
+    const turnExtend = (api as any)?.getTurnExtend ? Math.max(0, (api as any).getTurnExtend()) : turnExtendUI;
+    const virtualPolygons = solution.regions.map((region, index) => ({
+      id: `${polygonId}::${index}`,
+      ring: region.ring,
+      bearingDeg: region.bearingDeg,
+    }));
+
+    const allTileRefs = (() => {
+      const seen = new Set<string>();
+      const refs: Array<{ z: number; x: number; y: number }> = [];
+      for (const polygon of virtualPolygons) {
+        for (const tile of tilesCoveringPolygon({ ring: polygon.ring }, zoom)) {
+          const key = `${zoom}/${tile.x}/${tile.y}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          refs.push({ z: zoom, x: tile.x, y: tile.y });
+        }
+      }
+      return refs;
+    })();
+
+    const getTile = async (tileRef: { z: number; x: number; y: number }) => {
+      const cacheKey = `${tileRef.z}/${tileRef.x}/${tileRef.y}`;
+      let tileData = tileCacheRef.current.get(cacheKey);
+      if (!tileData) {
+        const imgData = await fetchTerrainRGBA(tileRef.z, tileRef.x, tileRef.y, mapboxToken);
+        tileData = {
+          width: imgData.width,
+          height: imgData.height,
+          data: new Uint8ClampedArray(imgData.data),
+        };
+        tileCacheRef.current.set(cacheKey, tileData);
+      }
+      return {
+        cacheKey,
+        tile: { z: tileRef.z, x: tileRef.x, y: tileRef.y, size: tileData.width, data: new Uint8ClampedArray(tileData.data) },
+      };
+    };
+
+    const normalizeTileRef = (tileRef: { z: number; x: number; y: number }) => {
+      const tilesPerAxis = 1 << tileRef.z;
+      const wrappedX = ((tileRef.x % tilesPerAxis) + tilesPerAxis) % tilesPerAxis;
+      const clampedY = Math.max(0, Math.min(tilesPerAxis - 1, tileRef.y));
+      return { z: tileRef.z, x: wrappedX, y: clampedY };
+    };
+
+    const getLidarTileWithHalo = async (tileRef: { z: number; x: number; y: number }, padTiles = 1) => {
+      const center = await getTile(tileRef);
+      if (padTiles <= 0) return center;
+      const offsets: Array<{ dx: number; dy: number; tileRef: { z: number; x: number; y: number } }> = [];
+      for (let dy = -padTiles; dy <= padTiles; dy++) {
+        for (let dx = -padTiles; dx <= padTiles; dx++) {
+          offsets.push({
+            dx,
+            dy,
+            tileRef: normalizeTileRef({ z: tileRef.z, x: tileRef.x + dx, y: tileRef.y + dy }),
+          });
+        }
+      }
+      const neighborTiles = await Promise.all(offsets.map((entry) => getTile(entry.tileRef)));
+      const tileSize = center.tile.size;
+      const span = padTiles * 2 + 1;
+      const demSize = tileSize * span;
+      const demData = new Uint8ClampedArray(demSize * demSize * 4);
+      for (let i = 0; i < offsets.length; i++) {
+        const { dx, dy } = offsets[i];
+        const srcTile = neighborTiles[i].tile;
+        const offsetX = (dx + padTiles) * tileSize;
+        const offsetY = (dy + padTiles) * tileSize;
+        for (let row = 0; row < tileSize; row++) {
+          const srcStart = row * tileSize * 4;
+          const dstStart = ((offsetY + row) * demSize + offsetX) * 4;
+          demData.set(srcTile.data.subarray(srcStart, srcStart + tileSize * 4), dstStart);
+        }
+      }
+      return {
+        cacheKey: center.cacheKey,
+        tile: center.tile,
+        demTile: { size: demSize, padTiles, data: demData },
+      };
+    };
+
+    const pointInRing = (lng: number, lat: number, ring: [number, number][]) => {
+      let inside = false;
+      for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+        const [xi, yi] = ring[i];
+        const [xj, yj] = ring[j];
+        const intersect = ((yi > lat) !== (yj > lat)) &&
+          (lng < ((xj - xi) * (lat - yi)) / (yj - yi) + xi);
+        if (intersect) inside = !inside;
+      }
+      return inside;
+    };
+
+    if (isLidarPayload(polygonId, paramsMap)) {
+      const model = getLidarModel(params.lidarKey);
+      const altitudeAGL = params.altitudeAGL ?? altitude;
+      const lineSpacing = lineSpacingFor(polygonId, altitudeAGL, params.sideOverlap ?? sideOverlap, paramsMap);
+      const mappingFovDeg = getLidarMappingFovDeg(model, params.mappingFovDeg);
+      const speedMps = params.speedMps ?? model.defaultSpeedMps;
+      const returnMode = params.lidarReturnMode ?? 'single';
+      const maxLidarRangeM = params.maxLidarRangeM ?? model.defaultMaxRangeM ?? DEFAULT_LIDAR_MAX_RANGE_M;
+      const frameRateHz = params.lidarFrameRateHz ?? model.defaultFrameRateHz;
+      const azimuthSectorCenterDeg = params.lidarAzimuthSectorCenterDeg ?? model.defaultAzimuthSectorCenterDeg ?? 0;
+      const boresightYawDeg = params.lidarBoresightYawDeg ?? model.boresightYawDeg ?? 0;
+      const boresightPitchDeg = params.lidarBoresightPitchDeg ?? model.boresightPitchDeg ?? 0;
+      const boresightRollDeg = params.lidarBoresightRollDeg ?? model.boresightRollDeg ?? 0;
+      const comparisonMode = params.lidarComparisonMode ?? 'first-return';
+      const densityPerPass = lidarSinglePassDensity(model, altitudeAGL, speedMps, returnMode, mappingFovDeg);
+      const halfFovTan = Math.tan((mappingFovDeg * Math.PI) / 360);
+      const strips: LidarStripMeters[] = [];
+      let passIndex = 0;
+
+      for (const region of virtualPolygons) {
+        const { flightLines } = generateFlightLinesForPolygon(region.ring, region.bearingDeg, lineSpacing);
+        for (let lineIndex = 0; lineIndex < flightLines.length; lineIndex++) {
+          const sourceLine = flightLines[lineIndex];
+          if (!Array.isArray(sourceLine) || sourceLine.length < 2) continue;
+          const flownLine = lineIndex % 2 === 0 ? sourceLine : [...sourceLine].reverse();
+          const activeSweepLine = extendFlightLineForTurnRunout(flownLine, turnExtend);
+          const sweepPath3d = build3DFlightPath(
+            [activeSweepLine],
+            parentTiles,
+            lineSpacing,
+            { altitudeAGL, mode: altitudeMode, minClearance, turnExtendM: 0 },
+          )[0];
+          if (!Array.isArray(sweepPath3d) || sweepPath3d.length < 2) continue;
+          const localPassIndex = passIndex++;
+          for (let i = 1; i < sweepPath3d.length; i++) {
+            const start = sweepPath3d[i - 1];
+            const end = sweepPath3d[i];
+            if (!Array.isArray(start) || !Array.isArray(end) || start.length < 3 || end.length < 3) continue;
+            const [x1, y1] = lngLatToMeters(start[0], start[1]);
+            const [x2, y2] = lngLatToMeters(end[0], end[1]);
+            const terrainMin = queryMinMaxElevationAlongPolylineWGS84([[start[0], start[1]], [end[0], end[1]]], parentTiles, 12).min;
+            const maxSensorAltitude = Math.max(start[2], end[2]);
+            const maxHalfWidth = Number.isFinite(terrainMin)
+              ? Math.max(lidarSwathWidth(altitudeAGL, mappingFovDeg) / 2, Math.max(1, (maxSensorAltitude - terrainMin) * halfFovTan))
+              : lidarSwathWidth(altitudeAGL, mappingFovDeg) / 2;
+            strips.push({
+              id: `${region.id}-line-${lineIndex}-seg-${i - 1}`,
+              polygonId: region.id,
+              x1, y1, z1: start[2], x2, y2, z2: end[2],
+              plannedAltitudeAGL: altitudeAGL,
+              halfWidthM: maxHalfWidth,
+              densityPerPass,
+              speedMps,
+              effectivePointRate: model.effectivePointRates[returnMode],
+              halfFovTan,
+              maxRangeM: maxLidarRangeM,
+              passIndex: localPassIndex,
+              frameRateHz,
+              nativeHorizontalFovDeg: model.nativeHorizontalFovDeg,
+              mappingFovDeg,
+              verticalAnglesDeg: model.verticalAnglesDeg,
+              returnMode,
+              comparisonMode,
+              azimuthSectorCenterDeg,
+              boresightYawDeg,
+              boresightPitchDeg,
+              boresightRollDeg,
+            });
+          }
+        }
+      }
+
+      const worker = new LidarDensityWorker();
+      try {
+        const perRegionStats = new Map<string, GSDStats[]>();
+        for (const tileRef of allTileRefs) {
+          const { demTile, tile } = await getLidarTileWithHalo(tileRef, 1);
+          const res = await worker.runTile({
+            tile,
+            demTile,
+            polygons: virtualPolygons.map(({ id, ring }) => ({ id, ring })),
+            strips,
+            options: { clipInnerBufferM },
+          } as any);
+          (res.perPolygon ?? []).forEach((polyStats) => {
+            if (!polyStats.densityStats) return;
+            const list = perRegionStats.get(polyStats.polygonId) ?? [];
+            list.push(polyStats.densityStats);
+            perRegionStats.set(polyStats.polygonId, list);
+          });
+        }
+        const regionSummaries = Array.from(perRegionStats.values())
+          .map((statsList) => aggregateMetricStats(statsList))
+          .filter((stats) => stats.count > 0);
+        if (regionSummaries.length === 0) throw new Error('No lidar density preview could be computed for this partition.');
+        return {
+          metricKind: 'density',
+          stats: aggregateMetricStats(regionSummaries),
+          regionCount: solution.regionCount,
+          sampleCount: new Set(strips.map((strip) => strip.passIndex ?? -1)).size,
+          sampleLabel: 'Flight lines',
+        };
+      } finally {
+        worker.terminate();
+      }
+    }
+
+    const camera = effectiveCameraForPolygon(polygonId, paramsMap);
+    const altitudeAGL = params.altitudeAGL ?? altitude;
+    const photoSpacing = photoSpacingFor(polygonId, altitudeAGL, params.frontOverlap ?? frontOverlap, paramsMap);
+    const lineSpacing = lineSpacingFor(polygonId, altitudeAGL, params.sideOverlap ?? sideOverlap, paramsMap);
+    const yawOffset = params.cameraYawOffsetDeg ?? 0;
+    const normalizeDeg = (d: number) => ((d % 360) + 360) % 360;
+    const poses: PoseMeters[] = [];
+    let poseId = 0;
+
+    for (const region of virtualPolygons) {
+      const { flightLines } = generateFlightLinesForPolygon(region.ring, region.bearingDeg, lineSpacing);
+      const path3d = build3DFlightPath(
+        flightLines,
+        parentTiles,
+        lineSpacing,
+        { altitudeAGL, mode: altitudeMode, minClearance, turnExtendM: turnExtend },
+      );
+      const cameraPositions = sampleCameraPositionsOnFlightPath(path3d, photoSpacing, { includeTurns: false });
+      const filtered = region.ring.length >= 3
+        ? cameraPositions.filter(([lng, lat]) => pointInRing(lng, lat, region.ring))
+        : cameraPositions;
+      filtered.forEach(([lng, lat, altMSL, yawDeg]) => {
+        const [x, y] = lngLatToMeters(lng, lat);
+        poses.push({
+          id: `partition_pose_${poseId++}`,
+          x,
+          y,
+          z: altMSL,
+          omega_deg: 0,
+          phi_deg: 0,
+          kappa_deg: normalizeDeg(-yawDeg + yawOffset),
+          polygonId: region.id,
+        });
+      });
+    }
+
+    if (poses.length === 0) throw new Error('No camera poses could be generated for this partition.');
+
+    const worker = new OverlapWorker();
+    try {
+      const perRegionStats = new Map<string, GSDStats[]>();
+      for (const tileRef of allTileRefs) {
+        const { tile } = await getTile(tileRef);
+        const res = await worker.runTile({
+          tile,
+          polygons: virtualPolygons.map(({ id, ring }) => ({ id, ring })),
+          poses,
+          cameras: [camera],
+          poseCameraIndices: new Uint16Array(poses.length),
+          camera: undefined,
+          options: { clipInnerBufferM, minOverlapForGsd: minOverlapForGsdRef.current },
+        } as any);
+        (res.perPolygon ?? []).forEach((polyStats) => {
+          if (!polyStats.gsdStats) return;
+          const list = perRegionStats.get(polyStats.polygonId) ?? [];
+          list.push(polyStats.gsdStats);
+          perRegionStats.set(polyStats.polygonId, list);
+        });
+      }
+      const regionSummaries = Array.from(perRegionStats.values())
+        .map((statsList) => aggregateMetricStats(statsList))
+        .filter((stats) => stats.count > 0);
+      if (regionSummaries.length === 0) throw new Error('No camera GSD preview could be computed for this partition.');
+      return {
+        metricKind: 'gsd',
+        stats: aggregateMetricStats(regionSummaries),
+        regionCount: solution.regionCount,
+        sampleCount: poses.length,
+        sampleLabel: 'Images',
+      };
+    } finally {
+      worker.terminate();
+    }
+  }, [
+    altitude,
+    altitudeModeUI,
+    clipInnerBufferM,
+    effectiveCameraForPolygon,
+    frontOverlap,
+    getMergedParamsMap,
+    isLidarPayload,
+    lineSpacingFor,
+    mapRef,
+    mapboxToken,
+    minClearanceUI,
+    minOverlapForGsdRef,
+    photoSpacingFor,
+    sideOverlap,
+    turnExtendUI,
+    zoom,
+    aggregateMetricStats,
+  ]);
+
+  const previewExactPartitionOption = useCallback(async (polygonId: string) => {
+    const solutions = partitionOptionsByPolygon[polygonId] ?? [];
+    const selectedIndex = partitionSelectionByPolygon[polygonId] ?? 0;
+    const selected = solutions[selectedIndex];
+    if (!selected) return;
+    const previewKey = `${polygonId}:${selected.signature}`;
+    if (exactPartitionPreviewByKey[previewKey]) return;
+    setPreviewingPartitionKey(previewKey);
+    try {
+      const preview = await evaluatePartitionOptionExact(polygonId, selected);
+      setExactPartitionPreviewByKey((prev) => ({ ...prev, [previewKey]: preview }));
+    } catch (error) {
+      toast({
+        title: 'Exact preview failed',
+        description: error instanceof Error ? error.message : 'Unable to compute exact partition quality.',
+        variant: 'destructive',
+      });
+    } finally {
+      setPreviewingPartitionKey((current) => (current === previewKey ? null : current));
+    }
+  }, [
+    exactPartitionPreviewByKey,
+    evaluatePartitionOptionExact,
+    partitionOptionsByPolygon,
+    partitionSelectionByPolygon,
+  ]);
+
   const combinedPolygons = useMemo(() => {
     const polygonOrdering = getPolygons().map((p) => p.id || 'unknown');
-    const order = polygonOrdering.length > 0 ? polygonOrdering : polygonAnalyses.map((analysis) => analysis.polygonId);
+    const analysisOrdering = polygonAnalyses.map((analysis) => analysis.polygonId);
+    const order = polygonOrdering.length > 0 ? polygonOrdering : analysisOrdering;
     const map = new Map<string, { analysis?: PolygonAnalysisResult; stats?: PolygonMetricSummary }>();
 
     polygonAnalyses.forEach((analysis) => {
@@ -646,7 +1121,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
       }
     });
 
-    const orderedIds = [...order, ...Array.from(perPolygonStats.keys()).filter((id) => !order.includes(id))];
+    const orderedIds = [...order, ...analysisOrdering.filter((id) => !order.includes(id))];
 
     return orderedIds
       .map((polygonId, index) => ({ polygonId, analysis: map.get(polygonId)?.analysis, stats: map.get(polygonId)?.stats, sortIndex: index }))
@@ -762,7 +1237,20 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
 
     const cameraPolygons = allPolygons.filter((polygon) => !isLidarPayload(polygon.id || 'unknown', paramsMap));
     const lidarPolygons = allPolygons.filter((polygon) => isLidarPayload(polygon.id || 'unknown', paramsMap));
-    const targetPolygonId = opts?.polygonId;
+    const requestedTargetPolygonId = opts?.polygonId;
+    const currentTargetPolygon = requestedTargetPolygonId
+      ? allPolygons.find((polygon) => (polygon.id || 'unknown') === requestedTargetPolygonId)
+      : undefined;
+    const previousTargetRing = requestedTargetPolygonId
+      ? prevPolygonRingsRef.current.get(requestedTargetPolygonId)
+      : undefined;
+    const targetPolygonMoved = !!(
+      requestedTargetPolygonId &&
+      currentTargetPolygon?.ring &&
+      previousTargetRing &&
+      !ringsRoughlyEqual(currentTargetPolygon.ring, previousTargetRing)
+    );
+    const targetPolygonId = targetPolygonMoved ? undefined : requestedTargetPolygonId;
     const targetIsCamera = targetPolygonId ? cameraPolygons.some((polygon) => (polygon.id || 'unknown') === targetPolygonId) : cameraPolygons.length > 0;
     const targetIsLidar = targetPolygonId ? lidarPolygons.some((polygon) => (polygon.id || 'unknown') === targetPolygonId) : lidarPolygons.length > 0;
     const canRunCamera = targetIsCamera && poses.length > 0;
@@ -786,8 +1274,8 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
     }
 
     const now = Date.now();
-    if (!opts?.polygonId) {
-      if (globalRunIdRef.current) clearRunOverlays(map, globalRunIdRef.current);
+    if (!opts?.polygonId || targetPolygonMoved) {
+      clearAllOverlays(map);
       globalRunIdRef.current = `${now}`;
       perPolyTileStatsRef.current.clear();
     }
@@ -1147,6 +1635,25 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
     } else { autoTriesRef.current = 0; }
   }, [running, autoGenerate, importedPoses, compute, getMergedParamsMap, isLidarPayload, mapRef, parsePosesMeters]);
 
+  function rerunAnalysisForCreatedPolygons(createdIds: string[]) {
+    const deadlineMs = 4000;
+    const startedAt = Date.now();
+    const attempt = () => {
+      const api = mapRef.current;
+      const lines = api?.getFlightLines?.();
+      const ready = !!lines && createdIds.every((id) => {
+        const entry = lines.get(id);
+        return !!entry && Array.isArray(entry.flightLines) && entry.flightLines.length > 0;
+      });
+      if (ready || Date.now() - startedAt >= deadlineMs) {
+        autoRun({ reason: 'manual' });
+        return;
+      }
+      window.setTimeout(attempt, 150);
+    };
+    window.setTimeout(attempt, 0);
+  }
+
   // Provide autoRun function to parent component - register immediately and on changes
   React.useEffect(() => {
     onAutoRun?.(autoRun);
@@ -1176,6 +1683,28 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
       onPosesImported?.(0); // notify parent
     }
   }, [mapRef, onPosesImported]);
+
+  const resetComputedAnalysisState = useCallback(() => {
+    const map: any = mapRef.current?.getMap?.();
+    computeSeqRef.current += 1;
+    if (autoRunTimeoutRef.current) {
+      clearTimeout(autoRunTimeoutRef.current);
+      autoRunTimeoutRef.current = null;
+    }
+    if (map) {
+      clearAllOverlays(map);
+    }
+    const now = Date.now();
+    globalRunIdRef.current = `${now}`;
+    perPolyTileStatsRef.current.clear();
+    prevPolygonRingsRef.current = new Map();
+    setOverallStats({ gsd: null, density: null });
+    setPerPolygonStats(new Map());
+    if (mapRef.current?.removeCameraPoints) {
+      mapRef.current.removeCameraPoints('__ALL__');
+      mapRef.current.removeCameraPoints('__POSES__');
+    }
+  }, [mapRef]);
 
   React.useEffect(() => {
     const api = mapRef.current;
@@ -1408,6 +1937,36 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
             const sourceLabel = stats?.sourceLabel;
             const isSelected = activeSelectedId === polygonId;
             const isPoseArea = polygonId === '__POSES__';
+            const partitionOptions = partitionOptionsByPolygon[polygonId] ?? [];
+            const selectedPartitionIndex = partitionOptions.length > 0
+              ? Math.min(
+                  partitionOptions.length - 1,
+                  Math.max(0, partitionSelectionByPolygon[polygonId] ?? 0),
+                )
+              : 0;
+            const selectedPartition = partitionOptions[selectedPartitionIndex];
+            const fastestPartition = partitionOptions[0];
+            const bestQualityPartition = partitionOptions.reduce<TerrainPartitionSolutionPreview | null>(
+              (best, solution) => {
+                if (!best || solution.normalizedQualityCost < best.normalizedQualityCost) return solution;
+                return best;
+              },
+              null,
+            );
+            const missionTimeDeltaPct = selectedPartition && fastestPartition && fastestPartition.totalMissionTimeSec > 0
+              ? ((selectedPartition.totalMissionTimeSec / fastestPartition.totalMissionTimeSec) - 1) * 100
+              : 0;
+            const qualityGainPct = selectedPartition && fastestPartition && fastestPartition.normalizedQualityCost > 0
+              ? ((fastestPartition.normalizedQualityCost - selectedPartition.normalizedQualityCost) / fastestPartition.normalizedQualityCost) * 100
+              : 0;
+            const selectedPreviewKey = selectedPartition ? `${polygonId}:${selectedPartition.signature}` : null;
+            const exactPreview = selectedPreviewKey ? exactPartitionPreviewByKey[selectedPreviewKey] : undefined;
+            const isPreviewingExact = selectedPreviewKey === previewingPartitionKey;
+            const exactMeanDelta = exactPreview && metricStats
+              ? exactPreview.metricKind === 'gsd'
+                ? metricStats.mean - exactPreview.stats.mean
+                : exactPreview.stats.mean - metricStats.mean
+              : null;
 
             return (
               <Card
@@ -1453,6 +2012,43 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
                         title="Edit flight parameters for this area"
                       >
                         Edit setup
+                      </Button>
+                    )}
+
+                    {!isPoseArea && (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        className="h-7 px-2 text-xs"
+                        disabled={splittingPolygonId === polygonId}
+                        onClick={async (e) => {
+                          e.stopPropagation();
+                          setSelection(polygonId);
+                          setSplittingPolygonId(polygonId);
+                          try {
+                            const result = await mapRef.current?.autoSplitPolygonByTerrain?.(polygonId);
+                            if (result?.replaced && result.createdIds.length > 1) {
+                              resetComputedAnalysisState();
+                              setSelection(result.createdIds[0] ?? null);
+                              rerunAnalysisForCreatedPolygons(result.createdIds);
+                              toast({
+                                title: 'Area split',
+                                description: `Created ${result.createdIds.length} terrain-aligned areas from this polygon.`,
+                              });
+                            } else {
+                              toast({
+                                variant: 'destructive',
+                                title: 'No split created',
+                                description: 'No useful terrain-face split was found for this area with the current rules.',
+                              });
+                            }
+                          } finally {
+                            setSplittingPolygonId((current) => current === polygonId ? null : current);
+                          }
+                        }}
+                        title="Split this area into a few terrain-aligned faces"
+                      >
+                        {splittingPolygonId === polygonId ? 'Splitting…' : 'Auto split'}
                       </Button>
                     )}
 
@@ -1535,6 +2131,141 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
                       </Button>
                     )}
                   </div>
+
+                  {!isPoseArea && (
+                    <div className="rounded-lg border border-slate-200 bg-slate-50 p-2 space-y-2">
+                      <div className="flex items-center justify-between gap-2">
+                        <div>
+                          <div className="text-xs font-medium text-slate-900">Auto partition tradeoff</div>
+                          <div className="text-[11px] text-slate-500">Explore faster vs higher-quality terrain partitions before applying one.</div>
+                        </div>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="h-7 px-2 text-xs"
+                          disabled={loadingPartitionOptionsId === polygonId || applyingPartitionId === polygonId}
+                          onClick={async (e) => {
+                            e.stopPropagation();
+                            setSelection(polygonId);
+                            await loadTerrainPartitionOptions(polygonId);
+                          }}
+                        >
+                          {loadingPartitionOptionsId === polygonId ? 'Planning…' : partitionOptions.length > 0 ? 'Refresh options' : 'Plan options'}
+                        </Button>
+                      </div>
+
+                      {partitionOptions.length > 0 && selectedPartition && (
+                        <div className="space-y-2" onClick={(e) => e.stopPropagation()}>
+                          <div className="flex items-center justify-between text-[11px] text-slate-500">
+                            <span>Faster</span>
+                            <span>Better quality</span>
+                          </div>
+                          <input
+                            type="range"
+                            min={0}
+                            max={Math.max(0, partitionOptions.length - 1)}
+                            step={1}
+                            value={selectedPartitionIndex}
+                            className="w-full"
+                            onChange={(e) => {
+                              const value = Number(e.target.value);
+                              setPartitionSelectionByPolygon((prev) => ({ ...prev, [polygonId]: value }));
+                            }}
+                          />
+                          <div className="grid grid-cols-3 gap-2 text-xs">
+                            <div>
+                              <div className="font-medium text-slate-900">{selectedPartition.regionCount}</div>
+                              <div className="text-slate-500">Regions</div>
+                            </div>
+                            <div>
+                              <div className="font-medium text-slate-900">{(selectedPartition.totalMissionTimeSec / 60).toFixed(1)} min</div>
+                              <div className="text-slate-500">Est. time</div>
+                            </div>
+                            <div>
+                              <div className="font-medium text-slate-900">{selectedPartition.weightedMeanMismatchDeg.toFixed(1)}°</div>
+                              <div className="text-slate-500">Mismatch</div>
+                            </div>
+                          </div>
+                          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-slate-600">
+                            <span>{missionTimeDeltaPct >= 0 ? '+' : ''}{missionTimeDeltaPct.toFixed(0)}% time vs fastest</span>
+                            <span>{qualityGainPct >= 0 ? '+' : ''}{qualityGainPct.toFixed(0)}% quality vs fastest</span>
+                            <span>Largest region {(selectedPartition.largestRegionFraction * 100).toFixed(0)}%</span>
+                            <span>Mean convexity {selectedPartition.meanConvexity.toFixed(2)}</span>
+                            {bestQualityPartition && (
+                              <span>
+                                {selectedPartition.isFirstPracticalSplit
+                                  ? 'First practical split'
+                                  : selectedPartition.signature === bestQualityPartition.signature
+                                    ? 'Best quality option'
+                                    : `Level ${selectedPartition.hierarchyLevel + 1}`}
+                              </span>
+                            )}
+                          </div>
+                          <div className="flex items-center justify-end">
+                            <div className="flex items-center gap-2">
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                className="h-7 px-2 text-xs"
+                                disabled={isPreviewingExact}
+                                onClick={async (e) => {
+                                  e.stopPropagation();
+                                  setSelection(polygonId);
+                                  await previewExactPartitionOption(polygonId);
+                                }}
+                              >
+                                {isPreviewingExact ? 'Previewing…' : exactPreview ? 'Refresh exact preview' : 'Preview exact quality'}
+                              </Button>
+                              <Button
+                                size="sm"
+                                className="h-7 px-2 text-xs"
+                                disabled={applyingPartitionId === polygonId}
+                                onClick={async (e) => {
+                                  e.stopPropagation();
+                                  setSelection(polygonId);
+                                  await applyTerrainPartitionOption(polygonId);
+                                }}
+                              >
+                                {applyingPartitionId === polygonId ? 'Applying…' : 'Apply partition'}
+                              </Button>
+                            </div>
+                          </div>
+                          {exactPreview && (
+                            <div className="rounded-md border border-emerald-200 bg-emerald-50 p-2 space-y-1">
+                              <div className="flex items-center justify-between">
+                                <div className="text-[11px] font-medium text-emerald-900">Exact preview</div>
+                                <div className="text-[11px] text-emerald-700">
+                                  {exactPreview.regionCount} regions · {exactPreview.sampleCount} {exactPreview.sampleLabel.toLowerCase()}
+                                </div>
+                              </div>
+                              <div className="grid grid-cols-3 gap-2 text-xs">
+                                <div>
+                                  <div className="font-medium text-emerald-900">{formatMetricValue(exactPreview.metricKind, exactPreview.stats.min, exactPreview.metricKind === 'density' ? 0 : 1)}</div>
+                                  <div className="text-emerald-700">Min</div>
+                                </div>
+                                <div>
+                                  <div className="font-medium text-emerald-900">{formatMetricValue(exactPreview.metricKind, exactPreview.stats.mean, exactPreview.metricKind === 'density' ? 1 : 2)}</div>
+                                  <div className="text-emerald-700">Mean</div>
+                                </div>
+                                <div>
+                                  <div className="font-medium text-emerald-900">{formatMetricValue(exactPreview.metricKind, exactPreview.stats.max, exactPreview.metricKind === 'density' ? 0 : 1)}</div>
+                                  <div className="text-emerald-700">Max</div>
+                                </div>
+                              </div>
+                              {exactMeanDelta != null && (
+                                <div className="text-[11px] text-emerald-800">
+                                  {exactPreview.metricKind === 'gsd' ? 'Improvement vs current' : 'Gain vs current'}:{' '}
+                                  <span className="font-medium">
+                                    {exactMeanDelta >= 0 ? '+' : ''}{formatMetricValue(exactPreview.metricKind, exactMeanDelta, exactPreview.metricKind === 'density' ? 1 : 2)}
+                                  </span>
+                                </div>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  )}
 
                   {metricStats ? (
                     <div className="space-y-2">

@@ -28,6 +28,10 @@ import { SONY_RX1R2, DJI_ZENMUSE_P1_24MM, ILX_LR1_INSPECT_85MM, MAP61_17MM, RGB6
 import { DEFAULT_LIDAR, DEFAULT_LIDAR_MAX_RANGE_M, LIDAR_REGISTRY, lidarLineSpacing } from '@/domain/lidar';
 import type { MapFlightDirectionAPI, ImportedFlightplanArea } from './api';
 import { fetchTilesForPolygon } from './utils/terrain';
+import { partitionPolygonByTerrainFaces } from '@/utils/terrainFacePartition';
+import { buildPartitionFrontier, type FrontierSolution } from '@/utils/terrainPartitionGraph';
+// @ts-ignore Turf typings are inconsistent in this repo.
+import * as turf from '@turf/turf';
 
 // NEW: Wingtra import helpers
 import { importWingtraFlightPlan } from '@/interop/wingtra/convert';
@@ -45,6 +49,8 @@ const DEFAULT_PAYLOAD_KIND = 'camera';
 const DEFAULT_ALTITUDE_AGL = 100;
 const DEFAULT_FRONT_OVERLAP = 70;
 const DEFAULT_SIDE_OVERLAP = 70;
+const DEFAULT_PARTITION_TRADEOFF_SAMPLES = [0.1, 0.25, 0.4, 0.55, 0.7, 0.85];
+const DEFAULT_PARTITION_TARGET_TRADEOFF = 0.7;
 
 function clampNumber(value: number | undefined, min: number, max: number, fallback: number): number {
   if (!Number.isFinite(value)) return fallback;
@@ -75,6 +81,74 @@ function sanitizePolygonParams(params: PolygonParams): PolygonParams {
     lidarReturnMode: isLidar ? (params.lidarReturnMode ?? 'single') : undefined,
     useCustomBearing: !!params.useCustomBearing,
     customBearingDeg: params.useCustomBearing ? normalizeBearing(params.customBearingDeg) : undefined,
+  };
+}
+
+function normalizeRingForGeometryOps(ring: [number, number][]): [number, number][] | null {
+  const coords = Array.isArray(ring)
+    ? ring.filter((coord): coord is [number, number] => (
+        Array.isArray(coord) &&
+        coord.length >= 2 &&
+        Number.isFinite(coord[0]) &&
+        Number.isFinite(coord[1])
+      ))
+    : [];
+  if (coords.length < 3) return null;
+  const [firstLng, firstLat] = coords[0];
+  const [lastLng, lastLat] = coords[coords.length - 1];
+  if (firstLng === lastLng && firstLat === lastLat) return coords;
+  return [...coords, [firstLng, firstLat]];
+}
+
+function unionTurfFeatures(a: any, b: any) {
+  const unionFn = (turf as any).union;
+  if (typeof unionFn !== 'function') return null;
+  return unionFn.length >= 2
+    ? unionFn(a, b)
+    : unionFn(turf.featureCollection([a, b]));
+}
+
+function intersectTurfFeatures(a: any, b: any) {
+  const intersectFn = (turf as any).intersect;
+  if (typeof intersectFn !== 'function') return null;
+  return intersectFn.length >= 2
+    ? intersectFn(a, b)
+    : intersectFn(turf.featureCollection([a, b]));
+}
+
+function computePartitionCoverageMetrics(
+  parentRing: [number, number][],
+  childRings: [number, number][][],
+) {
+  const normalizedParent = normalizeRingForGeometryOps(parentRing);
+  const normalizedChildren = childRings
+    .map((ring) => normalizeRingForGeometryOps(ring))
+    .filter((ring): ring is [number, number][] => ring !== null);
+  if (!normalizedParent || normalizedChildren.length === 0) {
+    return { coverageRatio: 0, overlapRatio: 1, normalizedChildren: [] as [number, number][][] };
+  }
+
+  const parentFeature = turf.polygon([normalizedParent]);
+  const parentArea = Math.max(1e-6, turf.area(parentFeature));
+  let unionFeature: any = null;
+  let summedArea = 0;
+
+  for (const childRing of normalizedChildren) {
+    const feature = turf.polygon([childRing]);
+    summedArea += turf.area(feature);
+    unionFeature = unionFeature ? unionTurfFeatures(unionFeature, feature) : feature;
+    if (!unionFeature) {
+      return { coverageRatio: 0, overlapRatio: 1, normalizedChildren };
+    }
+  }
+
+  const coveredFeature = intersectTurfFeatures(parentFeature, unionFeature);
+  const coveredArea = coveredFeature ? turf.area(coveredFeature) : 0;
+  const unionArea = turf.area(unionFeature);
+  return {
+    coverageRatio: coveredArea / parentArea,
+    overlapRatio: Math.max(0, summedArea - unionArea) / parentArea,
+    normalizedChildren,
   };
 }
 
@@ -185,6 +259,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
     const polygonTilesRef = React.useRef(polygonTiles);
     const polygonFlightLinesRef = React.useRef(polygonFlightLines);
     const polygonResultsRef = React.useRef(polygonResults);
+    const pendingGeometryRefreshRef = React.useRef<Set<string>>(new Set());
     // NEW: Suppress per‑polygon flight line update events during batched imports
     const suppressFlightLineEventsRef = React.useRef(false);
     const pendingOptimizeRef = React.useRef<Set<string>>(new Set());
@@ -475,7 +550,11 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         });
 
         if (!suppressFlightLineEventsRef.current) {
-          onFlightLinesUpdated?.(result.polygonId);
+          if (pendingGeometryRefreshRef.current.delete(result.polygonId)) {
+            onFlightLinesUpdated?.('__all__');
+          } else {
+            onFlightLinesUpdated?.(result.polygonId);
+          }
         }
 
         if (deckOverlayRef.current && lines.flightLines.length > 0) {
@@ -585,7 +664,9 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
 
       setTimeout(() => {
         onPolygonSelected?.(null);
-        onFlightLinesUpdated?.('__all__');
+        if (!suppressFlightLineEventsRef.current) {
+          onFlightLinesUpdated?.('__all__');
+        }
         try {
           const coll = (drawRef.current as any)?.getAll?.();
           const hasAny = Array.isArray(coll?.features) && coll.features.some((f: any) => f?.geometry?.type === 'Polygon');
@@ -631,6 +712,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       if (suspendAutoAnalysisRef.current) return;
       e.features.forEach((feature: any) => {
         if (feature.geometry.type === 'Polygon') {
+          pendingGeometryRefreshRef.current.add(String(feature.id));
           analyzePolygon(feature.id, feature);
         }
       });
@@ -1202,6 +1284,287 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       }
     }, [analyzePolygon]);
 
+    const getTerrainPartitionContext = useCallback(async (polygonId: string) => {
+      const draw = drawRef.current as any;
+      const feature = draw?.get?.(polygonId);
+      if (!feature?.geometry || feature.geometry.type !== 'Polygon') {
+        onError?.('Polygon not found for terrain-face splitting.', polygonId);
+        return null;
+      }
+
+      const ring = feature.geometry.coordinates?.[0] as [number, number][] | undefined;
+      if (!Array.isArray(ring) || ring.length < 4) {
+        onError?.('Polygon is invalid for terrain-face splitting.', polygonId);
+        return null;
+      }
+
+      const params = sanitizePolygonParams(
+        polygonParamsRef.current.get(polygonId) ?? { altitudeAGL: 100, frontOverlap: 80, sideOverlap: 70 },
+      );
+      const existingTiles = polygonTilesRef.current.get(polygonId);
+      const tiles = existingTiles && existingTiles.length > 0
+        ? existingTiles
+        : await fetchTilesForPolygon(
+            { coordinates: ring as any },
+            calculateOptimalTerrainZoom({ coordinates: ring as any }),
+            mapboxToken,
+            new AbortController().signal,
+          );
+
+      if (!tiles || tiles.length === 0) {
+        onError?.('Terrain tiles are required before the area can be auto-split.', polygonId);
+        return null;
+      }
+
+      return {
+        draw,
+        ring,
+        tiles,
+        params: sanitizePolygonParams({
+          ...params,
+          useCustomBearing: false,
+          customBearingDeg: undefined,
+        }),
+      };
+    }, [mapboxToken, onError]);
+
+    const getTerrainPartitionSolutions = useCallback(async (polygonId: string) => {
+      const context = await getTerrainPartitionContext(polygonId);
+      if (!context) return [];
+      const { ring, tiles, params } = context;
+      const { solutions } = buildPartitionFrontier(ring, tiles, params, {
+        tradeoffSamples: DEFAULT_PARTITION_TRADEOFF_SAMPLES,
+      });
+      return solutions
+        .filter((solution) => solution.regions.length > 1)
+        .map((solution) => ({
+        signature: solution.signature,
+        tradeoff: solution.tradeoff,
+        regionCount: solution.partition.regionCount,
+        totalMissionTimeSec: solution.partition.totalMissionTimeSec,
+        normalizedQualityCost: solution.partition.normalizedQualityCost,
+        weightedMeanMismatchDeg: solution.partition.weightedMeanMismatchDeg,
+        hierarchyLevel: solution.hierarchyLevel,
+        largestRegionFraction: solution.largestRegionFraction,
+        meanConvexity: solution.meanConvexity,
+        boundaryBreakAlignment: solution.boundaryBreakAlignment,
+        isFirstPracticalSplit: solution.isFirstPracticalSplit,
+        regions: solution.regions.map((region) => ({
+          areaM2: region.objective.regularization.areaM2,
+          bearingDeg: region.objective.bearingDeg,
+          atomCount: region.atomIds.length,
+          ring: region.ring,
+          convexity: region.convexity,
+          compactness: region.compactness,
+        })),
+      }));
+    }, [getTerrainPartitionContext]);
+
+    const applyTerrainPartitionRings = useCallback(async (
+      polygonId: string,
+      partitionRings: [number, number][][],
+      inheritedParams: PolygonParams,
+    ): Promise<{ createdIds: string[]; replaced: boolean }> => {
+      const draw = drawRef.current as any;
+      if (!draw) {
+        onError?.('Map is not ready for terrain-face splitting.', polygonId);
+        return { createdIds: [], replaced: false };
+      }
+
+      const coverage = computePartitionCoverageMetrics(
+        (draw?.get?.(polygonId)?.geometry?.coordinates?.[0] as [number, number][] | undefined) ?? [],
+        partitionRings,
+      );
+      const normalizedPartitionRings = coverage.normalizedChildren;
+
+      if (normalizedPartitionRings.length <= 1) {
+        onError?.('No useful terrain-face split was found for this area.', polygonId);
+        return { createdIds: [], replaced: false };
+      }
+
+      if (coverage.coverageRatio < 0.5 || coverage.overlapRatio > 0.35) {
+        onError?.('Auto-split produced incomplete child coverage for this area and was rejected.', polygonId);
+        return { createdIds: [], replaced: false };
+      }
+
+      suspendAutoAnalysisRef.current = true;
+      const prevSuppress = suppressFlightLineEventsRef.current;
+      suppressFlightLineEventsRef.current = true;
+      const createdIds: string[] = [];
+
+      try {
+        for (const childRing of normalizedPartitionRings) {
+          const id = addRingAsDrawFeature(childRing, 'Terrain Face', { source: 'terrain-face-split', parentPolygonId: polygonId });
+          if (id) createdIds.push(id);
+        }
+
+        if (createdIds.length <= 1) {
+          onError?.('Auto-split did not produce enough valid child polygons.', polygonId);
+          return { createdIds: [], replaced: false };
+        }
+
+        const nextParams = new Map(polygonParamsRef.current);
+        nextParams.delete(polygonId);
+        createdIds.forEach((id) => nextParams.set(id, inheritedParams));
+        polygonParamsRef.current = nextParams;
+        setPolygonParams(new Map(nextParams));
+
+        const nextOverrides = new Map(bearingOverridesRef.current);
+        nextOverrides.delete(polygonId);
+        bearingOverridesRef.current = nextOverrides;
+        setBearingOverrides(new Map(nextOverrides));
+
+        setImportedOriginals((prev) => {
+          const next = new Map(prev);
+          next.delete(polygonId);
+          return next;
+        });
+        setPolygonResults((prev) => {
+          if (!prev.has(polygonId)) return prev;
+          const next = new Map(prev);
+          next.delete(polygonId);
+          polygonResultsRef.current = next;
+          debouncedAnalysisComplete();
+          return next;
+        });
+        setPolygonTiles((prev) => {
+          if (!prev.has(polygonId)) return prev;
+          const next = new Map(prev);
+          next.delete(polygonId);
+          return next;
+        });
+        setPolygonFlightLines((prev) => {
+          if (!prev.has(polygonId)) return prev;
+          const next = new Map(prev);
+          next.delete(polygonId);
+          return next;
+        });
+        setPendingParamPolygons((prev) => prev.filter((id) => id !== polygonId));
+
+        if (mapRef.current) {
+          removeFlightLinesForPolygon(mapRef.current, polygonId);
+          removeTriggerPointsForPolygon(mapRef.current, polygonId);
+        }
+        if (deckOverlayRef.current) {
+          remove3DPathLayer(deckOverlayRef.current, polygonId, setDeckLayers);
+          remove3DTriggerPointsLayer(deckOverlayRef.current, polygonId, setDeckLayers);
+          remove3DCameraPointsLayer(deckOverlayRef.current, polygonId, setDeckLayers);
+        }
+
+        pendingProgrammaticDeletesRef.current.add(polygonId);
+        draw.delete(polygonId);
+
+        fitMapToRings(normalizedPartitionRings);
+
+        suspendAutoAnalysisRef.current = false;
+        const analysisPromises: Promise<any>[] = [];
+        for (const childId of createdIds) {
+          const childFeature = draw?.get?.(childId);
+          if (childFeature?.geometry?.type === 'Polygon') {
+            analysisPromises.push(analyzePolygon(childId, childFeature));
+          }
+        }
+        await Promise.allSettled(analysisPromises);
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        for (const childId of createdIds) {
+          applyPolygonParams(childId, inheritedParams, { skipEvent: true, skipQueue: true });
+        }
+
+        onPolygonSelected?.(createdIds[0] ?? null);
+        return { createdIds, replaced: true };
+      } catch (error) {
+        for (const childId of createdIds) {
+          try {
+            pendingProgrammaticDeletesRef.current.add(childId);
+            draw?.delete?.(childId);
+          } catch {}
+        }
+        onError?.(`Terrain-face split failed: ${error instanceof Error ? error.message : 'Unknown error'}`, polygonId);
+        return { createdIds: [], replaced: false };
+      } finally {
+        suspendAutoAnalysisRef.current = false;
+        suppressFlightLineEventsRef.current = prevSuppress;
+        if (!prevSuppress) {
+          onFlightLinesUpdated?.('__all__');
+        }
+      }
+    }, [addRingAsDrawFeature, analyzePolygon, applyPolygonParams, fitMapToRings, onError, onFlightLinesUpdated, onPolygonSelected]);
+
+    const applyTerrainPartitionSolution = useCallback(async (
+      polygonId: string,
+      signature: string,
+    ): Promise<{ createdIds: string[]; replaced: boolean }> => {
+      const context = await getTerrainPartitionContext(polygonId);
+      if (!context) return { createdIds: [], replaced: false };
+      const { ring, tiles, params } = context;
+      const { solutions } = buildPartitionFrontier(ring, tiles, params, {
+        tradeoffSamples: DEFAULT_PARTITION_TRADEOFF_SAMPLES,
+      });
+      const selected = solutions.find((solution) => solution.signature === signature);
+      if (!selected || selected.regions.length <= 1) {
+        onError?.('Selected terrain partition is no longer valid for this area.', polygonId);
+        return { createdIds: [], replaced: false };
+      }
+      return applyTerrainPartitionRings(
+        polygonId,
+        selected.regions.map((region) => region.ring),
+        params,
+      );
+    }, [applyTerrainPartitionRings, getTerrainPartitionContext, onError]);
+
+    const pickDefaultPartitionSolution = useCallback((solutions: FrontierSolution[]) => {
+      const candidates = solutions.filter((solution) => solution.regions.length > 1);
+      if (candidates.length === 0) return null;
+      const firstPractical = candidates.find((solution) => solution.isFirstPracticalSplit);
+      if (firstPractical) return firstPractical;
+      const bestTradeoffDistance = candidates.reduce(
+        (best, candidate) => Math.min(best, Math.abs(candidate.tradeoff - DEFAULT_PARTITION_TARGET_TRADEOFF)),
+        Infinity,
+      );
+      const tradeoffBucket = candidates.filter(
+        (candidate) => Math.abs(Math.abs(candidate.tradeoff - DEFAULT_PARTITION_TARGET_TRADEOFF) - bestTradeoffDistance) <= 1e-9,
+      );
+      const minRegionCount = tradeoffBucket.reduce(
+        (best, candidate) => Math.min(best, candidate.partition.regionCount),
+        Infinity,
+      );
+      return tradeoffBucket
+        .filter((candidate) => candidate.partition.regionCount === minRegionCount)
+        .reduce((best, candidate) => (
+          candidate.partition.normalizedQualityCost < best.partition.normalizedQualityCost ? candidate : best
+        ));
+    }, []);
+
+    const autoSplitPolygonByTerrain = useCallback(async (polygonId: string): Promise<{ createdIds: string[]; replaced: boolean }> => {
+      const context = await getTerrainPartitionContext(polygonId);
+      if (!context) return { createdIds: [], replaced: false };
+      const { ring, tiles, params } = context;
+
+      const { solutions } = buildPartitionFrontier(ring, tiles, params, {
+        tradeoffSamples: DEFAULT_PARTITION_TRADEOFF_SAMPLES,
+      });
+      const selected = pickDefaultPartitionSolution(solutions);
+      if (selected) {
+        const applied = await applyTerrainPartitionRings(
+          polygonId,
+          selected.regions.map((region) => region.ring),
+          params,
+        );
+        if (applied.replaced) return applied;
+      }
+
+      const partition = partitionPolygonByTerrainFaces(ring, tiles, {
+        ...params,
+        useCustomBearing: false,
+        customBearingDeg: undefined,
+      }, {
+        forceAtLeastOneSplit: true,
+        candidateAngleStepDeg: 10,
+        candidateOffsetFractions: [-0.42, -0.28, -0.14, 0, 0.14, 0.28, 0.42],
+      });
+      return applyTerrainPartitionRings(polygonId, partition.polygons, params);
+    }, [applyTerrainPartitionRings, getTerrainPartitionContext, pickDefaultPartitionSolution]);
+
     // ---------- Map render ----------
     // Note: using `any` for now due to complex nested types from Mapbox GL and Deck.gl
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1261,6 +1624,9 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         }, 0);
       },
       editPolygonBoundary,
+      autoSplitPolygonByTerrain,
+      getTerrainPartitionSolutions,
+      applyTerrainPartitionSolution,
       startPolygonDrawing: () => {
         if (drawRef.current) (drawRef.current as any).changeMode('draw_polygon');
       },
@@ -1371,7 +1737,8 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       },
     }), [
       polygonResults, polygonFlightLines, polygonTiles, polygonParams,
-      cancelAllAnalyses, applyPolygonParams, applyPolygonParamsBatch, cleanupPolygonState, editPolygonBoundary,
+      cancelAllAnalyses, applyPolygonParams, applyPolygonParamsBatch, cleanupPolygonState, editPolygonBoundary, autoSplitPolygonByTerrain,
+      getTerrainPartitionSolutions, applyTerrainPartitionSolution,
       bearingOverrides, importedOriginals,
       importKmlFromText, importWingtraFromText,
       optimizePolygonDirection, revertPolygonToImportedDirection, runFullAnalysis,
