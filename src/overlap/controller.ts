@@ -74,12 +74,17 @@ export class LidarDensityWorker {
     this.worker = new Worker(new URL("./lidar-worker.ts", import.meta.url), { type: "module" });
   }
   runTile(args: any) {
-    return new Promise<LidarWorkerOut>((resolve) => {
+    return new Promise<LidarWorkerOut>((resolve, reject) => {
       const onMsg = (e: MessageEvent<LidarWorkerOut>) => {
-        this.worker.removeEventListener("message", onMsg as any);
+        this.worker.removeEventListener("error", onErr as any);
         resolve(e.data);
       };
+      const onErr = (e: ErrorEvent) => {
+        this.worker.removeEventListener("message", onMsg as any);
+        reject(e.error ?? new Error(e.message || "Lidar worker failed"));
+      };
       this.worker.addEventListener("message", onMsg as any, { once: true });
+      this.worker.addEventListener("error", onErr as any, { once: true });
       const transfers: Transferable[] = [args.tile.data.buffer];
       if (args.demTile?.data?.buffer && args.demTile.data.buffer !== args.tile.data.buffer) {
         transfers.push(args.demTile.data.buffer);

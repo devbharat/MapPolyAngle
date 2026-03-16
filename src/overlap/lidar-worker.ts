@@ -360,6 +360,48 @@ function intersectRayWithTileXYBounds(
   return { sEnter: Math.max(0, sEnter), sExit: Math.max(0, sExit) };
 }
 
+function clipSegmentParamToRect(
+  x1: number,
+  y1: number,
+  x2: number,
+  y2: number,
+  minX: number,
+  maxX: number,
+  minY: number,
+  maxY: number
+): { t0: number; t1: number } | null {
+  const dx = x2 - x1;
+  const dy = y2 - y1;
+  let t0 = 0;
+  let t1 = 1;
+  const EPS = 1e-9;
+
+  const clip = (p: number, q: number) => {
+    if (Math.abs(p) < EPS) return q >= 0;
+    const r = q / p;
+    if (p < 0) {
+      if (r > t1) return false;
+      if (r > t0) t0 = r;
+      return true;
+    }
+    if (r < t0) return false;
+    if (r < t1) t1 = r;
+    return true;
+  };
+
+  if (
+    !clip(-dx, x1 - minX) ||
+    !clip(dx, maxX - x1) ||
+    !clip(-dy, y1 - minY) ||
+    !clip(dy, maxY - y1)
+  ) {
+    return null;
+  }
+
+  if (!(t1 >= t0)) return null;
+  return { t0, t1 };
+}
+
 function intersectBeamWithDem(
   dem: Float32Array,
   demSize: number,
@@ -372,12 +414,14 @@ function intersectBeamWithDem(
   sx: number,
   sy: number,
   sz: number,
-  dir: [number, number, number],
+  dirX: number,
+  dirY: number,
+  dirZ: number,
   maxRangeM: number,
   stepM: number
 ) : { x: number; y: number; z: number } | null {
-  if (!(dir[2] < -1e-6)) return null;
-  const boundsHit = intersectRayWithTileXYBounds(sx, sy, dir[0], dir[1], demMinX, demMaxX, demMinY, demMaxY, maxRangeM);
+  if (!(dirZ < -1e-6)) return null;
+  const boundsHit = intersectRayWithTileXYBounds(sx, sy, dirX, dirY, demMinX, demMaxX, demMinY, demMaxY, maxRangeM);
   if (!boundsHit) return null;
 
   const startS = boundsHit.sEnter;
@@ -385,9 +429,9 @@ function intersectBeamWithDem(
   if (!(endS >= startS)) return null;
 
   const evalSignedHeight = (s: number): number => {
-    const x = sx + dir[0] * s;
-    const y = sy + dir[1] * s;
-    const z = sz + dir[2] * s;
+    const x = sx + dirX * s;
+    const y = sy + dirY * s;
+    const z = sz + dirZ * s;
     const terrainZ = sampleDemBilinear(dem, demSize, demMinX, demMaxYOrigin, pixelSize, x, y);
     if (!Number.isFinite(terrainZ)) return Number.NaN;
     return z - terrainZ;
@@ -401,7 +445,7 @@ function intersectBeamWithDem(
     // terrain hit happened in a neighboring tile. Returning a hit at the tile
     // edge creates artificial seams exactly on tile boundaries.
     if (startS > 1e-6) return null;
-    return { x: sx + dir[0] * prevS, y: sy + dir[1] * prevS, z: sz + dir[2] * prevS };
+    return { x: sx + dirX * prevS, y: sy + dirY * prevS, z: sz + dirZ * prevS };
   }
 
   for (let s = startS + stepM; s <= endS + 1e-6; s += stepM) {
@@ -428,9 +472,9 @@ function intersectBeamWithDem(
         }
       }
       const hitS = flo > 0 ? hi : lo;
-      const x = sx + dir[0] * hitS;
-      const y = sy + dir[1] * hitS;
-      const z = sz + dir[2] * hitS;
+      const x = sx + dirX * hitS;
+      const y = sy + dirY * hitS;
+      const z = sz + dirZ * hitS;
       return { x, y, z };
     }
     prevS = currS;
@@ -638,9 +682,6 @@ self.onmessage = (ev: MessageEvent<Msg>) => {
     if (!(speedMps > 0) || !(effectivePointRate > 0) || !(strip.len > 1e-6)) continue;
 
     const alongSpacingM = Math.max(speedMps / strip.frameRateHzResolved, pixSize * 0.75);
-    const sampleCount = Math.max(1, Math.ceil(strip.len / alongSpacingM));
-    const representedDistancePerSampleM = strip.len / sampleCount;
-    const pointsPerSample = effectivePointRate * (representedDistancePerSampleM / speedMps);
     const rawChannelAngles = strip.verticalAnglesDegResolved;
     const comparisonMode = strip.comparisonMode ?? 'first-return';
     const channelAngles = comparisonMode === 'first-return'
@@ -649,8 +690,27 @@ self.onmessage = (ev: MessageEvent<Msg>) => {
     if (channelAngles.length === 0) continue;
     const swathWidthM = Math.max(2, strip.halfWidthM * 2);
     const azimuthSampleCount = chooseAzimuthSampleCount(strip.mappingFovDegResolved, swathWidthM, pixSize);
-    const beamWeight = pointsPerSample / (rawChannelAngles.length * azimuthSampleCount);
-    if (!(beamWeight > 0)) continue;
+
+    let segmentStartT = 0;
+    let segmentEndT = 1;
+    if (Number.isFinite(strip.maxRangeMResolved)) {
+      const reachPadM = strip.maxRangeMResolved;
+      const clipped = clipSegmentParamToRect(
+        strip.x1s,
+        strip.y1s,
+        strip.x2s,
+        strip.y2s,
+        minX - reachPadM,
+        maxX + reachPadM,
+        minY - reachPadM,
+        maxY + reachPadM
+      );
+      if (!clipped) continue;
+      segmentStartT = clipped.t0;
+      segmentEndT = clipped.t1;
+    }
+    const activeLen = strip.len * (segmentEndT - segmentStartT);
+    if (!(activeLen > 1e-6)) continue;
 
     const alongAxis: [number, number, number] = [strip.ux, strip.uy, 0];
     const crossAxis: [number, number, number] = [-strip.uy, strip.ux, 0];
@@ -660,49 +720,86 @@ self.onmessage = (ev: MessageEvent<Msg>) => {
     const boresightPitchDeg = Number.isFinite(strip.boresightPitchDeg) ? strip.boresightPitchDeg! : 0;
     const boresightRollDeg = Number.isFinite(strip.boresightRollDeg) ? strip.boresightRollDeg! : 0;
     const passIndex = strip.passIndex ?? strip.index;
+    const downwardRangeFactor = new Float32Array(channelAngles.length);
+    const useChannelForFirstReturn = new Uint8Array(channelAngles.length);
+    for (let channelIndex = 0; channelIndex < channelAngles.length; channelIndex++) {
+      const downwardLookDeg = FIRST_RETURN_CHANNEL_TILT_DEG - channelAngles[channelIndex];
+      if (comparisonMode !== 'first-return') {
+        useChannelForFirstReturn[channelIndex] = 1;
+        continue;
+      }
+      if (!(downwardLookDeg > 0)) continue;
+      const downRad = (downwardLookDeg * Math.PI) / 180;
+      const factor = 1 / Math.sin(downRad);
+      if (!Number.isFinite(factor) || !(factor > 0)) continue;
+      downwardRangeFactor[channelIndex] = factor;
+      useChannelForFirstReturn[channelIndex] = 1;
+    }
+    const beamDirections = new Float32Array(azimuthSampleCount * channelAngles.length * 3);
+    for (let azimuthIndex = 0; azimuthIndex < azimuthSampleCount; azimuthIndex++) {
+      const azimuthFraction = azimuthSampleCount === 1 ? 0.5 : azimuthIndex / (azimuthSampleCount - 1);
+      const azimuthDeg = strip.azimuthSectorCenterDegResolved + (azimuthFraction - 0.5) * strip.mappingFovDegResolved;
+      for (let channelIndex = 0; channelIndex < channelAngles.length; channelIndex++) {
+        const dir = buildBeamDirection(
+          alongAxis,
+          crossAxis,
+          azimuthDeg,
+          channelAngles[channelIndex],
+          boresightYawDeg,
+          boresightPitchDeg,
+          boresightRollDeg
+        );
+        const dirBase = (azimuthIndex * channelAngles.length + channelIndex) * 3;
+        beamDirections[dirBase] = dir[0];
+        beamDirections[dirBase + 1] = dir[1];
+        beamDirections[dirBase + 2] = dir[2];
+      }
+    }
+
+    const sampleCount = Math.max(1, Math.ceil(activeLen / alongSpacingM));
+    const representedDistancePerSampleM = activeLen / sampleCount;
+    const pointsPerSampleAdjusted = effectivePointRate * (representedDistancePerSampleM / speedMps);
+    const beamWeightAdjusted = pointsPerSampleAdjusted / (rawChannelAngles.length * azimuthSampleCount);
+    if (!(beamWeightAdjusted > 0)) continue;
 
     for (let sampleIndex = 0; sampleIndex < sampleCount; sampleIndex++) {
-      const t = sampleCount === 1 ? 0.5 : (sampleIndex + 0.5) / sampleCount;
+      const tInActive = sampleCount === 1 ? 0.5 : (sampleIndex + 0.5) / sampleCount;
+      const t = segmentStartT + (segmentEndT - segmentStartT) * tInActive;
       const sx = strip.x1s + strip.dx * t;
       const sy = strip.y1s + strip.dy * t;
       const sz = z1 + (z2 - z1) * t;
-      const terrainUnderSensor = sampleDemBilinear(elev, demSize, demMinX, demMaxY, pixSize, sx, sy);
-      const localAltitudeAGL = Number.isFinite(terrainUnderSensor)
-        ? (sz - terrainUnderSensor)
-        : (Number.isFinite(strip.plannedAltitudeAGL) ? strip.plannedAltitudeAGL! : Number.NaN);
+      let localAltitudeAGL = Number.NaN;
+      if (comparisonMode === 'first-return') {
+        const terrainUnderSensor = sampleDemBilinear(elev, demSize, demMinX, demMaxY, pixSize, sx, sy);
+        localAltitudeAGL = Number.isFinite(terrainUnderSensor)
+          ? (sz - terrainUnderSensor)
+          : (Number.isFinite(strip.plannedAltitudeAGL) ? strip.plannedAltitudeAGL! : Number.NaN);
+      }
 
       for (let azimuthIndex = 0; azimuthIndex < azimuthSampleCount; azimuthIndex++) {
-        const azimuthFraction = azimuthSampleCount === 1 ? 0.5 : azimuthIndex / (azimuthSampleCount - 1);
-        const azimuthDeg = strip.azimuthSectorCenterDegResolved + (azimuthFraction - 0.5) * strip.mappingFovDegResolved;
-
         for (let channelIndex = 0; channelIndex < channelAngles.length; channelIndex++) {
-          const channelDeg = channelAngles[channelIndex];
           let channelWeight = 1;
-          if (comparisonMode === 'first-return' && Number.isFinite(localAltitudeAGL) && localAltitudeAGL > 0) {
-            const downwardLookDeg = FIRST_RETURN_CHANNEL_TILT_DEG - channelDeg;
-            if (!(downwardLookDeg > 0)) continue;
-            const downRad = (downwardLookDeg * Math.PI) / 180;
-            const expectedFlatRange = localAltitudeAGL / Math.sin(downRad);
-            if (!(expectedFlatRange < strip.maxRangeMResolved + FIRST_RETURN_RANGE_TAPER_M)) continue;
-            if (expectedFlatRange > strip.maxRangeMResolved) {
-              channelWeight = clamp(
-                1 - (expectedFlatRange - strip.maxRangeMResolved) / FIRST_RETURN_RANGE_TAPER_M,
-                0,
-                1
-              );
+          if (comparisonMode === 'first-return') {
+            if (!useChannelForFirstReturn[channelIndex]) continue;
+            if (Number.isFinite(localAltitudeAGL) && localAltitudeAGL > 0) {
+              const expectedFlatRange = localAltitudeAGL * downwardRangeFactor[channelIndex];
+              if (!Number.isFinite(expectedFlatRange)) continue;
+              if (!(expectedFlatRange < strip.maxRangeMResolved + FIRST_RETURN_RANGE_TAPER_M)) continue;
+              if (expectedFlatRange > strip.maxRangeMResolved) {
+                channelWeight = clamp(
+                  1 - (expectedFlatRange - strip.maxRangeMResolved) / FIRST_RETURN_RANGE_TAPER_M,
+                  0,
+                  1
+                );
+              }
             }
           }
 
-          const dir = buildBeamDirection(
-            alongAxis,
-            crossAxis,
-            azimuthDeg,
-            channelDeg,
-            boresightYawDeg,
-            boresightPitchDeg,
-            boresightRollDeg
-          );
-          if (!(dir[2] < -1e-4)) continue;
+          const dirBase = (azimuthIndex * channelAngles.length + channelIndex) * 3;
+          const dirX = beamDirections[dirBase];
+          const dirY = beamDirections[dirBase + 1];
+          const dirZ = beamDirections[dirBase + 2];
+          if (!(dirZ < -1e-4)) continue;
 
           const hit = intersectBeamWithDem(
             elev,
@@ -716,7 +813,9 @@ self.onmessage = (ev: MessageEvent<Msg>) => {
             sx,
             sy,
             sz,
-            dir,
+            dirX,
+            dirY,
+            dirZ,
             strip.maxRangeMResolved,
             stepM
           );
@@ -726,7 +825,7 @@ self.onmessage = (ev: MessageEvent<Msg>) => {
           if (!polyMask[hitPixel.idx]) continue;
 
           const areaM2 = pixelAreaByRow[hitPixel.row];
-          const densityContribution = areaM2 > 0 ? ((beamWeight * channelWeight) / areaM2) : 0;
+          const densityContribution = areaM2 > 0 ? ((beamWeightAdjusted * channelWeight) / areaM2) : 0;
           if (!(densityContribution > 0)) continue;
           density[hitPixel.idx] += densityContribution;
           if (density[hitPixel.idx] > maxDensity) maxDensity = density[hitPixel.idx];
