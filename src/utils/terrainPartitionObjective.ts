@@ -16,6 +16,7 @@ import {
   lidarDeliverableDensity,
   lidarLineSpacing,
   lidarSinglePassDensity,
+  lidarSwathWidth,
 } from "@/domain/lidar";
 import {
   destination as geoDestination,
@@ -40,6 +41,7 @@ export type TerrainGuidanceCell = {
   lat: number;
   x: number;
   y: number;
+  terrainZ: number;
   areaWeightM2: number;
   preferredBearingDeg: number;
   slopeMagnitude: number;
@@ -103,8 +105,27 @@ export type RegionQualityEstimate = {
   meanMismatchLoss: number;
   p90MismatchLoss: number;
   weightedBreakStrength: number;
+  lineLift: LineLiftSummary;
   normalizedQualityCost: number;
   summary: CameraQualitySummary | LidarQualitySummary;
+};
+
+export type LineLiftSummary = {
+  lineCount: number;
+  meanLineLiftM: number;
+  p90LineLiftM: number;
+  maxLineLiftM: number;
+  elevatedAreaFraction: number;
+  severeLiftAreaFraction: number;
+};
+
+export type SensorNodeCost = {
+  sensorKind: "camera" | "lidar";
+  qualityCost: number;
+  holeRisk: number;
+  lowCoverageRisk: number;
+  meanCoverageScore: number;
+  bearingPriorLoss: number;
 };
 
 export type RegionRegularizationEstimate = {
@@ -437,7 +458,8 @@ export function buildTerrainGuidanceField(
       const zw = queryElevationAtPoint(westLng, westLat, tiles as any);
       const zn = queryElevationAtPoint(northLng, northLat, tiles as any);
       const zs = queryElevationAtPoint(southLng, southLat, tiles as any);
-      if (![ze, zw, zn, zs].every(Number.isFinite)) continue;
+      const zc = queryElevationAtPoint(lng, lat, tiles as any);
+      if (![ze, zw, zn, zs, zc].every(Number.isFinite)) continue;
       const gradX = (ze - zw) / (2 * diffStepM);
       const gradY = (zn - zs) / (2 * diffStepM);
       const slopeMagnitude = Math.sqrt(gradX * gradX + gradY * gradY);
@@ -449,6 +471,7 @@ export function buildTerrainGuidanceField(
         lat,
         x,
         y,
+        terrainZ: zc,
         areaWeightM2: gridStepM * gridStepM,
         preferredBearingDeg,
         slopeMagnitude,
@@ -619,6 +642,70 @@ function estimateRegionFlightTime(
   };
 }
 
+function summarizeLineLift(
+  guidance: TerrainGuidanceField,
+  bearingDeg: number,
+  params: FlightParams,
+): LineLiftSummary {
+  const cells = guidance.cells.filter((cell) => Number.isFinite(cell.terrainZ));
+  if (cells.length === 0) {
+    return {
+      lineCount: 0,
+      meanLineLiftM: 0,
+      p90LineLiftM: 0,
+      maxLineLiftM: 0,
+      elevatedAreaFraction: 0,
+      severeLiftAreaFraction: 0,
+    };
+  }
+
+  const lineSpacingM = Math.max(1, lineSpacingForParams(params));
+  const centerX = weightedMean(cells.map((cell) => ({ value: cell.x, weight: cell.areaWeightM2 })));
+  const centerY = weightedMean(cells.map((cell) => ({ value: cell.y, weight: cell.areaWeightM2 })));
+  const perpRad = degToRad((bearingDeg + 90) % 360);
+  const px = Math.sin(perpRad);
+  const py = Math.cos(perpRad);
+  const supportByBin = new Map<number, number>();
+
+  for (const cell of cells) {
+    const crossTrackM = (cell.x - centerX) * px + (cell.y - centerY) * py;
+    const binIndex = Math.round(crossTrackM / lineSpacingM);
+    const current = supportByBin.get(binIndex);
+    if (current == null || cell.terrainZ > current) supportByBin.set(binIndex, cell.terrainZ);
+  }
+
+  const weightedLifts: Array<{ value: number; weight: number }> = [];
+  let totalArea = 0;
+  let elevatedArea = 0;
+  let severeArea = 0;
+  let maxLineLiftM = 0;
+  const elevatedThresholdM = Math.max(10, params.altitudeAGL * 0.12);
+  const severeThresholdM = Math.max(25, params.altitudeAGL * 0.28);
+
+  for (const cell of cells) {
+    const crossTrackM = (cell.x - centerX) * px + (cell.y - centerY) * py;
+    const binIndex = Math.round(crossTrackM / lineSpacingM);
+    const supportTerrainZ = supportByBin.get(binIndex);
+    if (!Number.isFinite(supportTerrainZ)) continue;
+    const lineLiftM = Math.max(0, supportTerrainZ! - cell.terrainZ);
+    const weight = Math.max(1e-6, cell.areaWeightM2 * (0.35 + 0.65 * cell.confidence));
+    weightedLifts.push({ value: lineLiftM, weight });
+    totalArea += cell.areaWeightM2;
+    if (lineLiftM >= elevatedThresholdM) elevatedArea += cell.areaWeightM2;
+    if (lineLiftM >= severeThresholdM) severeArea += cell.areaWeightM2;
+    maxLineLiftM = Math.max(maxLineLiftM, lineLiftM);
+  }
+
+  return {
+    lineCount: supportByBin.size,
+    meanLineLiftM: weightedMean(weightedLifts),
+    p90LineLiftM: weightedQuantile(weightedLifts, 0.9),
+    maxLineLiftM,
+    elevatedAreaFraction: totalArea > 0 ? elevatedArea / totalArea : 0,
+    severeLiftAreaFraction: totalArea > 0 ? severeArea / totalArea : 0,
+  };
+}
+
 function evaluateRegularization(
   ring: Ring,
   areaM2: number,
@@ -700,12 +787,15 @@ function evaluateQuality(
   const meanMismatchLoss = weightedMean(weightedMismatches.map((item) => ({ value: item.mismatchLoss, weight: item.metricWeight })));
   const p90MismatchLoss = weightedQuantile(weightedMismatches.map((item) => ({ value: item.mismatchLoss, weight: item.metricWeight })), 0.9);
   const weightedBreakStrength = weightedMean(weightedMismatches.map((item) => ({ value: item.cell.breakStrength, weight: item.areaWeight })));
+  const lineLift = summarizeLineLift(guidance, bearingDeg, params);
 
   const meanReliefRatio = flightTime.meanTerrainReliefM / Math.max(1, params.altitudeAGL);
   const p90ReliefRatio = flightTime.p90TerrainReliefM / Math.max(1, params.altitudeAGL);
   const maxReliefRatio = flightTime.maxTerrainReliefM / Math.max(1, params.altitudeAGL);
+  const meanLineLiftRatio = lineLift.meanLineLiftM / Math.max(1, params.altitudeAGL);
+  const p90LineLiftRatio = lineLift.p90LineLiftM / Math.max(1, params.altitudeAGL);
 
-  const underTargetAreaFraction = weightedMismatches
+  const baseUnderTargetAreaFraction = weightedMismatches
     .filter((item) => item.mismatchLoss > 0.35)
     .reduce((sum, item) => sum + item.areaWeight, 0) /
     Math.max(1, weightedMismatches.reduce((sum, item) => sum + item.areaWeight, 0));
@@ -720,17 +810,43 @@ function evaluateQuality(
     const nominalSinglePassDensityPtsM2 = lidarSinglePassDensity(model, params.altitudeAGL, speedMps, returnMode, mappingFovDeg);
     const meanDensityFactor = clamp(1 - 1.15 * meanMismatchLoss - 0.45 * meanReliefRatio, 0, 1.25);
     const p10DensityFactor = clamp(1 - 1.65 * p90MismatchLoss - 0.65 * maxReliefRatio, 0, 1.15);
-    const meanPredictedDensityPtsM2 = targetDensityPtsM2 * meanDensityFactor;
-    const p10PredictedDensityPtsM2 = targetDensityPtsM2 * p10DensityFactor;
-    const holeAreaFraction = weightedMismatches
+    const meanLineLiftDensityFactor = 1 / ((1 + meanLineLiftRatio) ** 1.7);
+    const p10LineLiftDensityFactor = 1 / ((1 + p90LineLiftRatio) ** 2.1);
+    const meanPredictedDensityPtsM2 = targetDensityPtsM2 * meanDensityFactor * meanLineLiftDensityFactor;
+    const p10PredictedDensityPtsM2 = targetDensityPtsM2 * p10DensityFactor * p10LineLiftDensityFactor;
+    const baseHoleAreaFraction = weightedMismatches
       .filter((item) => 1 - 1.9 * item.mismatchLoss - 0.75 * maxReliefRatio < 0.1)
       .reduce((sum, item) => sum + item.areaWeight, 0) /
       Math.max(1, weightedMismatches.reduce((sum, item) => sum + item.areaWeight, 0));
+    const halfSwathWidthM = lidarSwathWidth(params.altitudeAGL, mappingFovDeg) * 0.5;
+    const maxRangeM = params.maxLidarRangeM ?? model.defaultMaxRangeM ?? DEFAULT_LIDAR.defaultMaxRangeM;
+    const liftedP90SlantRangeM = Math.sqrt(
+      (params.altitudeAGL + lineLift.p90LineLiftM) ** 2 + halfSwathWidthM ** 2,
+    );
+    const liftedMaxSlantRangeM = Math.sqrt(
+      (params.altitudeAGL + lineLift.maxLineLiftM) ** 2 + halfSwathWidthM ** 2,
+    );
+    const p90RangeOvershoot = Math.max(0, liftedP90SlantRangeM / Math.max(1, maxRangeM) - 1);
+    const maxRangeOvershoot = Math.max(0, liftedMaxSlantRangeM / Math.max(1, maxRangeM) - 1);
+    const lineLiftHoleFraction = clamp(
+      lineLift.elevatedAreaFraction * (0.25 + 1.2 * p90RangeOvershoot) +
+        lineLift.severeLiftAreaFraction * (0.8 + 2.4 * maxRangeOvershoot),
+      0,
+      1,
+    );
+    const holeAreaFraction = clamp(baseHoleAreaFraction + lineLiftHoleFraction, 0, 1);
+    const underTargetAreaFraction = clamp(
+      Math.max(baseUnderTargetAreaFraction, baseUnderTargetAreaFraction * 0.75 + lineLift.elevatedAreaFraction * 0.85),
+      0,
+      1,
+    );
     const normalizedQualityCost =
       Math.max(0, 1 - meanPredictedDensityPtsM2 / Math.max(1e-6, targetDensityPtsM2)) +
       1.6 * Math.max(0, 1 - p10PredictedDensityPtsM2 / Math.max(1e-6, targetDensityPtsM2)) +
       1.3 * holeAreaFraction +
-      0.9 * underTargetAreaFraction;
+      0.9 * underTargetAreaFraction +
+      0.55 * lineLift.elevatedAreaFraction +
+      1.1 * lineLift.severeLiftAreaFraction;
 
     return {
       meanDirectionMismatchDeg,
@@ -738,6 +854,7 @@ function evaluateQuality(
       meanMismatchLoss,
       p90MismatchLoss,
       weightedBreakStrength,
+      lineLift,
       normalizedQualityCost,
       summary: {
         sensorKind: "lidar",
@@ -753,12 +870,19 @@ function evaluateQuality(
 
   const camera = params.cameraKey ? CAMERA_REGISTRY[params.cameraKey] || SONY_RX1R2 : SONY_RX1R2;
   const targetGsdM = calculateGSD(camera, params.altitudeAGL);
-  const meanPredictedGsdM = targetGsdM * (1 + 1.5 * meanMismatchLoss + 0.55 * meanReliefRatio);
-  const p90PredictedGsdM = targetGsdM * (1 + 2.1 * p90MismatchLoss + 0.85 * p90ReliefRatio);
+  const meanPredictedGsdM = targetGsdM * (1 + 1.5 * meanMismatchLoss + 0.55 * meanReliefRatio + 0.95 * meanLineLiftRatio);
+  const p90PredictedGsdM = targetGsdM * (1 + 2.1 * p90MismatchLoss + 0.85 * p90ReliefRatio + 1.35 * p90LineLiftRatio);
+  const underTargetAreaFraction = clamp(
+    baseUnderTargetAreaFraction + 0.45 * lineLift.elevatedAreaFraction + 0.85 * lineLift.severeLiftAreaFraction,
+    0,
+    1,
+  );
   const normalizedQualityCost =
     Math.max(0, meanPredictedGsdM / Math.max(1e-6, targetGsdM) - 1) +
     1.4 * Math.max(0, p90PredictedGsdM / Math.max(1e-6, targetGsdM) - 1) +
     1.1 * underTargetAreaFraction +
+    0.4 * lineLift.elevatedAreaFraction +
+    0.8 * lineLift.severeLiftAreaFraction +
     0.4 * flightTime.shortLineFraction;
 
   return {
@@ -767,6 +891,7 @@ function evaluateQuality(
     meanMismatchLoss,
     p90MismatchLoss,
     weightedBreakStrength,
+    lineLift,
     normalizedQualityCost,
     summary: {
       sensorKind: "camera",
@@ -775,6 +900,112 @@ function evaluateQuality(
       p90PredictedGsdM,
       underTargetAreaFraction,
     },
+  };
+}
+
+export function evaluateSensorNodeCostForCells(
+  cells: TerrainGuidanceCell[],
+  bearingDeg: number,
+  params: FlightParams,
+): SensorNodeCost {
+  const weightedCells = cells.map((cell) => {
+    const deltaDeg = axialAngleDeltaDeg(cell.preferredBearingDeg, bearingDeg);
+    const mismatchLoss = Math.sin(degToRad(deltaDeg)) ** 2 * (0.35 + 0.65 * cell.confidence);
+    const weight = Math.max(1e-6, cell.areaWeightM2 * (0.25 + 0.75 * cell.confidence));
+    const crossSlopeFactor = clamp(
+      Math.abs(Math.sin(degToRad(deltaDeg))) * (cell.slopeMagnitude / 0.12),
+      0,
+      1.8,
+    );
+    return {
+      cell,
+      deltaDeg,
+      mismatchLoss,
+      crossSlopeFactor,
+      weight,
+    };
+  });
+  const totalWeight = Math.max(1e-6, weightedCells.reduce((sum, item) => sum + item.weight, 0));
+  const meanBearingPriorLoss = weightedMean(weightedCells.map((item) => ({ value: item.mismatchLoss, weight: item.weight })));
+
+  if ((params.payloadKind ?? "camera") === "lidar") {
+    const model = getLidarModel(params.lidarKey);
+    const mappingFovDeg = getLidarMappingFovDeg(model, params.mappingFovDeg);
+    const speedMps = params.speedMps ?? model.defaultSpeedMps;
+    const returnMode = params.lidarReturnMode ?? "single";
+    const targetDensityPtsM2 = params.pointDensityPtsM2
+      ?? lidarDeliverableDensity(model, params.altitudeAGL, params.sideOverlap, speedMps, returnMode, mappingFovDeg);
+    const maxRangeM = params.maxLidarRangeM ?? model.defaultMaxRangeM ?? DEFAULT_LIDAR.defaultMaxRangeM;
+    const halfSwathWidthM = lidarSwathWidth(params.altitudeAGL, mappingFovDeg) * 0.5;
+    const baseSlantRangeM = Math.sqrt(params.altitudeAGL * params.altitudeAGL + halfSwathWidthM * halfSwathWidthM);
+
+    const localDensityFactors = weightedCells.map((item) => {
+      const terrainLiftFactor = item.crossSlopeFactor * (0.55 + 0.45 * item.cell.confidence);
+      const inducedAltitudeM = params.altitudeAGL * (1 + 0.65 * terrainLiftFactor);
+      const slantRangeM = Math.sqrt(inducedAltitudeM * inducedAltitudeM + halfSwathWidthM * halfSwathWidthM);
+      const rangeOvershoot = Math.max(0, slantRangeM / Math.max(1, maxRangeM) - 1);
+      const holeRisk = clamp(
+        rangeOvershoot * 2.8 +
+          Math.max(0, item.mismatchLoss + 0.45 * terrainLiftFactor - 1.02),
+        0,
+        1,
+      );
+      const localDensityFactor = clamp(
+        1 - 1.05 * item.mismatchLoss - 0.42 * terrainLiftFactor - 1.6 * rangeOvershoot,
+        0,
+        1.15,
+      );
+      return {
+        value: localDensityFactor,
+        holeRisk,
+        weight: item.weight,
+      };
+    });
+
+    const meanDensityFactor = weightedMean(localDensityFactors.map((item) => ({ value: item.value, weight: item.weight })));
+    const q10DensityFactor = weightedQuantile(localDensityFactors.map((item) => ({ value: item.value, weight: item.weight })), 0.1);
+    const holeRisk = localDensityFactors.reduce((sum, item) => sum + item.holeRisk * item.weight, 0) / totalWeight;
+    const lowCoverageRisk = localDensityFactors
+      .filter((item) => item.value < 0.7 || item.holeRisk > 0.35)
+      .reduce((sum, item) => sum + item.weight, 0) / totalWeight;
+    const meanDensityDeficit = Math.max(0, 1 - meanDensityFactor);
+    const q10DensityDeficit = Math.max(0, 1 - q10DensityFactor);
+
+    return {
+      sensorKind: "lidar",
+      qualityCost:
+        0.85 * meanDensityDeficit +
+        1.95 * q10DensityDeficit +
+        4.1 * holeRisk +
+        2.15 * lowCoverageRisk +
+        0.35 * meanBearingPriorLoss,
+      holeRisk,
+      lowCoverageRisk,
+      meanCoverageScore: meanDensityFactor * targetDensityPtsM2,
+      bearingPriorLoss: meanBearingPriorLoss,
+    };
+  }
+
+  const meanMismatchLoss = meanBearingPriorLoss;
+  const p90MismatchLoss = weightedQuantile(weightedCells.map((item) => ({ value: item.mismatchLoss, weight: item.weight })), 0.9);
+  const meanCrossSlope = weightedMean(weightedCells.map((item) => ({ value: item.crossSlopeFactor, weight: item.weight })));
+  const meanGsdFactor = 1 + 1.35 * meanMismatchLoss + 0.35 * meanCrossSlope;
+  const p90GsdFactor = 1 + 1.85 * p90MismatchLoss + 0.55 * meanCrossSlope;
+  const underlapRisk = weightedCells
+    .filter((item) => item.mismatchLoss > 0.32 || item.crossSlopeFactor > 1.1)
+    .reduce((sum, item) => sum + item.weight, 0) / totalWeight;
+
+  return {
+    sensorKind: "camera",
+    qualityCost:
+      Math.max(0, meanGsdFactor - 1) +
+      1.35 * Math.max(0, p90GsdFactor - 1) +
+      1.05 * underlapRisk +
+      0.3 * meanMismatchLoss,
+    holeRisk: 0,
+    lowCoverageRisk: underlapRisk,
+    meanCoverageScore: 1 / Math.max(1e-6, meanGsdFactor),
+    bearingPriorLoss: meanMismatchLoss,
   };
 }
 

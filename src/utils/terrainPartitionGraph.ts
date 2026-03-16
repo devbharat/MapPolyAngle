@@ -2,9 +2,11 @@ import type { FlightParams, TerrainTile } from "@/domain/types";
 import {
   buildTerrainGuidanceField,
   combinePartitionObjectives,
+  evaluateSensorNodeCostForCells,
   findBestRegionOrientation,
   type PartitionObjective,
   type RegionOrientationObjective,
+  type SensorNodeCost,
   type TerrainGuidanceCell,
   type TerrainGuidanceField,
   type TerrainPartitionTradeoffOptions,
@@ -1114,6 +1116,8 @@ type RegionAdjacencyStats = {
   meanBearingDeltaDeg: number;
 };
 
+type AtomBearingCostTable = Map<string, Map<number, SensorNodeCost>>;
+
 type PartitionEvaluation = {
   regions: InternalRegion[];
   assignments: Map<string, string>;
@@ -1642,15 +1646,122 @@ function buildBreakHotspotSeedSequence(
   return chosen;
 }
 
+function bestBearingForAtom(
+  atomId: string,
+  candidateBearings: number[],
+  bearingCostTable: AtomBearingCostTable,
+) {
+  const byBearing = bearingCostTable.get(atomId);
+  let bestBearing = candidateBearings[0] ?? 0;
+  let bestCost = Number.POSITIVE_INFINITY;
+  if (!byBearing) return { bearingDeg: bestBearing, qualityCost: bestCost, holeRisk: 0, lowCoverageRisk: 0 };
+  for (const bearingDeg of candidateBearings) {
+    const cost = byBearing.get(bearingDeg);
+    if (!cost) continue;
+    if (cost.qualityCost < bestCost) {
+      bestCost = cost.qualityCost;
+      bestBearing = bearingDeg;
+    }
+  }
+  const bestNode = byBearing.get(bestBearing);
+  return {
+    bearingDeg: bestBearing,
+    qualityCost: bestNode?.qualityCost ?? bestCost,
+    holeRisk: bestNode?.holeRisk ?? 0,
+    lowCoverageRisk: bestNode?.lowCoverageRisk ?? 0,
+  };
+}
+
+function buildLidarHotspotSeedSequence(
+  graph: TerrainAtomGraph,
+  atomMap: Map<string, TerrainAtom>,
+  candidateBearings: number[],
+  bearingCostTable: AtomBearingCostTable,
+  params: FlightParams,
+  parentBearingDeg: number,
+  options: Required<TerrainAtomizationOptions>,
+) {
+  if ((params.payloadKind ?? "camera") !== "lidar") return [] as RegionSeed[];
+
+  const maxSeedCount = Math.min(8, options.maxHierarchyRegions, graph.atoms.length);
+  const totalAreaM2 = Math.max(1, graph.guidance.areaM2);
+  const polygonScaleM = Math.max(1, Math.sqrt(totalAreaM2));
+  const minSeedDistanceM = Math.max(graph.guidance.gridStepM * 1.25, polygonScaleM * 0.11);
+  const parentBearingBucket = nearestBearingBucket(parentBearingDeg, candidateBearings);
+
+  const ranked = graph.atoms
+    .map((atom) => {
+      const current = bearingCostTable.get(atom.id)?.get(parentBearingBucket);
+      const best = bestBearingForAtom(atom.id, candidateBearings, bearingCostTable);
+      const improvement = current ? Math.max(0, current.qualityCost - best.qualityCost) : 0;
+      const hotspotSeverity =
+        (current?.holeRisk ?? 0) * 4.6 +
+        (current?.lowCoverageRisk ?? 0) * 2.1 +
+        improvement * 1.4 +
+        Math.max(0, axialAngleDeltaDeg(parentBearingDeg, best.bearingDeg) - 12) / 26;
+      const weight = Math.sqrt(Math.max(1, atom.areaM2)) * (0.35 + 0.65 * atom.meanConfidence);
+      return {
+        atom,
+        bestBearingDeg: best.bearingDeg,
+        hotspotSeverity,
+        score: hotspotSeverity * weight,
+      };
+    })
+    .filter((item) => item.hotspotSeverity > 0.2)
+    .sort((a, b) => b.score - a.score);
+
+  const chosen: RegionSeed[] = [];
+  for (const item of ranked) {
+    if (chosen.length >= maxSeedCount) break;
+    const farEnough = chosen.every((seed) => (
+      distanceMetersBetweenLngLat(seed.centroidLngLat, item.atom.centroidLngLat) >= minSeedDistanceM ||
+      axialAngleDeltaDeg(seed.angleDeg, item.bestBearingDeg) >= Math.max(14, options.minModeSeparationDeg * 0.8)
+    ));
+    if (!farEnough) continue;
+    chosen.push({
+      regionId: `seed-${chosen.length + 1}`,
+      atomId: item.atom.id,
+      angleDeg: item.bestBearingDeg,
+      centroidLngLat: item.atom.centroidLngLat,
+    });
+  }
+
+  if (chosen.length < 2) return [];
+
+  const baseSequence = buildSeedSequence(graph, atomMap, options);
+  for (const seed of baseSequence) {
+    if (chosen.length >= maxSeedCount) break;
+    if (chosen.some((existing) => existing.atomId === seed.atomId)) continue;
+    const farEnough = chosen.every((existing) => (
+      distanceMetersBetweenLngLat(existing.centroidLngLat, seed.centroidLngLat) >= minSeedDistanceM ||
+      axialAngleDeltaDeg(existing.angleDeg, seed.angleDeg) >= Math.max(12, options.minModeSeparationDeg * 0.7)
+    ));
+    if (!farEnough) continue;
+    chosen.push({
+      regionId: `seed-${chosen.length + 1}`,
+      atomId: seed.atomId,
+      angleDeg: seed.angleDeg,
+      centroidLngLat: seed.centroidLngLat,
+    });
+  }
+
+  return chosen;
+}
+
 function buildSeedVariants(
   graph: TerrainAtomGraph,
   atomMap: Map<string, TerrainAtom>,
+  candidateBearings: number[],
+  bearingCostTable: AtomBearingCostTable,
+  params: FlightParams,
+  parentBearingDeg: number,
   options: Required<TerrainAtomizationOptions>,
 ) {
   const candidates = [
     buildSeedSequence(graph, atomMap, options),
     buildSpatialSeedSequence(graph, options),
     buildBreakHotspotSeedSequence(graph, options),
+    buildLidarHotspotSeedSequence(graph, atomMap, candidateBearings, bearingCostTable, params, parentBearingDeg, options),
   ]
     .filter((variant) => variant.length >= 2);
   const unique = new Map<string, RegionSeed[]>();
@@ -1686,26 +1797,111 @@ function buildRegionStates(
   return states;
 }
 
-function localBoundaryPenalty(
+function nearestBearingBucket(bearingDeg: number, candidateBearings: number[]) {
+  let best = candidateBearings[0] ?? normalizedAxialBearing(bearingDeg);
+  let bestDelta = axialAngleDeltaDeg(best, bearingDeg);
+  for (const candidate of candidateBearings) {
+    const delta = axialAngleDeltaDeg(candidate, bearingDeg);
+    if (delta < bestDelta) {
+      bestDelta = delta;
+      best = candidate;
+    }
+  }
+  return best;
+}
+
+function buildAtomBearingCostTable(
+  graph: TerrainAtomGraph,
+  atomMap: Map<string, TerrainAtom>,
+  candidateBearings: number[],
+  params: FlightParams,
+) {
+  const table: AtomBearingCostTable = new Map();
+  for (const atom of graph.atoms) {
+    const cells = atom.cellIndices
+      .map((cellIndex) => graph.guidance.cells[cellIndex])
+      .filter((cell): cell is TerrainGuidanceCell => cell != null);
+    const byBearing = new Map<number, SensorNodeCost>();
+    for (const bearingDeg of candidateBearings) {
+      byBearing.set(bearingDeg, evaluateSensorNodeCostForCells(cells, bearingDeg, params));
+    }
+    table.set(atom.id, byBearing);
+  }
+  return table;
+}
+
+function computeEdgeSmoothnessCost(
+  edge: Pick<TerrainAtomAdjacency, "meanBearingDeltaDeg" | "meanBreakBarrier">,
+  leftBearingDeg: number,
+  rightBearingDeg: number,
+) {
+  const atomContinuity = 1 - clamp(edge.meanBearingDeltaDeg / 55, 0, 1);
+  const breakContinuity = 1 - clamp(edge.meanBreakBarrier / 18, 0, 1);
+  const regionBearingDeltaDeg = axialAngleDeltaDeg(leftBearingDeg, rightBearingDeg);
+  const regionCutDiscount = 1 - 0.55 * clamp(regionBearingDeltaDeg / 60, 0, 1);
+  return clamp(
+    (0.18 + 0.82 * (0.68 * atomContinuity + 0.32 * breakContinuity)) * regionCutDiscount,
+    0.04,
+    1.05,
+  );
+}
+
+function computeCutEdgeCost(
+  edge: Pick<TerrainAtomAdjacency, "sharedBoundaryM" | "meanBearingDeltaDeg" | "meanBreakBarrier">,
+  leftBearingDeg: number,
+  rightBearingDeg: number,
+  polygonScaleM: number,
+) {
+  const normalizedBoundary = edge.sharedBoundaryM / Math.max(1, polygonScaleM);
+  return normalizedBoundary * computeEdgeSmoothnessCost(edge, leftBearingDeg, rightBearingDeg);
+}
+
+function computeAtomNodeCost(
+  atom: TerrainAtom,
+  region: RegionState,
+  polygonScaleM: number,
+  totalAreaM2: number,
+  candidateBearings: number[],
+  bearingCostTable: AtomBearingCostTable | null,
+) {
+  const bearingBucket = nearestBearingBucket(region.bearingDeg, candidateBearings);
+  const sensorCost = bearingCostTable?.get(atom.id)?.get(bearingBucket) ?? null;
+  const fitWeight = 0.42 + 0.38 * atom.meanConfidence + Math.min(0.35, atom.internalDispersionDeg / 70);
+  const fitCost = sensorCost
+    ? sensorCost.qualityCost + 0.15 * sensorCost.bearingPriorLoss
+    : fitWeight * axialModeCost(atom.dominantBearingDeg, region.bearingDeg) / 24;
+  const distanceCost = distanceMetersBetweenLngLat(atom.centroidLngLat, region.centroidLngLat) / Math.max(1, polygonScaleM) * 0.22;
+  const balanceCost = Math.max(0, region.areaM2 / Math.max(1, totalAreaM2) - 0.45) * 0.16;
+  return fitCost + distanceCost + balanceCost;
+}
+
+function computeLocalCutEnergy(
   atomId: string,
   targetRegionId: string,
   assignments: Map<string, string>,
+  regionStates: Map<string, RegionState>,
   adjacencyLookup: Map<string, TerrainAtomAdjacency[]>,
+  atomMap: Map<string, TerrainAtom>,
   polygonScaleM: number,
 ) {
   let penalty = 0;
+  const targetBearing = regionStates.get(targetRegionId)?.bearingDeg
+    ?? atomMap.get(atomId)?.dominantBearingDeg
+    ?? 0;
   for (const edge of adjacencyLookup.get(atomId) ?? []) {
     const neighborId = edge.atomA === atomId ? edge.atomB : edge.atomA;
     const neighborRegionId = assignments.get(neighborId);
     if (!neighborRegionId) continue;
     if (neighborRegionId === targetRegionId) continue;
-    const normalizedBoundary = edge.sharedBoundaryM / Math.max(1, polygonScaleM);
-    const smoothPenalty = clamp(
-      0.7 - 0.03 * edge.meanBreakBarrier + 0.007 * edge.meanBearingDeltaDeg,
-      0.04,
-      0.9,
+    const neighborBearing = regionStates.get(neighborRegionId)?.bearingDeg
+      ?? atomMap.get(neighborId)?.dominantBearingDeg
+      ?? targetBearing;
+    penalty += computeCutEdgeCost(
+      edge,
+      targetBearing,
+      neighborBearing,
+      polygonScaleM,
     );
-    penalty += normalizedBoundary * smoothPenalty;
   }
   return penalty;
 }
@@ -1719,14 +1915,22 @@ function atomAssignmentCost(
   atomMap: Map<string, TerrainAtom>,
   polygonScaleM: number,
   totalAreaM2: number,
+  candidateBearings: number[],
+  bearingCostTable: AtomBearingCostTable | null,
 ) {
   const atom = atomMap.get(atomId)!;
   const region = regionStates.get(targetRegionId)!;
-  const fitCost = axialModeCost(atom.dominantBearingDeg, region.bearingDeg) / 24;
-  const distanceCost = distanceMetersBetweenLngLat(atom.centroidLngLat, region.centroidLngLat) / Math.max(1, polygonScaleM) * 0.3;
-  const balanceCost = Math.max(0, region.areaM2 / Math.max(1, totalAreaM2) - 0.45) * 0.16;
-  const boundaryPenalty = localBoundaryPenalty(atomId, targetRegionId, assignments, adjacencyLookup, polygonScaleM);
-  return fitCost + distanceCost + balanceCost + boundaryPenalty;
+  const nodeCost = computeAtomNodeCost(atom, region, polygonScaleM, totalAreaM2, candidateBearings, bearingCostTable);
+  const cutEnergy = computeLocalCutEnergy(
+    atomId,
+    targetRegionId,
+    assignments,
+    regionStates,
+    adjacencyLookup,
+    atomMap,
+    polygonScaleM,
+  );
+  return nodeCost + cutEnergy;
 }
 
 function pickBestNeighborRegion(
@@ -1738,6 +1942,8 @@ function pickBestNeighborRegion(
   atomMap: Map<string, TerrainAtom>,
   polygonScaleM: number,
   totalAreaM2: number,
+  candidateBearings: number[],
+  bearingCostTable: AtomBearingCostTable | null,
 ) {
   const neighborCandidates = new Set<string>();
   for (const atomId of fragmentAtomIds) {
@@ -1750,7 +1956,18 @@ function pickBestNeighborRegion(
   let best: { regionId: string; cost: number } | null = null;
   for (const regionId of neighborCandidates) {
     const cost = mean(fragmentAtomIds.map((atomId) => (
-      atomAssignmentCost(atomId, regionId, assignments, regionStates, adjacencyLookup, atomMap, polygonScaleM, totalAreaM2)
+      atomAssignmentCost(
+        atomId,
+        regionId,
+        assignments,
+        regionStates,
+        adjacencyLookup,
+        atomMap,
+        polygonScaleM,
+        totalAreaM2,
+        candidateBearings,
+        bearingCostTable,
+      )
     )));
     if (!best || cost < best.cost) best = { regionId, cost };
   }
@@ -1765,6 +1982,8 @@ function repairDisconnectedAssignments(
   seedAngles: Map<string, number>,
   polygonScaleM: number,
   totalAreaM2: number,
+  candidateBearings: number[],
+  bearingCostTable: AtomBearingCostTable | null,
 ) {
   const next = new Map(assignments);
   for (let iteration = 0; iteration < 4; iteration++) {
@@ -1786,6 +2005,8 @@ function repairDisconnectedAssignments(
           atomMap,
           polygonScaleM,
           totalAreaM2,
+          candidateBearings,
+          bearingCostTable,
         );
         if (!targetRegionId) continue;
         for (const atomId of fragment) next.set(atomId, targetRegionId);
@@ -1806,6 +2027,8 @@ function mergeTinyRegions(
   polygonScaleM: number,
   totalAreaM2: number,
   minAreaM2: number,
+  candidateBearings: number[],
+  bearingCostTable: AtomBearingCostTable | null,
 ) {
   const next = new Map(assignments);
   for (let iteration = 0; iteration < 4; iteration++) {
@@ -1828,6 +2051,8 @@ function mergeTinyRegions(
         atomMap,
         polygonScaleM,
         totalAreaM2,
+        candidateBearings,
+        bearingCostTable,
       );
       if (!targetRegionId) continue;
       for (const atomId of state.atomIds) next.set(atomId, targetRegionId);
@@ -1922,6 +2147,7 @@ function evaluatePartitionRegions(
   const partition = combinePartitionObjectives(regions.map((region) => region.objective), options);
   const totalAreaM2 = Math.max(1, regions.reduce((sum, region) => sum + region.objective.regularization.areaM2, 0));
   const regionAdjacency = buildRegionAdjacency(assignments, adjacencyLookup);
+  const regionBearingMap = new Map(regions.map((region) => [region.regionId, region.objective.bearingDeg]));
   const internalBoundaryM = regionAdjacency.reduce((sum, edge) => sum + edge.sharedBoundaryM, 0);
   const weightedBreakBarrier = regionAdjacency.reduce((sum, edge) => sum + edge.meanBreakBarrier * edge.sharedBoundaryM, 0);
   const boundaryBreakAlignment = internalBoundaryM > 0
@@ -1958,8 +2184,13 @@ function evaluatePartitionRegions(
       shortLinePenalty
     );
   }, 0);
-  const boundaryPenalty =
-    0.08 * (internalBoundaryM / Math.max(1, Math.sqrt(totalAreaM2))) * (1.15 - 0.65 * boundaryBreakAlignment);
+  const polygonScaleM = Math.max(1, Math.sqrt(totalAreaM2));
+  const boundaryPenalty = regionAdjacency.reduce((sum, edge) => {
+    const leftBearing = regionBearingMap.get(edge.regionA);
+    const rightBearing = regionBearingMap.get(edge.regionB);
+    if (!Number.isFinite(leftBearing) || !Number.isFinite(rightBearing)) return sum;
+    return sum + 0.42 * computeCutEdgeCost(edge, leftBearing!, rightBearing!, polygonScaleM);
+  }, 0);
   const regionCountPenalty = Math.max(0, regions.length - 1) * 0.03;
   const dominancePenalty = Math.max(0, largestRegionFraction - 0.7) * 2.4;
   const totalScore = partition.totalCost + boundaryPenalty + shapePenalty + regionCountPenalty + dominancePenalty;
@@ -2052,6 +2283,8 @@ function segmentAtomsIntoRegions(
   atomMap: Map<string, TerrainAtom>,
   adjacencyLookup: Map<string, TerrainAtomAdjacency[]>,
   seedAtoms: RegionSeed[],
+  candidateBearings: number[],
+  bearingCostTable: AtomBearingCostTable | null,
   options: Required<TerrainAtomizationOptions>,
 ) {
   const regionIds = seedAtoms.map((seed) => seed.regionId);
@@ -2083,6 +2316,8 @@ function segmentAtomsIntoRegions(
         atomMap,
         polygonScaleM,
         totalAreaM2,
+        candidateBearings,
+        bearingCostTable,
       );
       for (const regionId of regionIds) {
         if (regionId === currentRegionId || !regionStates.has(regionId)) continue;
@@ -2095,6 +2330,8 @@ function segmentAtomsIntoRegions(
           atomMap,
           polygonScaleM,
           totalAreaM2,
+          candidateBearings,
+          bearingCostTable,
         );
         if (score + 1e-6 < bestCost) {
           bestCost = score;
@@ -2115,6 +2352,8 @@ function segmentAtomsIntoRegions(
       seedAngles,
       polygonScaleM,
       totalAreaM2,
+      candidateBearings,
+      bearingCostTable,
     );
     assignments = mergeTinyRegions(
       assignments,
@@ -2125,6 +2364,8 @@ function segmentAtomsIntoRegions(
       polygonScaleM,
       totalAreaM2,
       options.minAreaM2,
+      candidateBearings,
+      bearingCostTable,
     );
     regionStates = buildRegionStates(assignments, regionIds, atomMap, seedAngles);
     if (regionStates.size < 2) return null;
@@ -2145,7 +2386,22 @@ function buildFineSegmentation(
 ): FineSegmentationResult | null {
   const atomMap = buildAtomMap(graph);
   const adjacencyLookup = buildAdjacencyLookup(graph.adjacency);
-  const seedVariants = buildSeedVariants(graph, atomMap, options);
+  const bearingCostTable = buildAtomBearingCostTable(graph, atomMap, candidateBearings, params);
+  const parentObjective = bestObjectiveForRing(ring, tiles, params, candidateBearings, options);
+  const parentBearingDeg =
+    parentObjective?.bearingDeg ??
+    graph.guidance.dominantPreferredBearingDeg ??
+    candidateBearings[0] ??
+    0;
+  const seedVariants = buildSeedVariants(
+    graph,
+    atomMap,
+    candidateBearings,
+    bearingCostTable,
+    params,
+    parentBearingDeg,
+    options,
+  );
   if (seedVariants.length === 0) return null;
 
   const candidates: PartitionEvaluation[] = [];
@@ -2160,7 +2416,15 @@ function buildFineSegmentation(
     for (const seedVariant of seedVariants) {
       if (seedVariant.length < k) continue;
       const seeds = seedVariant.slice(0, k);
-      const assignments = segmentAtomsIntoRegions(graph, atomMap, adjacencyLookup, seeds, scoringOptions);
+      const assignments = segmentAtomsIntoRegions(
+        graph,
+        atomMap,
+        adjacencyLookup,
+        seeds,
+        candidateBearings,
+        bearingCostTable,
+        scoringOptions,
+      );
       if (!assignments) continue;
       const evaluation = buildPartitionEvaluationFromAssignments(
         ring,

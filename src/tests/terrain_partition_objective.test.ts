@@ -3,8 +3,10 @@ import assert from "node:assert/strict";
 import type { FlightParams } from "../domain/types.ts";
 import {
   combinePartitionObjectives,
+  evaluateSensorNodeCostForCells,
   evaluateRegionOrientation,
   findBestRegionOrientation,
+  type TerrainGuidanceCell,
 } from "../utils/terrainPartitionObjective.ts";
 
 type Ring = [number, number][];
@@ -137,6 +139,34 @@ function runLidarQualityCase() {
   );
 }
 
+function runLineLiftPeakPenaltyCase() {
+  const flatTile = makeDemTile(256, 256, (lng, lat) => {
+    const [, my] = lngLatToMercatorMeters(lng, lat);
+    return 1450 + my * 0.00055;
+  });
+  const peakTile = makeDemTile(256, 256, (lng, lat) => {
+    const [mx, my] = lngLatToMercatorMeters(lng, lat);
+    const ridgeCenterX = 33400;
+    const ridgeCenterY = 0;
+    const dx = mx - ridgeCenterX;
+    const dy = my - ridgeCenterY;
+    const spike = 85 * Math.exp(-(dx * dx) / (2 * 120 * 120) - (dy * dy) / (2 * 900 * 900));
+    return 1450 + my * 0.00055 + spike;
+  });
+
+  const flat = evaluateRegionOrientation(tradeoffRing, [flatTile] as any, lidarParams, 90, { tradeoff: 0.8 });
+  const withPeak = evaluateRegionOrientation(tradeoffRing, [peakTile] as any, lidarParams, 90, { tradeoff: 0.8 });
+  assert.ok(flat && withPeak, "line-lift peak regression should evaluate");
+  assert.ok(
+    withPeak!.quality.lineLift.p90LineLiftM > flat!.quality.lineLift.p90LineLiftM + 20,
+    "a narrow peak on one line family should register materially higher line-lift than the flat baseline",
+  );
+  assert.ok(
+    withPeak!.quality.normalizedQualityCost > flat!.quality.normalizedQualityCost + 0.25,
+    "line-lift-heavy terrain should cost more even when using the same heading",
+  );
+}
+
 function runPartitionCombinationCase() {
   const tile = makeDemTile(256, 256, (lng, lat) => {
     const [, my] = lngLatToMercatorMeters(lng, lat);
@@ -190,9 +220,47 @@ function runNonConvexBridgePenaltyCase() {
   );
 }
 
+function runLidarNodeCostHoleSeverityCase() {
+  const baseCells: TerrainGuidanceCell[] = Array.from({ length: 8 }, (_, index) => ({
+    lng: 8 + index * 1e-4,
+    lat: 47 + index * 1e-4,
+    x: index * 25,
+    y: index * 18,
+    terrainZ: 1200 + index * 2,
+    areaWeightM2: 400,
+    preferredBearingDeg: 0,
+    slopeMagnitude: 0.24,
+    breakStrength: 6,
+    confidence: 0.9,
+  }));
+
+  const lowDensityCost = evaluateSensorNodeCostForCells(baseCells, 60, {
+    ...lidarParams,
+    maxLidarRangeM: 170,
+  });
+  const holeCost = evaluateSensorNodeCostForCells(baseCells, 90, {
+    ...lidarParams,
+    altitudeAGL: 110,
+    maxLidarRangeM: 120,
+  });
+
+  assert.equal(lowDensityCost.sensorKind, "lidar");
+  assert.equal(holeCost.sensorKind, "lidar");
+  assert.ok(
+    holeCost.holeRisk > lowDensityCost.holeRisk + 0.12,
+    "a no-return-prone lidar orientation should register materially higher hole risk than a merely weak-density case",
+  );
+  assert.ok(
+    holeCost.qualityCost > lowDensityCost.qualityCost + 0.6,
+    "hole-heavy lidar node cost should be materially worse than low-density-only cost",
+  );
+}
+
 runCameraQualityAndTimeCase();
 runLidarQualityCase();
+runLineLiftPeakPenaltyCase();
 runPartitionCombinationCase();
 runNonConvexBridgePenaltyCase();
+runLidarNodeCostHoleSeverityCase();
 
 console.log("terrain_partition_objective.test.ts passed");
