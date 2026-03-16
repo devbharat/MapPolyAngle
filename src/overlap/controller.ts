@@ -77,11 +77,9 @@ export class LidarDensityWorker {
     return new Promise<LidarWorkerOut>((resolve, reject) => {
       const onMsg = (e: MessageEvent<LidarWorkerOut>) => {
         this.worker.removeEventListener("error", onErr as any);
-        this.worker.removeEventListener("message", onMsg as any);
         resolve(e.data);
       };
       const onErr = (e: ErrorEvent) => {
-        this.worker.removeEventListener("error", onErr as any);
         this.worker.removeEventListener("message", onMsg as any);
         reject(e.error ?? new Error(e.message || "Lidar worker failed"));
       };

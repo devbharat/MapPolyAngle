@@ -92,7 +92,7 @@ function lidarStripMayAffectTile(
   const bounds = tileMetersBounds(tileRef.z, tileRef.x, tileRef.y);
   const reachPadM = Math.max(
     strip.halfWidthM ?? 0,
-    Number.isFinite(strip.maxRangeM ?? Number.NaN) ? strip.maxRangeM! : 0
+    typeof strip.maxRangeM === "number" && Number.isFinite(strip.maxRangeM) ? strip.maxRangeM : 0
   );
   const minXs = Math.min(strip.x1, strip.x2) - reachPadM;
   const maxXs = Math.max(strip.x1, strip.x2) + reachPadM;
