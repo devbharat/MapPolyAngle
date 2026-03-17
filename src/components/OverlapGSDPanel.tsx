@@ -2317,14 +2317,16 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
                               handledPostApply,
                               result,
                             });
-                            if (result?.replaced && result.createdIds.length > 1 && !handledPostApply) {
-                              resetComputedAnalysisState();
-                              setSelection(result.createdIds[0] ?? null);
-                              rerunAnalysisForCreatedPolygons(result.createdIds);
-                              toast({
-                                title: 'Area split',
-                                description: `Created ${result.createdIds.length} terrain-aligned areas from this polygon.`,
-                              });
+                            if (result?.replaced && result.createdIds.length > 1) {
+                              if (!handledPostApply) {
+                                resetComputedAnalysisState();
+                                setSelection(result.createdIds[0] ?? null);
+                                rerunAnalysisForCreatedPolygons(result.createdIds);
+                                toast({
+                                  title: 'Area split',
+                                  description: `Created ${result.createdIds.length} terrain-aligned areas from this polygon.`,
+                                });
+                              }
                             } else {
                               toast({
                                 variant: 'destructive',
