@@ -272,6 +272,13 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
     setTurnExtendUI(ext);
   }, [mapRef]);
 
+  React.useEffect(() => {
+    mapRef.current?.setProcessingPolygonIds?.(Object.keys(splittingPolygonIds));
+    return () => {
+      mapRef.current?.setProcessingPolygonIds?.([]);
+    };
+  }, [mapRef, splittingPolygonIds]);
+
   const getMergedParamsMap = useCallback(() => {
     const externalParams = getPerPolygonParams?.() ?? {};
     const internalParams = mapRef.current?.getPerPolygonParams?.() ?? {};

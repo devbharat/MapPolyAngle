@@ -53,6 +53,7 @@ export interface MapFlightDirectionAPI {
   clearAllDrawings(): void;
   clearPolygon(polygonId: string): void;
   editPolygonBoundary(polygonId: string): void;
+  setProcessingPolygonIds(polygonIds: string[]): void;
   autoSplitPolygonByTerrain(polygonId: string): Promise<{ createdIds: string[]; replaced: boolean }>;
   getTerrainPartitionSolutions(polygonId: string): Promise<TerrainPartitionSolutionPreview[]>;
   applyTerrainPartitionSolution(polygonId: string, signature: string): Promise<{ createdIds: string[]; replaced: boolean }>;

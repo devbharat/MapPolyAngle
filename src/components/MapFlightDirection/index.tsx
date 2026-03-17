@@ -14,11 +14,13 @@ import { useMapInitialization } from './hooks/useMapInitialization';
 import { usePolygonAnalysis } from './hooks/usePolygonAnalysis';
 import {
   addFlightLinesForPolygon,
+  animateProcessingPerimeter,
   removeFlightLinesForPolygon,
   clearAllFlightLines,
   addTriggerPointsForPolygon,
   removeTriggerPointsForPolygon,
-  clearAllTriggerPoints
+  clearAllTriggerPoints,
+  setProcessingPerimeterPolygons,
 } from './utils/mapbox-layers';
 import { update3DPathLayer, remove3DPathLayer, update3DCameraPointsLayer, remove3DCameraPointsLayer, update3DTriggerPointsLayer, remove3DTriggerPointsLayer } from './utils/deckgl-layers';
 import { build3DFlightPath, calculateOptimalTerrainZoom, sampleCameraPositionsOnFlightPath } from './utils/geometry';
@@ -276,6 +278,8 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
     const polygonFlightLinesRef = React.useRef(polygonFlightLines);
     const polygonResultsRef = React.useRef(polygonResults);
     const pendingGeometryRefreshRef = React.useRef<Set<string>>(new Set());
+    const processingPolygonIdsRef = React.useRef<Set<string>>(new Set());
+    const processingAnimationFrameRef = React.useRef<number | null>(null);
     // NEW: Suppress per‑polygon flight line update events during batched imports
     const suppressFlightLineEventsRef = React.useRef(false);
     const pendingOptimizeRef = React.useRef<Set<string>>(new Set());
@@ -291,6 +295,54 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
     React.useEffect(() => { polygonTilesRef.current = polygonTiles; }, [polygonTiles]);
     React.useEffect(() => { polygonFlightLinesRef.current = polygonFlightLines; }, [polygonFlightLines]);
     React.useEffect(() => { polygonResultsRef.current = polygonResults; }, [polygonResults]);
+
+    const syncProcessingPerimeterOverlay = useCallback(() => {
+      const map = mapRef.current;
+      const draw = drawRef.current as any;
+      if (!map || !draw) return;
+      const polygons = Array.from(processingPolygonIdsRef.current)
+        .map((polygonId) => {
+          const feature = draw.get?.(polygonId);
+          const ring = feature?.geometry?.type === 'Polygon'
+            ? feature.geometry.coordinates?.[0] as [number, number][] | undefined
+            : undefined;
+          if (!ring || ring.length < 3) return null;
+          return { polygonId, ring };
+        })
+        .filter((polygon): polygon is NonNullable<typeof polygon> => polygon !== null);
+      setProcessingPerimeterPolygons(map, polygons);
+    }, []);
+
+    const stopProcessingPerimeterAnimation = useCallback(() => {
+      if (processingAnimationFrameRef.current != null && typeof window !== 'undefined') {
+        window.cancelAnimationFrame(processingAnimationFrameRef.current);
+        processingAnimationFrameRef.current = null;
+      }
+    }, []);
+
+    const startProcessingPerimeterAnimation = useCallback(() => {
+      if (typeof window === 'undefined' || processingAnimationFrameRef.current != null) return;
+      const tick = (timestamp: number) => {
+        const map = mapRef.current;
+        if (!map || processingPolygonIdsRef.current.size === 0) {
+          processingAnimationFrameRef.current = null;
+          return;
+        }
+        animateProcessingPerimeter(map, timestamp);
+        processingAnimationFrameRef.current = window.requestAnimationFrame(tick);
+      };
+      processingAnimationFrameRef.current = window.requestAnimationFrame(tick);
+    }, []);
+
+    const setProcessingPolygonIds = useCallback((polygonIds: string[]) => {
+      processingPolygonIdsRef.current = new Set(polygonIds);
+      syncProcessingPerimeterOverlay();
+      if (processingPolygonIdsRef.current.size === 0) {
+        stopProcessingPerimeterAnimation();
+        return;
+      }
+      startProcessingPerimeterAnimation();
+    }, [startProcessingPerimeterAnimation, stopProcessingPerimeterAnimation, syncProcessingPerimeterOverlay]);
 
     // Debounced callback to prevent React render conflicts when multiple analyses complete
     const debouncedAnalysisComplete = useCallback(() => {
@@ -673,6 +725,12 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         return next;
       });
       setPendingParamPolygons((prev) => prev.filter((id) => id !== polygonId));
+      if (processingPolygonIdsRef.current.delete(polygonId)) {
+        syncProcessingPerimeterOverlay();
+        if (processingPolygonIdsRef.current.size === 0) {
+          stopProcessingPerimeterAnimation();
+        }
+      }
 
       setTimeout(() => {
         onPolygonSelected?.(null);
@@ -749,6 +807,13 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         map.on('draw.create', handleDrawCreate);
         map.on('draw.update', handleDrawUpdate);
         map.on('draw.delete', handleDrawDelete);
+        map.on('draw.create', syncProcessingPerimeterOverlay);
+        map.on('draw.update', syncProcessingPerimeterOverlay);
+        map.on('draw.delete', syncProcessingPerimeterOverlay);
+        syncProcessingPerimeterOverlay();
+        if (processingPolygonIdsRef.current.size > 0) {
+          startProcessingPerimeterAnimation();
+        }
         // Open params dialog when user selects an existing polygon
         map.on('draw.selectionchange', (e: any) => {
           try {
@@ -1731,6 +1796,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
 
     React.useImperativeHandle(ref, () => ({
       clearAllDrawings: () => {
+        setProcessingPolygonIds([]);
         if (drawRef.current) drawRef.current.deleteAll();
         if (deckOverlayRef.current) {
           setDeckLayers([]);
@@ -1757,6 +1823,9 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         onAnalysisComplete?.([]);
       },
       clearPolygon: (polygonId: string) => {
+        if (processingPolygonIdsRef.current.has(polygonId)) {
+          setProcessingPolygonIds(Array.from(processingPolygonIdsRef.current).filter((id) => id !== polygonId));
+        }
         const draw = drawRef.current as any;
         if (!draw) {
           cleanupPolygonState(polygonId);
@@ -1773,6 +1842,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         }, 0);
       },
       editPolygonBoundary,
+      setProcessingPolygonIds,
       autoSplitPolygonByTerrain,
       getTerrainPartitionSolutions,
       applyTerrainPartitionSolution,
@@ -1886,13 +1956,17 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       },
     }), [
       polygonResults, polygonFlightLines, polygonTiles, polygonParams,
-      cancelAllAnalyses, applyPolygonParams, applyPolygonParamsBatch, cleanupPolygonState, editPolygonBoundary, autoSplitPolygonByTerrain,
+      cancelAllAnalyses, applyPolygonParams, applyPolygonParamsBatch, cleanupPolygonState, editPolygonBoundary, setProcessingPolygonIds, autoSplitPolygonByTerrain,
       getTerrainPartitionSolutions, applyTerrainPartitionSolution,
       bearingOverrides, importedOriginals,
       importKmlFromText, importWingtraFromText,
       optimizePolygonDirection, revertPolygonToImportedDirection, runFullAnalysis,
       lastImportedFlightplan
     ]);
+
+    React.useEffect(() => () => {
+      stopProcessingPerimeterAnimation();
+    }, [stopProcessingPerimeterAnimation]);
 
     return (
       <div style={{ position: 'relative', width: '100%', height: '100%' }}>

@@ -30,6 +30,192 @@ function getDrawLayerAnchor(map: MapboxMap): string | undefined {
   return layers.find((layer) => layer.id.startsWith('gl-draw-'))?.id;
 }
 
+const PROCESSING_PERIMETER_SOURCE_ID = 'terrain-processing-perimeter-source';
+const PROCESSING_PERIMETER_GLOW_LAYER_ID = 'terrain-processing-perimeter-glow';
+const PROCESSING_PERIMETER_CORE_LAYER_ID = 'terrain-processing-perimeter-core';
+const PROCESSING_PERIMETER_PULSE_LAYER_ID = 'terrain-processing-perimeter-pulse';
+
+function emptyProcessingPerimeterData() {
+  return {
+    type: 'FeatureCollection',
+    features: [],
+  } as const;
+}
+
+function ensureClosedRing(ring: [number, number][]): [number, number][] {
+  if (ring.length < 2) return ring;
+  const [firstLng, firstLat] = ring[0];
+  const [lastLng, lastLat] = ring[ring.length - 1];
+  if (firstLng === lastLng && firstLat === lastLat) return ring;
+  return [...ring, [firstLng, firstLat]];
+}
+
+function buildProcessingPulseGradient(phase: number) {
+  const base = 'rgba(147, 197, 253, 0)';
+  const shoulder = 'rgba(219, 234, 254, 0.72)';
+  const peak = 'rgba(255, 255, 255, 1)';
+  const tail = 0.16;
+  const lead = 0.085;
+  const shoulderBefore = 0.07;
+  const shoulderAfter = 0.05;
+  const resolution = 10000;
+  const rawStops: Array<[number, string, number]> = [
+    [0, base, 0],
+    [1, base, 0],
+  ];
+
+  for (const center of [phase - 1, phase, phase + 1]) {
+    const stops: Array<[number, string, number]> = [
+      [center - tail, base, 0],
+      [center - shoulderBefore, shoulder, 1],
+      [center, peak, 2],
+      [center + shoulderAfter, shoulder, 1],
+      [center + lead, base, 0],
+    ];
+    for (const [position, color, priority] of stops) {
+      if (position < 0 || position > 1) continue;
+      rawStops.push([position, color, priority]);
+    }
+  }
+
+  const byPosition = new Map<number, { color: string; priority: number }>();
+  for (const [position, color, priority] of rawStops) {
+    const key = Math.round(position * resolution);
+    const existing = byPosition.get(key);
+    if (!existing || priority >= existing.priority) {
+      byPosition.set(key, { color, priority });
+    }
+  }
+
+  const sortedStops = Array.from(byPosition.entries())
+    .map(([key, value]) => ({
+      position: key / resolution,
+      color: value.color,
+    }))
+    .sort((a, b) => a.position - b.position);
+
+  const normalized: Array<number | string | ['line-progress'] | ['linear'] | ['interpolate']> = [
+    'interpolate',
+    ['linear'],
+    ['line-progress'],
+  ];
+  for (const stop of sortedStops) {
+    normalized.push(stop.position, stop.color);
+  }
+  return normalized as any;
+}
+
+function ensureProcessingPerimeterLayers(map: MapboxMap) {
+  if (!map.getSource(PROCESSING_PERIMETER_SOURCE_ID)) {
+    map.addSource(PROCESSING_PERIMETER_SOURCE_ID, {
+      type: 'geojson',
+      lineMetrics: true,
+      data: emptyProcessingPerimeterData(),
+    } as any);
+  }
+
+  if (!map.getLayer(PROCESSING_PERIMETER_GLOW_LAYER_ID)) {
+    map.addLayer({
+      id: PROCESSING_PERIMETER_GLOW_LAYER_ID,
+      type: 'line',
+      source: PROCESSING_PERIMETER_SOURCE_ID,
+      layout: {
+        'line-join': 'round',
+        'line-cap': 'round',
+      },
+      paint: {
+        'line-color': '#60a5fa',
+        'line-width': 14,
+        'line-opacity': 0.28,
+        'line-blur': 4.8,
+      },
+    });
+  }
+
+  if (!map.getLayer(PROCESSING_PERIMETER_CORE_LAYER_ID)) {
+    map.addLayer({
+      id: PROCESSING_PERIMETER_CORE_LAYER_ID,
+      type: 'line',
+      source: PROCESSING_PERIMETER_SOURCE_ID,
+      layout: {
+        'line-join': 'round',
+        'line-cap': 'round',
+      },
+      paint: {
+        'line-color': '#bfdbfe',
+        'line-width': 2.5,
+        'line-opacity': 0.8,
+      },
+    });
+  }
+
+  if (!map.getLayer(PROCESSING_PERIMETER_PULSE_LAYER_ID)) {
+    map.addLayer({
+      id: PROCESSING_PERIMETER_PULSE_LAYER_ID,
+      type: 'line',
+      source: PROCESSING_PERIMETER_SOURCE_ID,
+      layout: {
+        'line-join': 'round',
+        'line-cap': 'round',
+      },
+      paint: {
+        'line-width': 8.5,
+        'line-opacity': 1,
+        'line-blur': 0.5,
+        'line-gradient': buildProcessingPulseGradient(0),
+      },
+    });
+  }
+}
+
+export function setProcessingPerimeterPolygons(
+  map: MapboxMap,
+  polygons: Array<{ polygonId: string; ring: [number, number][] }>,
+) {
+  ensureProcessingPerimeterLayers(map);
+  const source = map.getSource(PROCESSING_PERIMETER_SOURCE_ID) as any;
+  if (!source) return;
+
+  const data = {
+    type: 'FeatureCollection',
+    features: polygons
+      .map(({ polygonId, ring }) => {
+        const closedRing = ensureClosedRing(ring);
+        if (closedRing.length < 2) return null;
+        return {
+          type: 'Feature',
+          geometry: {
+            type: 'LineString',
+            coordinates: closedRing,
+          },
+          properties: {
+            polygonId,
+          },
+        };
+      })
+      .filter((feature): feature is NonNullable<typeof feature> => feature !== null),
+  } as const;
+
+  source.setData(data);
+}
+
+export function animateProcessingPerimeter(map: MapboxMap, timestampMs: number) {
+  ensureProcessingPerimeterLayers(map);
+  const pulse = (Math.sin(timestampMs * 0.004) + 1) / 2;
+  const phase = (timestampMs * 0.00018) % 1;
+
+  if (map.getLayer(PROCESSING_PERIMETER_GLOW_LAYER_ID)) {
+    map.setPaintProperty(PROCESSING_PERIMETER_GLOW_LAYER_ID, 'line-opacity', 0.22 + pulse * 0.2);
+    map.setPaintProperty(PROCESSING_PERIMETER_GLOW_LAYER_ID, 'line-width', 12 + pulse * 5);
+  }
+  if (map.getLayer(PROCESSING_PERIMETER_CORE_LAYER_ID)) {
+    map.setPaintProperty(PROCESSING_PERIMETER_CORE_LAYER_ID, 'line-opacity', 0.62 + pulse * 0.18);
+  }
+  if (map.getLayer(PROCESSING_PERIMETER_PULSE_LAYER_ID)) {
+    map.setPaintProperty(PROCESSING_PERIMETER_PULSE_LAYER_ID, 'line-gradient', buildProcessingPulseGradient(phase));
+  }
+}
+
 export function generateFlightLinesForPolygon(
   ring: number[][],
   bearingDeg: number,
