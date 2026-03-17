@@ -1,0 +1,33 @@
+[project]
+name = "terrain-splitter"
+version = "0.1.0"
+description = "Local backend terrain partition solver for MapPolyAngle"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115,<1.0",
+  "uvicorn[standard]>=0.34,<1.0",
+  "numpy>=2.1,<3.0",
+  "pillow>=11.1,<12.0",
+  "shapely>=2.0,<3.0",
+  "httpx>=0.28,<1.0",
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest>=8.3,<9.0",
+]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "."}
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["terrain_splitter*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

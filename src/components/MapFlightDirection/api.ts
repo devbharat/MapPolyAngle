@@ -44,6 +44,7 @@ export interface TerrainPartitionSolutionPreview {
     ring: [number, number][];
     convexity: number;
     compactness: number;
+    baseAltitudeAGL?: number;
   }>;
 }
 

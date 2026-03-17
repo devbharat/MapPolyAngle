@@ -6,3 +6,6 @@ vite.config.ts.*
 *.tar.gz
 .env
 .vercel
+.venv
+backend/terrain_splitter/.cache/
+backend/terrain_splitter/.debug/
