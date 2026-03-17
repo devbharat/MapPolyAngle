@@ -24,6 +24,8 @@ from .geometry import (
     polygon_compactness,
     polygon_convexity,
     polygon_to_lnglat_ring,
+    ring_to_polygon_mercator,
+    simplify_polygon_coverage,
     weighted_axial_mean_deg,
     weighted_mean,
     weighted_quantile,
@@ -44,6 +46,9 @@ DOMINANCE_EPS = 1e-6
 DEFAULT_DEPTH_SMALL = 3
 DEFAULT_DEPTH_LARGE = 2
 SPLIT_QUANTILES = (0.20, 0.25, 0.33, 0.40, 0.50, 0.60, 0.67, 0.75, 0.80)
+OUTPUT_RING_SIMPLIFY_FACTOR = 0.4
+OUTPUT_RING_SIMPLIFY_MIN_M = 6.0
+OUTPUT_RING_SIMPLIFY_MAX_M = 24.0
 logger = logging.getLogger("uvicorn.error")
 
 
@@ -1361,10 +1366,11 @@ def _serialize_evaluated_region(region: EvaluatedRegion) -> dict[str, Any]:
 
 
 def _deserialize_evaluated_region(payload: dict[str, Any]) -> EvaluatedRegion:
+    ring = [tuple(coord) for coord in payload["ring"]]
     return EvaluatedRegion(
         cell_ids=tuple(payload["cellIds"]),
-        polygon=Polygon(),
-        ring=[tuple(coord) for coord in payload["ring"]],
+        polygon=ring_to_polygon_mercator(ring) if ring else Polygon(),
+        ring=ring,
         objective=_deserialize_region_objective(payload["objective"]),
         score=payload["score"],
         hard_invalid=payload["hardInvalid"],
@@ -1799,6 +1805,17 @@ def solve_partition_hierarchy(
 
     previews: list[PartitionSolutionPreviewModel] = []
     for index, plan in enumerate(practical_filtered):
+        simplify_tolerance_m = clamp(
+            grid.grid_step_m * OUTPUT_RING_SIMPLIFY_FACTOR,
+            OUTPUT_RING_SIMPLIFY_MIN_M,
+            OUTPUT_RING_SIMPLIFY_MAX_M,
+        )
+        simplified_polygons = simplify_polygon_coverage(
+            [region.polygon for region in plan.regions],
+            simplify_tolerance_m,
+            simplify_boundary=True,
+        )
+        simplified_rings = [polygon_to_lnglat_ring(polygon) for polygon in simplified_polygons]
         boundary_break_alignment = _plan_boundary_alignment(plan)
         if time_max - time_min <= 1e-6:
             tradeoff = requested_tradeoff if requested_tradeoff is not None else 0.5
@@ -1809,11 +1826,11 @@ def solve_partition_hierarchy(
                 {
                     "regions": [
                         {
-                            "ring": region.ring,
+                            "ring": ring,
                             "bearingDeg": round(region.objective.bearing_deg, 4),
                             "areaM2": round(region.objective.area_m2, 3),
                         }
-                        for region in plan.regions
+                        for region, ring in zip(plan.regions, simplified_rings)
                     ]
                 }
             ),
@@ -1832,12 +1849,12 @@ def solve_partition_hierarchy(
                     areaM2=region.objective.area_m2,
                     bearingDeg=region.objective.bearing_deg,
                     atomCount=len(region.cell_ids),
-                    ring=region.ring,
+                    ring=ring,
                     convexity=region.objective.convexity,
                     compactness=region.objective.compactness,
                     baseAltitudeAGL=params.altitudeAGL,
                 )
-                for region in plan.regions
+                for region, ring in zip(plan.regions, simplified_rings)
             ],
         )
         previews.append(preview)

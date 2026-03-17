@@ -7,6 +7,11 @@ from typing import Iterable
 import numpy as np
 from shapely.geometry import Polygon
 
+try:
+    from shapely import coverage_simplify as shapely_coverage_simplify
+except ImportError:  # pragma: no cover - exercised only on older Shapely
+    shapely_coverage_simplify = None
+
 
 WEB_MERCATOR_R = 6378137.0
 MAX_LAT = 85.05112878
@@ -137,6 +142,43 @@ def polygon_compactness(polygon: Polygon) -> float:
 def polygon_to_lnglat_ring(polygon: Polygon) -> list[tuple[float, float]]:
     coords = list(polygon.exterior.coords)
     return [mercator_to_lnglat(x, y) for x, y in coords]
+
+
+def simplify_polygon_coverage(
+    polygons: Iterable[Polygon],
+    tolerance_m: float,
+    *,
+    simplify_boundary: bool = True,
+) -> list[Polygon]:
+    polygon_list = [polygon for polygon in polygons]
+    if tolerance_m <= 0 or len(polygon_list) <= 1:
+        return polygon_list
+
+    simplified: list[Polygon]
+    if shapely_coverage_simplify is not None:
+        result = shapely_coverage_simplify(
+            polygon_list,
+            tolerance_m,
+            simplify_boundary=simplify_boundary,
+        )
+        simplified = [polygon for polygon in result]
+    else:
+        simplified = [polygon.simplify(tolerance_m, preserve_topology=True) for polygon in polygon_list]
+
+    if len(simplified) != len(polygon_list):
+        return polygon_list
+
+    cleaned: list[Polygon] = []
+    for original, polygon in zip(polygon_list, simplified):
+        if polygon.is_empty:
+            cleaned.append(original)
+            continue
+        candidate = polygon if polygon.is_valid else polygon.buffer(0)
+        if candidate.is_empty or candidate.area <= 0:
+            cleaned.append(original)
+            continue
+        cleaned.append(candidate)
+    return cleaned
 
 
 def line_spacing_camera(

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from shapely.geometry import box
+from shapely.geometry import Polygon, box
 
 from terrain_splitter.costs import RegionObjective
 from terrain_splitter.features import CellFeatures, FeatureField
+from terrain_splitter.geometry import simplify_polygon_coverage
 from terrain_splitter.grid import GridCell, GridData, GridEdge
 from terrain_splitter.schemas import FlightParamsModel
 from terrain_splitter.solver_graphcut import solve_partition_hierarchy
@@ -301,3 +302,30 @@ def test_pareto_frontier_preserves_practical_plan_against_non_practical_dominato
 
     frontier = _pareto_frontier([baseline, practical, non_practical], root_area_m2)
     assert any(plan.region_count == 2 and abs(plan.quality_cost - 5.0) < 1e-6 for plan in frontier)
+
+
+def test_coverage_simplify_reduces_vertices_while_preserving_shared_boundary() -> None:
+    shared = [
+        (4, 0),
+        (4, 1),
+        (3, 1),
+        (3, 2),
+        (4, 2),
+        (4, 3),
+        (3, 3),
+        (3, 4),
+        (4, 4),
+        (4, 5),
+    ]
+    left = Polygon([(0, 0)] + shared + [(0, 5), (0, 0)])
+    right = Polygon(shared + [(8, 5), (8, 0), (4, 0)])
+
+    simplified = simplify_polygon_coverage([left, right], 0.8)
+
+    assert len(simplified) == 2
+    assert len(list(simplified[0].exterior.coords)) < len(list(left.exterior.coords))
+    assert len(list(simplified[1].exterior.coords)) < len(list(right.exterior.coords))
+
+    shared_edge = simplified[0].boundary.intersection(simplified[1].boundary)
+    assert shared_edge.length > 0
+    assert shared_edge.geom_type in {"LineString", "MultiLineString"}
