@@ -302,11 +302,10 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
 
     const applyPolygonParams = useCallback((polygonId: string, params: PolygonParams, opts?: { skipEvent?: boolean; skipQueue?: boolean }) => {
       const safeParams = sanitizePolygonParams(params);
-      setPolygonParams((prev) => {
-        const next = new Map(prev);
-        next.set(polygonId, safeParams);
-        return next;
-      });
+      const nextParams = new Map(polygonParamsRef.current);
+      nextParams.set(polygonId, safeParams);
+      polygonParamsRef.current = nextParams;
+      setPolygonParams(nextParams);
 
       const res = polygonResultsRef.current.get(polygonId);
       const tiles = polygonTilesRef.current.get(polygonId) || [];
@@ -369,11 +368,10 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         res.result.fitQuality
       );
 
-      setPolygonFlightLines((prev) => {
-        const next = new Map(prev);
-        next.set(polygonId, { ...fl, altitudeAGL: safeParams.altitudeAGL });
-        return next;
-      });
+      const nextFlightLines = new Map(polygonFlightLinesRef.current);
+      nextFlightLines.set(polygonId, { ...fl, altitudeAGL: safeParams.altitudeAGL });
+      polygonFlightLinesRef.current = nextFlightLines;
+      setPolygonFlightLines(nextFlightLines);
 
       if (!opts?.skipEvent && !suppressFlightLineEventsRef.current) {
         onFlightLinesUpdated?.(polygonId);
@@ -497,11 +495,10 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         });
 
         // 2) Store tiles
-        setPolygonTiles((prev) => {
-          const next = new Map(prev);
-          next.set(result.polygonId, tiles);
-          return next;
-        });
+        const nextTiles = new Map(polygonTilesRef.current);
+        nextTiles.set(result.polygonId, tiles);
+        polygonTilesRef.current = nextTiles;
+        setPolygonTiles(nextTiles);
 
         // Decide which heading/spacing to use when drawing
       let params = polygonParamsRef.current.get(result.polygonId);
@@ -559,11 +556,10 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           result.result.fitQuality
         );
 
-        setPolygonFlightLines((prev) => {
-          const next = new Map(prev);
-          next.set(result.polygonId, { ...lines, altitudeAGL: safeParams.altitudeAGL });
-          return next;
-        });
+        const nextFlightLines = new Map(polygonFlightLinesRef.current);
+        nextFlightLines.set(result.polygonId, { ...lines, altitudeAGL: safeParams.altitudeAGL });
+        polygonFlightLinesRef.current = nextFlightLines;
+        setPolygonFlightLines(nextFlightLines);
 
         if (!suppressFlightLineEventsRef.current) {
           if (pendingGeometryRefreshRef.current.delete(result.polygonId)) {
@@ -1531,18 +1527,18 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           debouncedAnalysisComplete();
           return next;
         });
-        setPolygonTiles((prev) => {
-          if (!prev.has(polygonId)) return prev;
-          const next = new Map(prev);
-          next.delete(polygonId);
-          return next;
-        });
-        setPolygonFlightLines((prev) => {
-          if (!prev.has(polygonId)) return prev;
-          const next = new Map(prev);
-          next.delete(polygonId);
-          return next;
-        });
+        if (polygonTilesRef.current.has(polygonId)) {
+          const nextTiles = new Map(polygonTilesRef.current);
+          nextTiles.delete(polygonId);
+          polygonTilesRef.current = nextTiles;
+          setPolygonTiles(nextTiles);
+        }
+        if (polygonFlightLinesRef.current.has(polygonId)) {
+          const nextFlightLines = new Map(polygonFlightLinesRef.current);
+          nextFlightLines.delete(polygonId);
+          polygonFlightLinesRef.current = nextFlightLines;
+          setPolygonFlightLines(nextFlightLines);
+        }
         setPendingParamPolygons((prev) => prev.filter((id) => id !== polygonId));
         backendPartitionSolutionsRef.current.delete(polygonId);
         createdIds.forEach((id) => backendPartitionSolutionsRef.current.delete(id));
@@ -1783,7 +1779,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       startPolygonDrawing: () => {
         if (drawRef.current) (drawRef.current as any).changeMode('draw_polygon');
       },
-      getPolygonResults: () => Array.from(polygonResults.values()),
+      getPolygonResults: () => Array.from(polygonResultsRef.current.values()),
       getMap: () => mapRef.current,
       getPolygons: (): [number,number][][] => {
         const draw = drawRef.current;
@@ -1812,8 +1808,8 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         }
         return polygonsWithIds;
       },
-      getFlightLines: () => polygonFlightLines,
-      getPolygonTiles: () => polygonTiles,
+      getFlightLines: () => polygonFlightLinesRef.current,
+      getPolygonTiles: () => polygonTilesRef.current,
       addCameraPoints: (polygonId: string, positions: [number, number, number][]) => {
         if (deckOverlayRef.current) update3DCameraPointsLayer(deckOverlayRef.current, polygonId, positions, setDeckLayers);
       },
@@ -1824,7 +1820,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       applyPolygonParamsBatch,
       // expose bulk apply helper
       applyParamsToAllPending,
-      getPerPolygonParams: () => Object.fromEntries(polygonParams),
+      getPerPolygonParams: () => Object.fromEntries(polygonParamsRef.current),
       // Altitude strategy and clearance controls
       setAltitudeMode: (m: 'legacy' | 'min-clearance') => setAltitudeMode(m),
       getAltitudeMode: () => altitudeMode,

@@ -241,8 +241,10 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
   const tileCacheRef = useRef<Map<string, { width: number; height: number; data: Uint8ClampedArray }>>(new Map());
   const autoTriesRef = useRef(0);
   const autoRunTimeoutRef = useRef<number | null>(null);
+  const deferredComputeTimeoutRef = useRef<number | null>(null);
   const computeSeqRef = useRef(0); // increment to invalidate in-flight computations
   const runningRef = useRef(false);
+  const pendingComputeRef = useRef<{ polygonId?: string; suppressMapNotReadyToast?: boolean } | null>(null);
   const suppressAutoRunUntilRef = useRef(0);
   const [clipInnerBufferM, setClipInnerBufferM] = useState(0);
   const [maxTiltDeg, setMaxTiltDeg] = useState(30); // NEW: max allowable camera tilt (deg from vertical)
@@ -1380,13 +1382,21 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
    *  - all polygons (default)
    */
   const compute = useCallback(async (opts?: { polygonId?: string; suppressMapNotReadyToast?: boolean }) => {
-    const computeStartedAt = splitPerfNow();
-    const mySeq = ++computeSeqRef.current;
-    const scope = opts?.polygonId ?? '__all__';
-    splitPerfLog(scope, 'coverage compute start', {
-      seq: mySeq,
-      polygonId: opts?.polygonId,
-    });
+    if (runningRef.current) {
+      const nextPending = pendingComputeRef.current;
+      pendingComputeRef.current = {
+        polygonId: nextPending?.polygonId === undefined || opts?.polygonId === undefined
+          ? undefined
+          : (nextPending?.polygonId ?? opts?.polygonId),
+        suppressMapNotReadyToast: Boolean(
+          nextPending?.suppressMapNotReadyToast || opts?.suppressMapNotReadyToast
+        ),
+      };
+      splitPerfLog(opts?.polygonId ?? '__all__', 'coverage compute queued while another run is active', {
+        queued: pendingComputeRef.current,
+      });
+      return;
+    }
     const api = mapRef.current;
     const paramsMap = getMergedParamsMap();
     const overrideCam = parseCameraOverride();
@@ -1494,7 +1504,18 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
 
     const map: mapboxgl.Map | undefined = mapRef.current?.getMap?.();
     if (!map || !map.isStyleLoaded?.()) {
-      if (!opts?.suppressMapNotReadyToast) {
+      if (opts?.suppressMapNotReadyToast) {
+        if (deferredComputeTimeoutRef.current !== null) {
+          clearTimeout(deferredComputeTimeoutRef.current);
+        }
+        splitPerfLog(opts?.polygonId ?? '__all__', 'coverage compute deferred because map is not ready', {
+          polygonId: opts?.polygonId,
+        });
+        deferredComputeTimeoutRef.current = window.setTimeout(() => {
+          deferredComputeTimeoutRef.current = null;
+          compute(opts);
+        }, 200);
+      } else {
         toast({
           variant: "destructive",
           title: "Map not ready",
@@ -1503,6 +1524,14 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
       }
       return;
     }
+
+    const computeStartedAt = splitPerfNow();
+    const mySeq = ++computeSeqRef.current;
+    const scope = opts?.polygonId ?? '__all__';
+    splitPerfLog(scope, 'coverage compute start', {
+      seq: mySeq,
+      polygonId: opts?.polygonId,
+    });
 
     const now = Date.now();
     if (!opts?.polygonId || targetPolygonMoved) {
@@ -1655,6 +1684,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
       }
     };
 
+    runningRef.current = true;
     setRunning(true);
     autoTriesRef.current = 0;
 
@@ -1812,11 +1842,19 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
     } finally {
       cameraWorker?.terminate();
       lidarWorker?.terminate();
+      runningRef.current = false;
       setRunning(false);
       splitPerfLog(scope, 'coverage compute end', {
         seq: mySeq,
         totalMs: Math.round(splitPerfNow() - computeStartedAt),
       });
+      const pending = pendingComputeRef.current;
+      if (pending) {
+        pendingComputeRef.current = null;
+        window.setTimeout(() => {
+          compute(pending);
+        }, 0);
+      }
     }
   }, [CAMERA_REGISTRY, aggregateMetricStats, buildLidarStrips, cameraText, clipInnerBufferM, getMergedParamsMap, getPolygons, importedPoses, isLidarPayload, mapRef, mapboxToken, opacity, parseCameraOverride, parsePosesMeters, showCameraPoints, showGsd, showOverlap, zoom]);
 
@@ -1888,7 +1926,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
   }, [running, autoGenerate, importedPoses, compute, getMergedParamsMap, isLidarPayload, mapRef, parsePosesMeters]);
 
   function rerunAnalysisForCreatedPolygons(createdIds: string[]) {
-    const deadlineMs = 4000;
+    const deadlineMs = 8000;
     const startedAt = Date.now();
     const scope = createdIds[0] ?? `split-${++splitPerfSeqRef.current}`;
     splitPerfLog(scope, 'waiting for child flight lines before full raster recompute', {
@@ -1897,18 +1935,35 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
     const attempt = () => {
       const api = mapRef.current;
       const lines = api?.getFlightLines?.();
-      const ready = !!lines && createdIds.every((id) => {
+      const tiles = api?.getPolygonTiles?.();
+      const polygonIds = new Set((api?.getPolygonsWithIds?.() ?? []).map((polygon) => polygon.id || 'unknown'));
+      const paramsByPolygon = api?.getPerPolygonParams?.() ?? {};
+      const resultsByPolygon = new Set((api?.getPolygonResults?.() ?? []).map((result) => result.polygonId));
+      const havePolygons = createdIds.every((id) => polygonIds.has(id));
+      const haveLines = !!lines && createdIds.every((id) => {
         const entry = lines.get(id);
         return !!entry && Array.isArray(entry.flightLines) && entry.flightLines.length > 0;
       });
+      const haveTiles = !!tiles && createdIds.every((id) => {
+        const entry = tiles.get(id);
+        return Array.isArray(entry) && entry.length > 0;
+      });
+      const haveParams = createdIds.every((id) => !!paramsByPolygon[id]);
+      const haveResults = createdIds.every((id) => resultsByPolygon.has(id));
+      const ready = havePolygons && haveLines && haveTiles && haveParams && haveResults;
       if ((ready || Date.now() - startedAt >= deadlineMs) && !runningRef.current) {
         suppressAutoRunUntilRef.current = 0;
-        splitPerfLog(scope, 'triggering full raster recompute for created polygons', {
+        splitPerfLog(scope, 'triggering post-split auto-run for created polygons', {
           ready,
           waitMs: Date.now() - startedAt,
+          havePolygons,
+          haveLines,
+          haveTiles,
+          haveParams,
+          haveResults,
           createdIds,
         });
-        compute({ suppressMapNotReadyToast: true });
+        autoRun({ reason: 'lines' });
         return;
       }
       window.setTimeout(attempt, 150);
@@ -1927,6 +1982,10 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
       // Invalidate any in-flight compute
       computeSeqRef.current += 1;
       if (autoRunTimeoutRef.current) { clearTimeout(autoRunTimeoutRef.current); autoRunTimeoutRef.current = null; }
+      if (deferredComputeTimeoutRef.current !== null) {
+        clearTimeout(deferredComputeTimeoutRef.current);
+        deferredComputeTimeoutRef.current = null;
+      }
       // Remove all overlays regardless of run id to be safe
       clearAllOverlays(map);
       perPolyTileStatsRef.current.clear();
@@ -1952,6 +2011,10 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
     if (autoRunTimeoutRef.current) {
       clearTimeout(autoRunTimeoutRef.current);
       autoRunTimeoutRef.current = null;
+    }
+    if (deferredComputeTimeoutRef.current !== null) {
+      clearTimeout(deferredComputeTimeoutRef.current);
+      deferredComputeTimeoutRef.current = null;
     }
     if (map) {
       clearAllOverlays(map);
