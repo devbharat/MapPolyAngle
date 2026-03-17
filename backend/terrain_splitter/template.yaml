@@ -14,12 +14,16 @@ Parameters:
     Type: String
     Default: "*"
     Description: CORS origin for the Lambda Function URL.
+  RootParallelWorkers:
+    Type: Number
+    Default: 6
+    Description: Number of root split branches to evaluate in parallel via Lambda self-invocation.
 
 Globals:
   Function:
     Runtime: python3.11
     Timeout: 900
-    MemorySize: 3072
+    MemorySize: 10240
     Architectures:
       - x86_64
     Environment:
@@ -28,6 +32,8 @@ Globals:
         TERRAIN_SPLITTER_CACHE_DIR: /tmp/terrain-splitter/cache
         TERRAIN_SPLITTER_DEBUG_DIR: /tmp/terrain-splitter/debug
         TERRAIN_SPLITTER_ENABLE_APP_CORS: "false"
+        TERRAIN_SPLITTER_ROOT_PARALLEL_MODE: "lambda"
+        TERRAIN_SPLITTER_ROOT_PARALLEL_WORKERS: !Ref RootParallelWorkers
         PYTHONPATH: /var/task
 
 Resources:
@@ -38,6 +44,12 @@ Resources:
       Handler: main.lambda_handler
       CodeUri: .
       Description: Terrain-aware polygon partition solver
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - lambda:InvokeFunction
+              Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-terrain-splitter"
       EphemeralStorage:
         Size: 2048
 

@@ -84,5 +84,9 @@ Notes:
 
 - The Lambda package is stateless. Cache/debug data is ephemeral in `/tmp`.
 - On macOS, `sam build` without `--use-container` can fail for `numpy`/`pillow` because Lambda needs Linux wheels.
-- Memory is set high (`3072 MB`) because the solver is CPU-heavy.
+- Memory is set to the Lambda maximum (`10240 MB`) because the solver is CPU-heavy and benefits from extra CPU allocation.
+- AWS deploys now enable exact root-branch fan-out via Lambda self-invocation:
+  - `TERRAIN_SPLITTER_ROOT_PARALLEL_MODE=lambda`
+  - `TERRAIN_SPLITTER_ROOT_PARALLEL_WORKERS=6` by default
+- Local runs still default to exact process-based root fan-out when `TERRAIN_SPLITTER_ROOT_PARALLEL_WORKERS > 1`.
 - Timeout is `900s`, matching Lambda's maximum.

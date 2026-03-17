@@ -7,7 +7,22 @@ from terrain_splitter.features import CellFeatures, FeatureField
 from terrain_splitter.grid import GridCell, GridData, GridEdge
 from terrain_splitter.schemas import FlightParamsModel
 from terrain_splitter.solver_graphcut import solve_partition_hierarchy
-from terrain_splitter.solver_frontier import EvaluatedRegion, _pareto_frontier, _plan_from_regions
+from terrain_splitter.solver_frontier import (
+    BoundaryStats,
+    EvaluatedRegion,
+    RootSplitTask,
+    SolverContext,
+    _deserialize_partition_plan,
+    _feature_lookup,
+    _neighbor_lookup,
+    _pareto_frontier,
+    _plan_from_regions,
+    _serialize_partition_plan,
+    _serialize_solver_context,
+    _solve_root_split_branch_with_context,
+    _cell_lookup,
+    solve_root_split_branch_event,
+)
 
 
 def _toy_grid() -> GridData:
@@ -69,6 +84,90 @@ def test_solver_frontier_contains_face_aligned_quality_solution() -> None:
         sorted(round(region.bearingDeg) % 180 for region in solution.regions) == [0, 90]
         for solution in solutions
     )
+
+
+def test_solver_parallel_root_path_matches_serial_frontier() -> None:
+    grid = _toy_grid()
+    feature_field = FeatureField(
+        cells=[
+            CellFeatures(index=0, preferred_bearing_deg=0, slope_magnitude=0.3, break_strength=18, confidence=0.9, aspect_deg=270),
+            CellFeatures(index=1, preferred_bearing_deg=0, slope_magnitude=0.25, break_strength=18, confidence=0.85, aspect_deg=270),
+            CellFeatures(index=2, preferred_bearing_deg=90, slope_magnitude=0.28, break_strength=18, confidence=0.88, aspect_deg=0),
+            CellFeatures(index=3, preferred_bearing_deg=90, slope_magnitude=0.26, break_strength=18, confidence=0.86, aspect_deg=0),
+        ],
+        dominant_preferred_bearing_deg=45,
+    )
+    params = FlightParamsModel(payloadKind="camera", altitudeAGL=120, frontOverlap=70, sideOverlap=70, cameraKey="MAP61_17MM")
+
+    serial = solve_partition_hierarchy(grid, feature_field, params, root_parallel_workers=0)
+    parallel = solve_partition_hierarchy(grid, feature_field, params, root_parallel_workers=2)
+
+    def summarize(solution_list):
+        return [
+            (
+                solution.regionCount,
+                round(solution.totalMissionTimeSec, 6),
+                round(solution.normalizedQualityCost, 6),
+                tuple(
+                    (
+                        round(region.areaM2, 6),
+                        round(region.bearingDeg, 6),
+                        tuple((round(lng, 8), round(lat, 8)) for lng, lat in region.ring),
+                    )
+                    for region in solution.regions
+                ),
+            )
+            for solution in solution_list
+        ]
+
+    assert summarize(serial) == summarize(parallel)
+
+
+def test_lambda_root_split_worker_event_matches_direct_branch_solver() -> None:
+    grid = _toy_grid()
+    feature_field = FeatureField(
+        cells=[
+            CellFeatures(index=0, preferred_bearing_deg=0, slope_magnitude=0.3, break_strength=18, confidence=0.9, aspect_deg=270),
+            CellFeatures(index=1, preferred_bearing_deg=0, slope_magnitude=0.25, break_strength=18, confidence=0.85, aspect_deg=270),
+            CellFeatures(index=2, preferred_bearing_deg=90, slope_magnitude=0.28, break_strength=18, confidence=0.88, aspect_deg=0),
+            CellFeatures(index=3, preferred_bearing_deg=90, slope_magnitude=0.26, break_strength=18, confidence=0.86, aspect_deg=0),
+        ],
+        dominant_preferred_bearing_deg=45,
+        dominant_aspect_deg=315,
+    )
+    params = FlightParamsModel(payloadKind="camera", altitudeAGL=120, frontOverlap=70, sideOverlap=70, cameraKey="MAP61_17MM")
+    context = SolverContext(
+        grid=grid,
+        feature_field=feature_field,
+        params=params,
+        root_area_m2=max(1.0, grid.area_m2),
+        feature_lookup=_feature_lookup(feature_field),
+        cell_lookup=_cell_lookup(grid),
+        neighbors=_neighbor_lookup(grid),
+    )
+    task = RootSplitTask(
+        left_ids=(0, 1),
+        right_ids=(2, 3),
+        boundary=BoundaryStats(shared_boundary_m=10.0, break_weight_sum=25.0),
+        depth=1,
+    )
+
+    direct_frontier, _ = _solve_root_split_branch_with_context(task, context)
+    worker_payload = {
+        "context": _serialize_solver_context(context),
+        "task": {
+            "leftIds": list(task.left_ids),
+            "rightIds": list(task.right_ids),
+            "boundary": {"sharedBoundaryM": task.boundary.shared_boundary_m, "breakWeightSum": task.boundary.break_weight_sum},
+            "depth": task.depth,
+        },
+    }
+    worker_result = solve_root_split_branch_event(worker_payload)
+    worker_frontier = [_deserialize_partition_plan(plan) for plan in worker_result["plans"]]
+
+    assert [_serialize_partition_plan(plan) for plan in direct_frontier] == [
+        _serialize_partition_plan(plan) for plan in worker_frontier
+    ]
 
 
 def _mock_region(area_m2: float, mean_line_length_m: float, *, region_id: int, bearing_deg: float = 0.0) -> EvaluatedRegion:

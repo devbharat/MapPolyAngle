@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import json
 import logging
 import math
+import os
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, replace
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from typing import Any, Literal
 
 import numpy as np
 from shapely.geometry import Polygon
+from shapely.wkt import loads as load_wkt
 
 from .costs import RegionObjective, RegionStaticInputs, evaluate_region_objective
 from .features import CellFeatures, FeatureField
@@ -23,7 +28,7 @@ from .geometry import (
     weighted_mean,
     weighted_quantile,
 )
-from .grid import GridCell, GridData
+from .grid import GridCell, GridData, GridEdge
 from .postprocess import region_polygon_from_cells
 from .schemas import FlightParamsModel, PartitionSolutionPreviewModel, RegionPreview
 
@@ -95,6 +100,90 @@ class PartitionPlan:
     largest_region_fraction: float
     mean_convexity: float
     region_count: int
+
+
+@dataclass(slots=True)
+class SolverContext:
+    grid: GridData
+    feature_field: FeatureField
+    params: FlightParamsModel
+    root_area_m2: float
+    feature_lookup: dict[int, CellFeatures]
+    cell_lookup: dict[int, GridCell]
+    neighbors: dict[int, list[int]]
+
+
+@dataclass(slots=True)
+class SolverCaches:
+    best_bearing_cache: dict[tuple[int, ...], float]
+    region_cache: dict[tuple[int, ...], EvaluatedRegion | None]
+    region_static_cache: dict[tuple[int, ...], RegionStatic | None]
+    region_bearing_core_cache: dict[tuple[tuple[int, ...], int], RegionBearingCore]
+    heading_candidates_cache: dict[tuple[int, ...], list[float]]
+    polygon_cache: dict[tuple[int, ...], Polygon | None]
+    frontier_cache: dict[tuple[tuple[int, ...], int], list[PartitionPlan]]
+
+
+@dataclass(slots=True)
+class RootSplitTask:
+    left_ids: tuple[int, ...]
+    right_ids: tuple[int, ...]
+    boundary: BoundaryStats
+    depth: int
+
+
+_PARALLEL_SOLVER_CONTEXT: SolverContext | None = None
+
+
+def _make_solver_caches() -> SolverCaches:
+    return SolverCaches(
+        best_bearing_cache={},
+        region_cache={},
+        region_static_cache={},
+        region_bearing_core_cache={},
+        heading_candidates_cache={},
+        polygon_cache={},
+        frontier_cache={},
+    )
+
+
+def _make_perf() -> defaultdict[str, float]:
+    return defaultdict(float)
+
+
+def _merge_perf(target: dict[str, float], source: dict[str, float]) -> None:
+    for key, value in source.items():
+        target[key] += value
+
+
+def _resolve_root_parallel_workers(requested: int | None) -> int:
+    if requested is not None:
+        return max(0, int(requested))
+    raw = os.environ.get("TERRAIN_SPLITTER_ROOT_PARALLEL_WORKERS")
+    if raw is None or raw.strip() == "":
+        return 0
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        logger.warning(
+            "[terrain-split-backend] invalid TERRAIN_SPLITTER_ROOT_PARALLEL_WORKERS=%r; falling back to serial",
+            raw,
+        )
+        return 0
+
+
+def _resolve_root_parallel_mode(requested: Literal["process", "lambda"] | None) -> Literal["process", "lambda"]:
+    if requested in {"process", "lambda"}:
+        return requested
+    raw = (os.environ.get("TERRAIN_SPLITTER_ROOT_PARALLEL_MODE") or "process").strip().lower()
+    if raw == "lambda":
+        return "lambda"
+    return "process"
+
+
+def _init_parallel_solver_context(context: SolverContext) -> None:
+    global _PARALLEL_SOLVER_CONTEXT
+    _PARALLEL_SOLVER_CONTEXT = context
 
 
 def _feature_lookup(feature_field: FeatureField) -> dict[int, CellFeatures]:
@@ -863,6 +952,474 @@ def _generate_split_candidates(
     return candidates[:MAX_SPLIT_OPTIONS]
 
 
+def _build_region_for_context(
+    cell_ids: tuple[int, ...],
+    boundary_alignment: float,
+    context: SolverContext,
+    caches: SolverCaches,
+    perf: dict[str, float],
+) -> EvaluatedRegion | None:
+    return _build_region(
+        cell_ids,
+        boundary_alignment,
+        context.grid,
+        context.neighbors,
+        context.feature_lookup,
+        context.cell_lookup,
+        context.feature_field,
+        context.params,
+        caches.best_bearing_cache,
+        caches.region_cache,
+        caches.region_static_cache,
+        caches.region_bearing_core_cache,
+        caches.heading_candidates_cache,
+        caches.polygon_cache,
+        perf,
+    )
+
+
+def _generate_split_candidates_for_context(
+    baseline_region: EvaluatedRegion,
+    baseline_plan: PartitionPlan,
+    cell_ids: tuple[int, ...],
+    context: SolverContext,
+    caches: SolverCaches,
+    perf: dict[str, float],
+) -> list[SplitCandidate]:
+    return _generate_split_candidates(
+        baseline_region,
+        baseline_plan,
+        cell_ids,
+        context.root_area_m2,
+        context.grid,
+        context.feature_lookup,
+        context.cell_lookup,
+        context.feature_field,
+        context.params,
+        context.neighbors,
+        caches.best_bearing_cache,
+        caches.region_cache,
+        caches.region_static_cache,
+        caches.region_bearing_core_cache,
+        caches.heading_candidates_cache,
+        caches.polygon_cache,
+        perf,
+    )
+
+
+def _solve_region_recursive(
+    cell_ids: tuple[int, ...],
+    depth: int,
+    context: SolverContext,
+    caches: SolverCaches,
+    perf: dict[str, float],
+) -> list[PartitionPlan]:
+    perf["solve_region_calls"] += 1
+    key = (cell_ids, depth)
+    cached = caches.frontier_cache.get(key)
+    if cached is not None:
+        perf["solve_region_cache_hits"] += 1
+        return cached
+
+    baseline_region = _build_region_for_context(cell_ids, 0.0, context, caches, perf)
+    if baseline_region is None:
+        caches.frontier_cache[key] = []
+        return []
+
+    baseline_plan = _plan_from_regions((baseline_region,), 0.0, 0.0)
+    if depth <= 0 or len(cell_ids) < 4 or baseline_region.objective.flight_line_count < 1:
+        caches.frontier_cache[key] = [baseline_plan]
+        perf["baseline_leaf_plans"] += 1
+        return [baseline_plan]
+
+    candidates = [baseline_plan]
+    split_gen_started_at = time.perf_counter()
+    for split in _generate_split_candidates_for_context(
+        baseline_region,
+        baseline_plan,
+        cell_ids,
+        context,
+        caches,
+        perf,
+    ):
+        left_frontier = _solve_region_recursive(split.left_ids, depth - 1, context, caches, perf) or []
+        right_frontier = _solve_region_recursive(split.right_ids, depth - 1, context, caches, perf) or []
+        if not left_frontier or not right_frontier:
+            continue
+        for left_plan in left_frontier:
+            for right_plan in right_frontier:
+                combined = _combine_plans(left_plan, right_plan, split.boundary)
+                if combined.region_count > MAX_REGIONS:
+                    perf["combine_region_limit_rejections"] += 1
+                    continue
+                candidates.append(combined)
+                perf["combined_plan_candidates"] += 1
+    perf["split_generation_ms"] += (time.perf_counter() - split_gen_started_at) * 1000.0
+
+    frontier = _pareto_frontier(candidates, context.root_area_m2)
+    perf["frontier_plan_count"] += len(frontier)
+    caches.frontier_cache[key] = frontier
+    return frontier
+
+
+def _solve_root_split_branch(task: RootSplitTask) -> tuple[list[PartitionPlan], dict[str, float]]:
+    if _PARALLEL_SOLVER_CONTEXT is None:
+        raise RuntimeError("Parallel solver context is not initialized.")
+    context = _PARALLEL_SOLVER_CONTEXT
+    return _solve_root_split_branch_with_context(task, context)
+
+
+def _solve_root_split_branch_with_context(
+    task: RootSplitTask,
+    context: SolverContext,
+) -> tuple[list[PartitionPlan], dict[str, float]]:
+    caches = _make_solver_caches()
+    perf = _make_perf()
+    left_frontier = _solve_region_recursive(task.left_ids, task.depth, context, caches, perf) or []
+    right_frontier = _solve_region_recursive(task.right_ids, task.depth, context, caches, perf) or []
+    if not left_frontier or not right_frontier:
+        return [], dict(perf)
+    combined_candidates: list[PartitionPlan] = []
+    for left_plan in left_frontier:
+        for right_plan in right_frontier:
+            combined = _combine_plans(left_plan, right_plan, task.boundary)
+            if combined.region_count > MAX_REGIONS:
+                perf["combine_region_limit_rejections"] += 1
+                continue
+            combined_candidates.append(combined)
+            perf["combined_plan_candidates"] += 1
+    branch_frontier = _pareto_frontier(combined_candidates, context.root_area_m2)
+    perf["frontier_plan_count"] += len(branch_frontier)
+    return branch_frontier, dict(perf)
+
+
+def _serialize_polygon(polygon: Polygon) -> str:
+    return polygon.wkt
+
+
+def _serialize_grid(grid: GridData) -> dict[str, Any]:
+    return {
+        "ring": grid.ring,
+        "polygonWkt": _serialize_polygon(grid.polygon_mercator),
+        "cells": [
+            {
+                "index": cell.index,
+                "row": cell.row,
+                "col": cell.col,
+                "x": cell.x,
+                "y": cell.y,
+                "lng": cell.lng,
+                "lat": cell.lat,
+                "areaM2": cell.area_m2,
+                "terrainZ": cell.terrain_z,
+                "polygonWkt": _serialize_polygon(cell.polygon),
+            }
+            for cell in grid.cells
+        ],
+        "edges": [
+            {
+                "a": edge.a,
+                "b": edge.b,
+                "sharedBoundaryM": edge.shared_boundary_m,
+            }
+            for edge in grid.edges
+        ],
+        "gridStepM": grid.grid_step_m,
+        "areaM2": grid.area_m2,
+    }
+
+
+def _deserialize_grid(payload: dict[str, Any]) -> GridData:
+    return GridData(
+        ring=[tuple(coord) for coord in payload["ring"]],
+        polygon_mercator=load_wkt(payload["polygonWkt"]),
+        cells=[
+            GridCell(
+                index=cell["index"],
+                row=cell["row"],
+                col=cell["col"],
+                x=cell["x"],
+                y=cell["y"],
+                lng=cell["lng"],
+                lat=cell["lat"],
+                area_m2=cell["areaM2"],
+                terrain_z=cell["terrainZ"],
+                polygon=load_wkt(cell["polygonWkt"]),
+            )
+            for cell in payload["cells"]
+        ],
+        edges=[
+            GridEdge(
+                a=edge["a"],
+                b=edge["b"],
+                shared_boundary_m=edge["sharedBoundaryM"],
+            )
+            for edge in payload["edges"]
+        ],
+        grid_step_m=payload["gridStepM"],
+        area_m2=payload["areaM2"],
+    )
+
+
+def _serialize_feature_field(feature_field: FeatureField) -> dict[str, Any]:
+    return {
+        "cells": [
+            {
+                "index": cell.index,
+                "preferredBearingDeg": cell.preferred_bearing_deg,
+                "slopeMagnitude": cell.slope_magnitude,
+                "breakStrength": cell.break_strength,
+                "confidence": cell.confidence,
+                "aspectDeg": cell.aspect_deg,
+            }
+            for cell in feature_field.cells
+        ],
+        "dominantPreferredBearingDeg": feature_field.dominant_preferred_bearing_deg,
+        "dominantAspectDeg": feature_field.dominant_aspect_deg,
+    }
+
+
+def _deserialize_feature_field(payload: dict[str, Any]) -> FeatureField:
+    return FeatureField(
+        cells=[
+            CellFeatures(
+                index=cell["index"],
+                preferred_bearing_deg=cell["preferredBearingDeg"],
+                slope_magnitude=cell["slopeMagnitude"],
+                break_strength=cell["breakStrength"],
+                confidence=cell["confidence"],
+                aspect_deg=cell["aspectDeg"],
+            )
+            for cell in payload["cells"]
+        ],
+        dominant_preferred_bearing_deg=payload.get("dominantPreferredBearingDeg"),
+        dominant_aspect_deg=payload.get("dominantAspectDeg"),
+    )
+
+
+def _serialize_solver_context(context: SolverContext) -> dict[str, Any]:
+    return {
+        "grid": _serialize_grid(context.grid),
+        "featureField": _serialize_feature_field(context.feature_field),
+        "params": context.params.model_dump(mode="json"),
+    }
+
+
+def _deserialize_solver_context(payload: dict[str, Any]) -> SolverContext:
+    grid = _deserialize_grid(payload["grid"])
+    feature_field = _deserialize_feature_field(payload["featureField"])
+    return SolverContext(
+        grid=grid,
+        feature_field=feature_field,
+        params=FlightParamsModel.model_validate(payload["params"]),
+        root_area_m2=max(1.0, grid.area_m2),
+        feature_lookup=_feature_lookup(feature_field),
+        cell_lookup=_cell_lookup(grid),
+        neighbors=_neighbor_lookup(grid),
+    )
+
+
+def _serialize_boundary(boundary: BoundaryStats) -> dict[str, float]:
+    return {
+        "sharedBoundaryM": boundary.shared_boundary_m,
+        "breakWeightSum": boundary.break_weight_sum,
+    }
+
+
+def _deserialize_boundary(payload: dict[str, Any]) -> BoundaryStats:
+    return BoundaryStats(
+        shared_boundary_m=payload["sharedBoundaryM"],
+        break_weight_sum=payload["breakWeightSum"],
+    )
+
+
+def _serialize_root_split_task(task: RootSplitTask) -> dict[str, Any]:
+    return {
+        "leftIds": list(task.left_ids),
+        "rightIds": list(task.right_ids),
+        "boundary": _serialize_boundary(task.boundary),
+        "depth": task.depth,
+    }
+
+
+def _deserialize_root_split_task(payload: dict[str, Any]) -> RootSplitTask:
+    return RootSplitTask(
+        left_ids=tuple(payload["leftIds"]),
+        right_ids=tuple(payload["rightIds"]),
+        boundary=_deserialize_boundary(payload["boundary"]),
+        depth=payload["depth"],
+    )
+
+
+def _serialize_region_objective(objective: RegionObjective) -> dict[str, Any]:
+    return {
+        "bearingDeg": objective.bearing_deg,
+        "normalizedQualityCost": objective.normalized_quality_cost,
+        "totalMissionTimeSec": objective.total_mission_time_sec,
+        "weightedMeanMismatchDeg": objective.weighted_mean_mismatch_deg,
+        "areaM2": objective.area_m2,
+        "convexity": objective.convexity,
+        "compactness": objective.compactness,
+        "boundaryBreakAlignment": objective.boundary_break_alignment,
+        "flightLineCount": objective.flight_line_count,
+        "lineSpacingM": objective.line_spacing_m,
+        "alongTrackLengthM": objective.along_track_length_m,
+        "crossTrackWidthM": objective.cross_track_width_m,
+        "fragmentedLineFraction": objective.fragmented_line_fraction,
+        "overflightTransitFraction": objective.overflight_transit_fraction,
+        "shortLineFraction": objective.short_line_fraction,
+        "meanLineLengthM": objective.mean_line_length_m,
+        "medianLineLengthM": objective.median_line_length_m,
+        "meanLineLiftM": objective.mean_line_lift_m,
+        "p90LineLiftM": objective.p90_line_lift_m,
+        "maxLineLiftM": objective.max_line_lift_m,
+        "elevatedAreaFraction": objective.elevated_area_fraction,
+        "severeLiftAreaFraction": objective.severe_lift_area_fraction,
+    }
+
+
+def _deserialize_region_objective(payload: dict[str, Any]) -> RegionObjective:
+    return RegionObjective(
+        bearing_deg=payload["bearingDeg"],
+        normalized_quality_cost=payload["normalizedQualityCost"],
+        total_mission_time_sec=payload["totalMissionTimeSec"],
+        weighted_mean_mismatch_deg=payload["weightedMeanMismatchDeg"],
+        area_m2=payload["areaM2"],
+        convexity=payload["convexity"],
+        compactness=payload["compactness"],
+        boundary_break_alignment=payload["boundaryBreakAlignment"],
+        flight_line_count=payload["flightLineCount"],
+        line_spacing_m=payload["lineSpacingM"],
+        along_track_length_m=payload["alongTrackLengthM"],
+        cross_track_width_m=payload["crossTrackWidthM"],
+        fragmented_line_fraction=payload["fragmentedLineFraction"],
+        overflight_transit_fraction=payload["overflightTransitFraction"],
+        short_line_fraction=payload["shortLineFraction"],
+        mean_line_length_m=payload["meanLineLengthM"],
+        median_line_length_m=payload["medianLineLengthM"],
+        mean_line_lift_m=payload["meanLineLiftM"],
+        p90_line_lift_m=payload["p90LineLiftM"],
+        max_line_lift_m=payload["maxLineLiftM"],
+        elevated_area_fraction=payload["elevatedAreaFraction"],
+        severe_lift_area_fraction=payload["severeLiftAreaFraction"],
+    )
+
+
+def _serialize_evaluated_region(region: EvaluatedRegion) -> dict[str, Any]:
+    return {
+        "cellIds": list(region.cell_ids),
+        "ring": region.ring,
+        "objective": _serialize_region_objective(region.objective),
+        "score": region.score,
+        "hardInvalid": region.hard_invalid,
+    }
+
+
+def _deserialize_evaluated_region(payload: dict[str, Any]) -> EvaluatedRegion:
+    return EvaluatedRegion(
+        cell_ids=tuple(payload["cellIds"]),
+        polygon=Polygon(),
+        ring=[tuple(coord) for coord in payload["ring"]],
+        objective=_deserialize_region_objective(payload["objective"]),
+        score=payload["score"],
+        hard_invalid=payload["hardInvalid"],
+    )
+
+
+def _serialize_partition_plan(plan: PartitionPlan) -> dict[str, Any]:
+    return {
+        "regions": [_serialize_evaluated_region(region) for region in plan.regions],
+        "qualityCost": plan.quality_cost,
+        "missionTimeSec": plan.mission_time_sec,
+        "weightedMeanMismatchDeg": plan.weighted_mean_mismatch_deg,
+        "internalBoundaryM": plan.internal_boundary_m,
+        "breakWeightSum": plan.break_weight_sum,
+        "largestRegionFraction": plan.largest_region_fraction,
+        "meanConvexity": plan.mean_convexity,
+        "regionCount": plan.region_count,
+    }
+
+
+def _deserialize_partition_plan(payload: dict[str, Any]) -> PartitionPlan:
+    return PartitionPlan(
+        regions=tuple(_deserialize_evaluated_region(region) for region in payload["regions"]),
+        quality_cost=payload["qualityCost"],
+        mission_time_sec=payload["missionTimeSec"],
+        weighted_mean_mismatch_deg=payload["weightedMeanMismatchDeg"],
+        internal_boundary_m=payload["internalBoundaryM"],
+        break_weight_sum=payload["breakWeightSum"],
+        largest_region_fraction=payload["largestRegionFraction"],
+        mean_convexity=payload["meanConvexity"],
+        region_count=payload["regionCount"],
+    )
+
+
+def solve_root_split_branch_event(payload: dict[str, Any]) -> dict[str, Any]:
+    context = _deserialize_solver_context(payload["context"])
+    task = _deserialize_root_split_task(payload["task"])
+    frontier, perf = _solve_root_split_branch_with_context(task, context)
+    return {
+        "plans": [_serialize_partition_plan(plan) for plan in frontier],
+        "perf": perf,
+    }
+
+
+def _invoke_root_split_branch_lambda(
+    function_name: str,
+    context: SolverContext,
+    task: RootSplitTask,
+) -> tuple[list[PartitionPlan], dict[str, float]]:
+    try:
+        import boto3
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError("boto3 is required for Lambda root fan-out mode.") from exc
+
+    client = boto3.client("lambda")
+    payload = {
+        "terrainSplitterInternal": "root-split",
+        "payload": {
+            "context": _serialize_solver_context(context),
+            "task": _serialize_root_split_task(task),
+        },
+    }
+    response = client.invoke(
+        FunctionName=function_name,
+        InvocationType="RequestResponse",
+        Payload=json.dumps(payload).encode("utf-8"),
+    )
+    if "FunctionError" in response:
+        error_payload = response["Payload"].read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Lambda root split invocation failed: {error_payload}")
+    raw_payload = response["Payload"].read()
+    decoded = json.loads(raw_payload.decode("utf-8"))
+    return (
+        [_deserialize_partition_plan(plan) for plan in decoded["plans"]],
+        {key: float(value) for key, value in decoded.get("perf", {}).items()},
+    )
+
+
+def _solve_root_splits_via_lambda(
+    tasks: list[RootSplitTask],
+    context: SolverContext,
+    max_workers: int,
+) -> tuple[list[PartitionPlan], dict[str, float]]:
+    function_name = os.environ.get("AWS_LAMBDA_FUNCTION_NAME")
+    if not function_name:
+        raise RuntimeError("AWS_LAMBDA_FUNCTION_NAME is required for Lambda root fan-out mode.")
+    perf = _make_perf()
+    plans: list[PartitionPlan] = []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(_invoke_root_split_branch_lambda, function_name, context, task)
+            for task in tasks
+        ]
+        for future in futures:
+            branch_frontier, branch_perf = future.result()
+            plans.extend(branch_frontier)
+            _merge_perf(perf, branch_perf)
+    return plans, perf
+
+
 def solve_partition_hierarchy(
     grid: GridData,
     feature_field: FeatureField,
@@ -871,6 +1428,8 @@ def solve_partition_hierarchy(
     *,
     request_id: str | None = None,
     polygon_id: str | None = None,
+    root_parallel_workers: int | None = None,
+    root_parallel_mode: Literal["process", "lambda"] | None = None,
 ) -> list[PartitionSolutionPreviewModel]:
     solve_started_at = time.perf_counter()
     if not grid.cells:
@@ -879,103 +1438,102 @@ def solve_partition_hierarchy(
     feature_lookup = _feature_lookup(feature_field)
     cell_lookup = _cell_lookup(grid)
     neighbors = _neighbor_lookup(grid)
-    perf: defaultdict[str, float] = defaultdict(float)
-    best_bearing_cache: dict[tuple[int, ...], float] = {}
-    region_cache: dict[tuple[int, ...], EvaluatedRegion | None] = {}
-    region_static_cache: dict[tuple[int, ...], RegionStatic | None] = {}
-    region_bearing_core_cache: dict[tuple[tuple[int, ...], int], RegionBearingCore] = {}
-    heading_candidates_cache: dict[tuple[int, ...], list[float]] = {}
-    polygon_cache: dict[tuple[int, ...], Polygon | None] = {}
-    frontier_cache: dict[tuple[tuple[int, ...], int], list[PartitionPlan]] = {}
+    perf = _make_perf()
+    caches = _make_solver_caches()
     root_area_m2 = max(1.0, grid.area_m2)
+    context = SolverContext(
+        grid=grid,
+        feature_field=feature_field,
+        params=params,
+        root_area_m2=root_area_m2,
+        feature_lookup=feature_lookup,
+        cell_lookup=cell_lookup,
+        neighbors=neighbors,
+    )
     max_depth = DEFAULT_DEPTH_SMALL if len(grid.cells) <= 140 else DEFAULT_DEPTH_LARGE
 
-    def solve_region(cell_ids: tuple[int, ...], depth: int) -> list[PartitionPlan]:
-        perf["solve_region_calls"] += 1
-        key = (cell_ids, depth)
-        cached = frontier_cache.get(key)
-        if cached is not None:
-            perf["solve_region_cache_hits"] += 1
-            return cached
-
-        baseline_region = _build_region(
-            cell_ids,
-            0.0,
-            grid,
-            neighbors,
-            feature_lookup,
-            cell_lookup,
-            feature_field,
-            params,
-            best_bearing_cache,
-            region_cache,
-            region_static_cache,
-            region_bearing_core_cache,
-            heading_candidates_cache,
-            polygon_cache,
-            perf,
-        )
-        if baseline_region is None:
-            frontier_cache[key] = []
-            return []
-
-        baseline_plan = _plan_from_regions((baseline_region,), 0.0, 0.0)
-        if depth <= 0 or len(cell_ids) < 4 or baseline_region.objective.flight_line_count < 1:
-            frontier_cache[key] = [baseline_plan]
-            perf["baseline_leaf_plans"] += 1
-            return [baseline_plan]
-
-        candidates = [baseline_plan]
-        split_gen_started_at = time.perf_counter()
-        for split in _generate_split_candidates(
-            baseline_region,
-            baseline_plan,
-            cell_ids,
-            root_area_m2,
-            grid,
-            feature_lookup,
-            cell_lookup,
-            feature_field,
-            params,
-            neighbors,
-            best_bearing_cache,
-            region_cache,
-            region_static_cache,
-            region_bearing_core_cache,
-            heading_candidates_cache,
-            polygon_cache,
-            perf,
-        ):
-            left_frontier = solve_region(split.left_ids, depth - 1) or []
-            right_frontier = solve_region(split.right_ids, depth - 1) or []
-            if not left_frontier or not right_frontier:
-                continue
-            for left_plan in left_frontier:
-                for right_plan in right_frontier:
-                    combined = _combine_plans(left_plan, right_plan, split.boundary)
-                    if combined.region_count > MAX_REGIONS:
-                        perf["combine_region_limit_rejections"] += 1
-                        continue
-                    candidates.append(combined)
-                    perf["combined_plan_candidates"] += 1
-        perf["split_generation_ms"] += (time.perf_counter() - split_gen_started_at) * 1000.0
-
-        frontier = _pareto_frontier(candidates, root_area_m2)
-        perf["frontier_plan_count"] += len(frontier)
-        frontier_cache[key] = frontier
-        return frontier
-
     root_cell_ids = tuple(sorted(cell_lookup))
-    all_plans = solve_region(root_cell_ids, max_depth)
+    requested_workers = _resolve_root_parallel_workers(root_parallel_workers)
+    parallel_mode = _resolve_root_parallel_mode(root_parallel_mode)
+    all_plans: list[PartitionPlan]
+    if requested_workers <= 1:
+        all_plans = _solve_region_recursive(root_cell_ids, max_depth, context, caches, perf)
+    else:
+        baseline_region = _build_region_for_context(root_cell_ids, 0.0, context, caches, perf)
+        if baseline_region is None:
+            all_plans = []
+        else:
+            baseline_plan = _plan_from_regions((baseline_region,), 0.0, 0.0)
+            if max_depth <= 0 or len(root_cell_ids) < 4 or baseline_region.objective.flight_line_count < 1:
+                perf["baseline_leaf_plans"] += 1
+                all_plans = [baseline_plan]
+            else:
+                root_splits = _generate_split_candidates_for_context(
+                    baseline_region,
+                    baseline_plan,
+                    root_cell_ids,
+                    context,
+                    caches,
+                    perf,
+                )
+                usable_workers = min(requested_workers, len(root_splits))
+                if usable_workers <= 1 or not root_splits:
+                    all_plans = _solve_region_recursive(root_cell_ids, max_depth, context, caches, perf)
+                else:
+                    perf["root_parallel_requested_workers"] = requested_workers
+                    perf["root_parallel_workers_used"] = usable_workers
+                    perf["root_parallel_split_count"] = len(root_splits)
+                    branch_started_at = time.perf_counter()
+                    branch_candidates: list[PartitionPlan] = []
+                    tasks = [
+                        RootSplitTask(
+                            left_ids=split.left_ids,
+                            right_ids=split.right_ids,
+                            boundary=split.boundary,
+                            depth=max_depth - 1,
+                        )
+                        for split in root_splits
+                    ]
+                    try:
+                        if parallel_mode == "lambda":
+                            lambda_plans, lambda_perf = _solve_root_splits_via_lambda(tasks, context, usable_workers)
+                            branch_candidates.extend(lambda_plans)
+                            _merge_perf(perf, lambda_perf)
+                        else:
+                            with ProcessPoolExecutor(
+                                max_workers=usable_workers,
+                                initializer=_init_parallel_solver_context,
+                                initargs=(context,),
+                            ) as executor:
+                                for branch_frontier, branch_perf in executor.map(_solve_root_split_branch, tasks):
+                                    branch_candidates.extend(branch_frontier)
+                                    _merge_perf(perf, branch_perf)
+                    except Exception:  # noqa: BLE001
+                        logger.exception(
+                            "[terrain-split-backend][%s] root-parallel solve failed polygonId=%s mode=%s; falling back to serial",
+                            request_id or "<none>",
+                            polygon_id or "<none>",
+                            parallel_mode,
+                        )
+                        perf["root_parallel_failures"] += 1
+                        all_plans = _solve_region_recursive(root_cell_ids, max_depth, context, caches, perf)
+                    else:
+                        perf["root_parallel_ms"] += (time.perf_counter() - branch_started_at) * 1000.0
+                        all_plans = _pareto_frontier([baseline_plan] + branch_candidates, root_area_m2)
+                        perf["frontier_plan_count"] += len(all_plans)
     if not all_plans:
         total_ms = (time.perf_counter() - solve_started_at) * 1000.0
         logger.info(
-            "[terrain-split-backend][%s] solver finished polygonId=%s cells=%d maxDepth=%d totalMs=%.1f allPlans=0 solveRegionCalls=%d cacheHits=%d regionCacheHits=%d regionCacheMisses=%d regionStaticHits=%d regionStaticMisses=%d regionBearingHits=%d regionBearingMisses=%d buildRegionCalls=%d objectiveCalls=%d splitAttempts=%d kept=%d",
+            "[terrain-split-backend][%s] solver finished polygonId=%s cells=%d maxDepth=%d totalMs=%.1f allPlans=0 rootParallelMode=%s rootParallelRequested=%d rootParallelUsed=%d rootParallelSplits=%d solveRegionCalls=%d cacheHits=%d regionCacheHits=%d regionCacheMisses=%d regionStaticHits=%d regionStaticMisses=%d regionBearingHits=%d regionBearingMisses=%d buildRegionCalls=%d objectiveCalls=%d splitAttempts=%d kept=%d",
             request_id or "<none>",
             polygon_id or "<none>",
             len(grid.cells),
             max_depth,
             total_ms,
+            parallel_mode,
+            requested_workers,
+            int(perf["root_parallel_workers_used"]),
+            int(perf["root_parallel_split_count"]),
             int(perf["solve_region_calls"]),
             int(perf["solve_region_cache_hits"]),
             int(perf["region_cache_hits"]),
@@ -1000,13 +1558,18 @@ def solve_partition_hierarchy(
     if not practical:
         total_ms = (time.perf_counter() - solve_started_at) * 1000.0
         logger.info(
-            "[terrain-split-backend][%s] solver finished polygonId=%s cells=%d maxDepth=%d totalMs=%.1f allPlans=%d practicalPlans=0 solveRegionCalls=%d cacheHits=%d regionCacheHits=%d regionCacheMisses=%d regionStaticHits=%d regionStaticMisses=%d regionBearingHits=%d regionBearingMisses=%d buildRegionCalls=%d buildRegionMs=%.1f regionStaticBuildMs=%.1f polygonMs=%.1f objectiveCalls=%d objectiveMs=%.1f regionBearingCoreMs=%.1f nodeCostMs=%.1f lineLiftMs=%.1f flightTimeMs=%.1f shapeMetricMs=%.1f splitGenMs=%.1f splitAttempts=%d kept=%d returned=%d",
+            "[terrain-split-backend][%s] solver finished polygonId=%s cells=%d maxDepth=%d totalMs=%.1f allPlans=%d practicalPlans=0 rootParallelMode=%s rootParallelRequested=%d rootParallelUsed=%d rootParallelSplits=%d rootParallelMs=%.1f solveRegionCalls=%d cacheHits=%d regionCacheHits=%d regionCacheMisses=%d regionStaticHits=%d regionStaticMisses=%d regionBearingHits=%d regionBearingMisses=%d buildRegionCalls=%d buildRegionMs=%.1f regionStaticBuildMs=%.1f polygonMs=%.1f objectiveCalls=%d objectiveMs=%.1f regionBearingCoreMs=%.1f nodeCostMs=%.1f lineLiftMs=%.1f flightTimeMs=%.1f shapeMetricMs=%.1f splitGenMs=%.1f splitAttempts=%d kept=%d returned=%d",
             request_id or "<none>",
             polygon_id or "<none>",
             len(grid.cells),
             max_depth,
             total_ms,
             len(all_plans),
+            parallel_mode,
+            requested_workers,
+            int(perf["root_parallel_workers_used"]),
+            int(perf["root_parallel_split_count"]),
+            perf["root_parallel_ms"],
             int(perf["solve_region_calls"]),
             int(perf["solve_region_cache_hits"]),
             int(perf["region_cache_hits"]),
@@ -1103,7 +1666,7 @@ def solve_partition_hierarchy(
     region_static_attempts = perf["region_static_hits"] + perf["region_static_misses"]
     region_bearing_attempts = perf["region_bearing_hits"] + perf["region_bearing_misses"]
     logger.info(
-        "[terrain-split-backend][%s] solver finished polygonId=%s cells=%d maxDepth=%d totalMs=%.1f allPlans=%d practicalPlans=%d returnedSolutions=%d solveRegionCalls=%d cacheHits=%d regionCacheHits=%d regionCacheMisses=%d regionCacheHitRate=%.3f regionStaticHits=%d regionStaticMisses=%d regionStaticHitRate=%.3f regionStaticNullHits=%d regionBearingHits=%d regionBearingMisses=%d regionBearingHitRate=%.3f regionBearingRewraps=%d buildRegionCalls=%d buildRegionMs=%.1f regionStaticBuildMs=%.1f polygonMs=%.1f polygonFailures=%d objectiveCalls=%d objectiveMs=%.1f regionBearingCoreMs=%.1f nodeCostMs=%.1f lineLiftMs=%.1f flightTimeMs=%.1f shapeMetricMs=%.1f splitGenMs=%.1f splitDirections=%d splitAttempts=%d kept=%d returned=%d smallChildRejects=%d duplicateRejects=%d disconnectedRejects=%d boundaryRejects=%d regionBuildRejects=%d validityRejects=%d nonImprovingRejects=%d combinedCandidates=%d frontierStates=%d",
+        "[terrain-split-backend][%s] solver finished polygonId=%s cells=%d maxDepth=%d totalMs=%.1f allPlans=%d practicalPlans=%d returnedSolutions=%d rootParallelMode=%s rootParallelRequested=%d rootParallelUsed=%d rootParallelSplits=%d rootParallelMs=%.1f rootParallelFailures=%d solveRegionCalls=%d cacheHits=%d regionCacheHits=%d regionCacheMisses=%d regionCacheHitRate=%.3f regionStaticHits=%d regionStaticMisses=%d regionStaticHitRate=%.3f regionStaticNullHits=%d regionBearingHits=%d regionBearingMisses=%d regionBearingHitRate=%.3f regionBearingRewraps=%d buildRegionCalls=%d buildRegionMs=%.1f regionStaticBuildMs=%.1f polygonMs=%.1f polygonFailures=%d objectiveCalls=%d objectiveMs=%.1f regionBearingCoreMs=%.1f nodeCostMs=%.1f lineLiftMs=%.1f flightTimeMs=%.1f shapeMetricMs=%.1f splitGenMs=%.1f splitDirections=%d splitAttempts=%d kept=%d returned=%d smallChildRejects=%d duplicateRejects=%d disconnectedRejects=%d boundaryRejects=%d regionBuildRejects=%d validityRejects=%d nonImprovingRejects=%d combinedCandidates=%d frontierStates=%d",
         request_id or "<none>",
         polygon_id or "<none>",
         len(grid.cells),
@@ -1112,6 +1675,12 @@ def solve_partition_hierarchy(
         len(all_plans),
         len(practical),
         len(previews),
+        parallel_mode,
+        requested_workers,
+        int(perf["root_parallel_workers_used"]),
+        int(perf["root_parallel_split_count"]),
+        perf["root_parallel_ms"],
+        int(perf["root_parallel_failures"]),
         int(perf["solve_region_calls"]),
         int(perf["solve_region_cache_hits"]),
         int(perf["region_cache_hits"]),
