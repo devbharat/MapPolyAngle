@@ -240,7 +240,30 @@ def _plan_is_practical(plan: PartitionPlan, root_area_m2: float) -> bool:
     return True
 
 
-def _dominates(a: PartitionPlan, b: PartitionPlan) -> bool:
+def _dominates(
+    a: PartitionPlan,
+    b: PartitionPlan,
+    root_area_m2: float,
+    status_cache: dict[tuple[tuple[tuple[int, ...], int], ...], int],
+) -> bool:
+    status_a = status_cache.get(_plan_signature(a))
+    if status_a is None:
+        status_a = 2 if a.region_count <= 1 else (1 if _plan_is_practical(a, root_area_m2) else 0)
+        status_cache[_plan_signature(a)] = status_a
+    status_b = status_cache.get(_plan_signature(b))
+    if status_b is None:
+        status_b = 2 if b.region_count <= 1 else (1 if _plan_is_practical(b, root_area_m2) else 0)
+        status_cache[_plan_signature(b)] = status_b
+
+    # Keep "don't split" baselines as first-class options for parent composition.
+    if status_a == 2 or status_b == 2:
+        return False
+
+    # Non-practical plans are useful for search, but they should not suppress
+    # practical plans from the frontier because they can never be returned.
+    if status_a == 0 and status_b == 1:
+        return False
+
     better_or_equal = (
         a.quality_cost <= b.quality_cost + DOMINANCE_EPS
         and a.mission_time_sec <= b.mission_time_sec + DOMINANCE_EPS
@@ -252,32 +275,59 @@ def _dominates(a: PartitionPlan, b: PartitionPlan) -> bool:
     return better_or_equal and strictly_better
 
 
-def _thin_frontier(plans: list[PartitionPlan]) -> list[PartitionPlan]:
-    by_region_count: dict[int, list[PartitionPlan]] = defaultdict(list)
+def _thin_frontier(plans: list[PartitionPlan], root_area_m2: float) -> list[PartitionPlan]:
+    baseline_bucket: list[PartitionPlan] = []
+    practical_buckets: dict[int, list[PartitionPlan]] = defaultdict(list)
+    non_practical_buckets: dict[int, list[PartitionPlan]] = defaultdict(list)
     for plan in plans:
-        by_region_count[plan.region_count].append(plan)
+        if plan.region_count <= 1:
+            baseline_bucket.append(plan)
+        elif _plan_is_practical(plan, root_area_m2):
+            practical_buckets[plan.region_count].append(plan)
+        else:
+            non_practical_buckets[plan.region_count].append(plan)
+
     retained: list[PartitionPlan] = []
-    for region_count, bucket in by_region_count.items():
+    if baseline_bucket:
+        baseline_bucket.sort(key=lambda plan: (plan.mission_time_sec, plan.quality_cost))
+        retained.extend(baseline_bucket[:1])
+
+    for region_count, bucket in practical_buckets.items():
         bucket.sort(key=lambda plan: (plan.quality_cost, plan.mission_time_sec))
-        retained.extend(bucket[:4] if region_count > 1 else bucket[:1])
+        retained.extend(bucket[:4])
+
+    remaining = max(0, MAX_FRONTIER_STATES - len(retained))
+    if remaining > 0:
+        for region_count, bucket in non_practical_buckets.items():
+            bucket.sort(key=lambda plan: (plan.quality_cost, plan.mission_time_sec))
+            retained.extend(bucket[: min(2, remaining)])
+            remaining = max(0, MAX_FRONTIER_STATES - len(retained))
+            if remaining <= 0:
+                break
+
     retained.sort(key=lambda plan: (plan.region_count, plan.mission_time_sec, plan.quality_cost))
     return retained[:MAX_FRONTIER_STATES]
 
 
-def _pareto_frontier(plans: list[PartitionPlan]) -> list[PartitionPlan]:
+def _pareto_frontier(plans: list[PartitionPlan], root_area_m2: float) -> list[PartitionPlan]:
     unique: dict[tuple[tuple[tuple[int, ...], int], ...], PartitionPlan] = {}
     for plan in plans:
         signature = _plan_signature(plan)
         existing = unique.get(signature)
         if existing is None or plan.quality_cost < existing.quality_cost - DOMINANCE_EPS:
             unique[signature] = plan
+    status_cache: dict[tuple[tuple[tuple[int, ...], int], ...], int] = {}
     nondominated: list[PartitionPlan] = []
     for plan in sorted(unique.values(), key=lambda item: (item.mission_time_sec, item.quality_cost, item.region_count)):
-        if any(_dominates(existing, plan) for existing in nondominated):
+        if any(_dominates(existing, plan, root_area_m2, status_cache) for existing in nondominated):
             continue
-        nondominated = [existing for existing in nondominated if not _dominates(plan, existing)]
+        nondominated = [
+            existing
+            for existing in nondominated
+            if not _dominates(plan, existing, root_area_m2, status_cache)
+        ]
         nondominated.append(plan)
-    return _thin_frontier(nondominated)
+    return _thin_frontier(nondominated, root_area_m2)
 
 
 def _principal_axis_bearing(cell_ids: tuple[int, ...], cell_lookup: dict[int, GridCell]) -> float | None:
@@ -910,7 +960,7 @@ def solve_partition_hierarchy(
                     perf["combined_plan_candidates"] += 1
         perf["split_generation_ms"] += (time.perf_counter() - split_gen_started_at) * 1000.0
 
-        frontier = _pareto_frontier(candidates)
+        frontier = _pareto_frontier(candidates, root_area_m2)
         perf["frontier_plan_count"] += len(frontier)
         frontier_cache[key] = frontier
         return frontier
@@ -986,7 +1036,7 @@ def solve_partition_hierarchy(
     comparison_pool = practical[:]
     if baseline is not None:
         comparison_pool.append(baseline)
-    filtered = _pareto_frontier(comparison_pool)
+    filtered = _pareto_frontier(comparison_pool, root_area_m2)
     practical_filtered = [plan for plan in filtered if plan.region_count > 1 and _plan_is_practical(plan, root_area_m2)]
     if not practical_filtered:
         return []

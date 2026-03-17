@@ -205,13 +205,13 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
   const [overallStats, setOverallStats] = useState<OverallMetricStats>({ gsd: null, density: null });
   const [perPolygonStats, setPerPolygonStats] = useState<Map<string, PolygonMetricSummary>>(new Map());
   const [internalSelectedId, setInternalSelectedId] = useState<string | null>(null);
-  const [splittingPolygonId, setSplittingPolygonId] = useState<string | null>(null);
+  const [splittingPolygonIds, setSplittingPolygonIds] = useState<Record<string, true>>({});
   const [partitionOptionsByPolygon, setPartitionOptionsByPolygon] = useState<Record<string, TerrainPartitionSolutionPreview[]>>({});
   const [partitionSelectionByPolygon, setPartitionSelectionByPolygon] = useState<Record<string, number>>({});
-  const [loadingPartitionOptionsId, setLoadingPartitionOptionsId] = useState<string | null>(null);
-  const [applyingPartitionId, setApplyingPartitionId] = useState<string | null>(null);
+  const [loadingPartitionOptionsIds, setLoadingPartitionOptionsIds] = useState<Record<string, true>>({});
+  const [applyingPartitionIds, setApplyingPartitionIds] = useState<Record<string, true>>({});
   const [exactPartitionPreviewByKey, setExactPartitionPreviewByKey] = useState<Record<string, ExactPartitionPreview>>({});
-  const [previewingPartitionKey, setPreviewingPartitionKey] = useState<string | null>(null);
+  const [previewingPartitionKeys, setPreviewingPartitionKeys] = useState<Record<string, true>>({});
   const isControlled = controlledSelectedId !== undefined;
   const activeSelectedId = isControlled ? (controlledSelectedId ?? null) : internalSelectedId;
   const itemRefs = useRef<Map<string, HTMLDivElement>>(new Map());
@@ -304,7 +304,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
       signature: selected.signature,
       regionCount: selected.regionCount,
     });
-    setApplyingPartitionId(polygonId);
+    setApplyingPartitionIds((prev) => ({ ...prev, [polygonId]: true }));
     suppressAutoRunUntilRef.current = Date.now() + 5000;
     try {
       const result = await api.applyTerrainPartitionSolution(polygonId, selected.signature);
@@ -356,7 +356,12 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
       });
       return { replaced: false, createdIds: [] as string[] };
     } finally {
-      setApplyingPartitionId((current) => (current === polygonId ? null : current));
+      setApplyingPartitionIds((prev) => {
+        if (!prev[polygonId]) return prev;
+        const next = { ...prev };
+        delete next[polygonId];
+        return next;
+      });
     }
   }, [mapRef, partitionOptionsByPolygon, partitionSelectionByPolygon]);
 
@@ -1232,7 +1237,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
     const startedAt = splitPerfNow();
     const showEmptyToast = options?.showEmptyToast ?? true;
     const showErrorToast = options?.showErrorToast ?? true;
-    setLoadingPartitionOptionsId(polygonId);
+    setLoadingPartitionOptionsIds((prev) => ({ ...prev, [polygonId]: true }));
     try {
       splitPerfLog(polygonId, 'loading terrain partition options');
       const solutions = await api.getTerrainPartitionSolutions(polygonId);
@@ -1283,7 +1288,12 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
       }
       return { solutions: [], defaultIndex: 0 };
     } finally {
-      setLoadingPartitionOptionsId((current) => (current === polygonId ? null : current));
+      setLoadingPartitionOptionsIds((prev) => {
+        if (!prev[polygonId]) return prev;
+        const next = { ...prev };
+        delete next[polygonId];
+        return next;
+      });
     }
   }, [chooseBestExactLidarPartitionIndex, getMergedParamsMap, isLidarPayload, mapRef, partitionSelectionByPolygon]);
 
@@ -1294,7 +1304,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
     if (!selected) return;
     const previewKey = `${polygonId}:${selected.signature}`;
     if (exactPartitionPreviewByKey[previewKey]) return;
-    setPreviewingPartitionKey(previewKey);
+    setPreviewingPartitionKeys((prev) => ({ ...prev, [previewKey]: true }));
     try {
       await getOrComputeExactPartitionPreview(polygonId, selected);
     } catch (error) {
@@ -1304,7 +1314,12 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
         variant: 'destructive',
       });
     } finally {
-      setPreviewingPartitionKey((current) => (current === previewKey ? null : current));
+      setPreviewingPartitionKeys((prev) => {
+        if (!prev[previewKey]) return prev;
+        const next = { ...prev };
+        delete next[previewKey];
+        return next;
+      });
     }
   }, [
     exactPartitionPreviewByKey,
@@ -1682,7 +1697,10 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
           const res = await lidarWorker.runTile({
             tile,
             demTile,
-            polygons: lidarSourcePolygons,
+            // Lidar density overlays are tile-global and additive across overlapping polygons.
+            // Even during a targeted recompute, evaluate the affected tiles against the full lidar
+            // polygon set so we do not overwrite a shared tile with one-polygon-only density.
+            polygons: lidarPolygons,
             strips: tileStrips,
             options: { clipInnerBufferM },
           } as any);
@@ -2205,7 +2223,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
               : 0;
             const selectedPreviewKey = selectedPartition ? `${polygonId}:${selectedPartition.signature}` : null;
             const exactPreview = selectedPreviewKey ? exactPartitionPreviewByKey[selectedPreviewKey] : undefined;
-            const isPreviewingExact = selectedPreviewKey === previewingPartitionKey;
+            const isPreviewingExact = !!(selectedPreviewKey && previewingPartitionKeys[selectedPreviewKey]);
             const exactMeanDelta = exactPreview && metricStats
               ? exactPreview.metricKind === 'gsd'
                 ? metricStats.mean - exactPreview.stats.mean
@@ -2264,11 +2282,11 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
                         size="sm"
                         variant="outline"
                         className="h-7 px-2 text-xs"
-                        disabled={splittingPolygonId === polygonId}
+                        disabled={!!splittingPolygonIds[polygonId]}
                         onClick={async (e) => {
                           e.stopPropagation();
                           setSelection(polygonId);
-                          setSplittingPolygonId(polygonId);
+                          setSplittingPolygonIds((prev) => ({ ...prev, [polygonId]: true }));
                           const splitRunId = `${polygonId}:${++splitPerfSeqRef.current}`;
                           const startedAt = splitPerfNow();
                           splitPerfLog(splitRunId, 'auto split button clicked', {
@@ -2316,12 +2334,17 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
                               suppressAutoRunUntilRef.current = 0;
                             }
                           } finally {
-                            setSplittingPolygonId((current) => current === polygonId ? null : current);
+                            setSplittingPolygonIds((prev) => {
+                              if (!prev[polygonId]) return prev;
+                              const next = { ...prev };
+                              delete next[polygonId];
+                              return next;
+                            });
                           }
                         }}
                         title="Split this area into a few terrain-aligned faces"
                       >
-                        {splittingPolygonId === polygonId ? 'Splitting…' : 'Auto split'}
+                        {!!splittingPolygonIds[polygonId] ? 'Splitting…' : 'Auto split'}
                       </Button>
                     )}
 
@@ -2416,14 +2439,14 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
                           size="sm"
                           variant="outline"
                           className="h-7 px-2 text-xs"
-                          disabled={loadingPartitionOptionsId === polygonId || applyingPartitionId === polygonId}
+                          disabled={!!loadingPartitionOptionsIds[polygonId] || !!applyingPartitionIds[polygonId]}
                           onClick={async (e) => {
                             e.stopPropagation();
                             setSelection(polygonId);
                             await loadTerrainPartitionOptions(polygonId);
                           }}
                         >
-                          {loadingPartitionOptionsId === polygonId ? 'Planning…' : partitionOptions.length > 0 ? 'Refresh options' : 'Plan options'}
+                          {!!loadingPartitionOptionsIds[polygonId] ? 'Planning…' : partitionOptions.length > 0 ? 'Refresh options' : 'Plan options'}
                         </Button>
                       </div>
 
@@ -2492,14 +2515,14 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
                               <Button
                                 size="sm"
                                 className="h-7 px-2 text-xs"
-                                disabled={applyingPartitionId === polygonId}
+                                disabled={!!applyingPartitionIds[polygonId]}
                                 onClick={async (e) => {
                                   e.stopPropagation();
                                   setSelection(polygonId);
                                   await applyTerrainPartitionOption(polygonId);
                                 }}
                               >
-                                {applyingPartitionId === polygonId ? 'Applying…' : 'Apply partition'}
+                                {!!applyingPartitionIds[polygonId] ? 'Applying…' : 'Apply partition'}
                               </Button>
                             </div>
                           </div>
