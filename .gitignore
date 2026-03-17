@@ -7,5 +7,10 @@ vite.config.ts.*
 .env
 .vercel
 .venv
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
 backend/terrain_splitter/.cache/
 backend/terrain_splitter/.debug/
