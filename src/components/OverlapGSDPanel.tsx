@@ -2305,7 +2305,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
                       <Button
                         size="sm"
                         variant="outline"
-                        className="h-7 px-2 text-xs"
+                        className="h-6 px-1.5 text-[11px]"
                         onClick={(e) => {
                           e.stopPropagation();
                           setSelection(polygonId);
@@ -2321,7 +2321,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
                       <Button
                         size="sm"
                         variant="outline"
-                        className="h-7 px-2 text-xs"
+                        className="h-6 px-1.5 text-[11px]"
                         disabled={!!splittingPolygonIds[polygonId]}
                         onClick={async (e) => {
                           e.stopPropagation();
@@ -2394,7 +2394,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
                       <Button
                         size="sm"
                         variant="secondary"
-                        className="h-7 px-2 text-xs"
+                        className="h-6 px-1.5 text-[11px]"
                         onClick={(e) => {
                           e.stopPropagation();
                           setSelection(polygonId);
@@ -2409,7 +2409,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
 
                     <Button
                       size="sm"
-                      className="h-7 px-2 text-xs"
+                      className="h-6 px-1.5 text-[11px]"
                       disabled={isPoseArea}
                       onClick={(e) => {
                         e.stopPropagation();
@@ -2425,7 +2425,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
                       <Button
                         size="sm"
                         variant="outline"
-                        className="h-7 px-2 text-xs"
+                        className="h-6 px-1.5 text-[11px]"
                         disabled={overrideInfo?.source === 'wingtra'}
                         onClick={(e) => {
                           e.stopPropagation();
@@ -2442,7 +2442,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
                       <Button
                         size="sm"
                         variant="outline"
-                        className="h-7 px-2 text-xs"
+                        className="h-6 px-1.5 text-[11px]"
                         onClick={(e) => {
                           e.stopPropagation();
                           mapRef.current?.runFullAnalysis?.(polygonId);
@@ -2457,7 +2457,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
                       <Button
                         size="sm"
                         variant="ghost"
-                        className="h-7 px-2 text-xs ml-auto text-red-500"
+                        className="h-6 px-1.5 text-[11px] ml-auto text-red-500"
                         onClick={(e) => {
                           e.stopPropagation();
                           mapRef.current?.clearPolygon?.(polygonId);
@@ -2491,23 +2491,6 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
                         <div>{sampleLabel}: <span className="font-medium text-gray-900">{sampleCount}</span></div>
                         <div>Area: <span className="font-medium text-gray-900">{areaAcres.toFixed(2)} acres</span></div>
                         {sourceLabel && <div className="col-span-2">System: <span className="font-medium text-gray-900">{sourceLabel}</span></div>}
-                      </div>
-
-                      <div className="h-40">
-                        <ResponsiveContainer width="100%" height="100%">
-                          <BarChart data={convertHistogramToArea(metricStats).map(bin => ({ metric: metricKind === 'density' ? bin.bin.toFixed(0) : (bin.bin * 100).toFixed(1), areaM2: bin.areaM2, areaAcres: bin.areaM2 / ACRE_M2 }))}>
-                            <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
-                            <XAxis dataKey="metric" tick={{ fontSize: 10 }} label={{ value: labels.xAxis, position: 'insideBottom', offset: -5, style: { fontSize: '10px' } }} />
-                            <YAxis tick={{ fontSize: 10 }} tickFormatter={(v:number)=> (v/ACRE_M2).toFixed(2)} label={{ value: 'Area (acres)', angle: -90, position: 'insideLeft', style: { fontSize: '10px' } }} />
-                            <Tooltip
-                              formatter={(value)=>{ const m2=value as number; const acres=m2/ACRE_M2; return [`${acres.toFixed(2)} acres (${m2.toFixed(0)} m²)`, 'Area']; }}
-                              labelFormatter={(label)=> `${labels.tooltipLabel}: ${label}${metricKind === 'density' ? ' pts/m²' : ' cm'}`}
-                              labelStyle={{ fontSize: '11px' }}
-                              contentStyle={{ fontSize: '11px' }}
-                            />
-                            <Bar dataKey="areaM2" fill="#3b82f6" stroke="#1e40af" strokeWidth={0.5} radius={[1,1,0,0]} />
-                          </BarChart>
-                        </ResponsiveContainer>
                       </div>
                     </div>
                   ) : (
