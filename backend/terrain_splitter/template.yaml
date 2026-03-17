@@ -18,6 +18,13 @@ Parameters:
     Type: Number
     Default: 6
     Description: Number of root split branches to evaluate in parallel via Lambda self-invocation.
+  RootParallelGranularity:
+    Type: String
+    Default: subtree
+    AllowedValues:
+      - branch
+      - subtree
+    Description: Whether Lambda fan-out dispatches whole root branches or individual left/right subtrees.
 
 Globals:
   Function:
@@ -34,6 +41,7 @@ Globals:
         TERRAIN_SPLITTER_ENABLE_APP_CORS: "false"
         TERRAIN_SPLITTER_ROOT_PARALLEL_MODE: "lambda"
         TERRAIN_SPLITTER_ROOT_PARALLEL_WORKERS: !Ref RootParallelWorkers
+        TERRAIN_SPLITTER_ROOT_PARALLEL_GRANULARITY: !Ref RootParallelGranularity
         PYTHONPATH: /var/task
 
 Resources:

@@ -11,5 +11,5 @@ s3_prefix = "terrain-splitter"
 region = "us-east-1"
 confirm_changeset = true
 capabilities = "CAPABILITY_IAM"
-parameter_overrides = "StageName=\"prod\" AllowedOrigin=\"*\" RootParallelWorkers=\"6\""
+parameter_overrides = "StageName=\"prod\" AllowedOrigin=\"*\" RootParallelWorkers=\"12\" RootParallelGranularity=\"subtree\""
 image_repositories = []

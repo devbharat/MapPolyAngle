@@ -132,6 +132,12 @@ class RootSplitTask:
     depth: int
 
 
+@dataclass(slots=True)
+class SubtreeSolveTask:
+    cell_ids: tuple[int, ...]
+    depth: int
+
+
 _PARALLEL_SOLVER_CONTEXT: SolverContext | None = None
 
 
@@ -179,6 +185,15 @@ def _resolve_root_parallel_mode(requested: Literal["process", "lambda"] | None) 
     if raw == "lambda":
         return "lambda"
     return "process"
+
+
+def _resolve_root_parallel_granularity(requested: Literal["branch", "subtree"] | None) -> Literal["branch", "subtree"]:
+    if requested in {"branch", "subtree"}:
+        return requested
+    raw = (os.environ.get("TERRAIN_SPLITTER_ROOT_PARALLEL_GRANULARITY") or "branch").strip().lower()
+    if raw == "subtree":
+        return "subtree"
+    return "branch"
 
 
 def _init_parallel_solver_context(context: SolverContext) -> None:
@@ -1093,6 +1108,22 @@ def _solve_root_split_branch_with_context(
     return branch_frontier, dict(perf)
 
 
+def _solve_subtree_task(task: SubtreeSolveTask) -> tuple[list[PartitionPlan], dict[str, float]]:
+    if _PARALLEL_SOLVER_CONTEXT is None:
+        raise RuntimeError("Parallel solver context is not initialized.")
+    return _solve_subtree_task_with_context(task, _PARALLEL_SOLVER_CONTEXT)
+
+
+def _solve_subtree_task_with_context(
+    task: SubtreeSolveTask,
+    context: SolverContext,
+) -> tuple[list[PartitionPlan], dict[str, float]]:
+    caches = _make_solver_caches()
+    perf = _make_perf()
+    frontier = _solve_region_recursive(task.cell_ids, task.depth, context, caches, perf) or []
+    return frontier, dict(perf)
+
+
 def _serialize_polygon(polygon: Polygon) -> str:
     return polygon.wkt
 
@@ -1251,6 +1282,20 @@ def _deserialize_root_split_task(payload: dict[str, Any]) -> RootSplitTask:
     )
 
 
+def _serialize_subtree_task(task: SubtreeSolveTask) -> dict[str, Any]:
+    return {
+        "cellIds": list(task.cell_ids),
+        "depth": task.depth,
+    }
+
+
+def _deserialize_subtree_task(payload: dict[str, Any]) -> SubtreeSolveTask:
+    return SubtreeSolveTask(
+        cell_ids=tuple(payload["cellIds"]),
+        depth=payload["depth"],
+    )
+
+
 def _serialize_region_objective(objective: RegionObjective) -> dict[str, Any]:
     return {
         "bearingDeg": objective.bearing_deg,
@@ -1364,6 +1409,16 @@ def solve_root_split_branch_event(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def solve_subtree_task_event(payload: dict[str, Any]) -> dict[str, Any]:
+    context = _deserialize_solver_context(payload["context"])
+    task = _deserialize_subtree_task(payload["task"])
+    frontier, perf = _solve_subtree_task_with_context(task, context)
+    return {
+        "plans": [_serialize_partition_plan(plan) for plan in frontier],
+        "perf": perf,
+    }
+
+
 def _invoke_root_split_branch_lambda(
     function_name: str,
     context: SolverContext,
@@ -1398,6 +1453,40 @@ def _invoke_root_split_branch_lambda(
     )
 
 
+def _invoke_subtree_lambda(
+    function_name: str,
+    context: SolverContext,
+    task: SubtreeSolveTask,
+) -> tuple[list[PartitionPlan], dict[str, float]]:
+    try:
+        import boto3
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError("boto3 is required for Lambda subtree fan-out mode.") from exc
+
+    client = boto3.client("lambda")
+    payload = {
+        "terrainSplitterInternal": "subtree",
+        "payload": {
+            "context": _serialize_solver_context(context),
+            "task": _serialize_subtree_task(task),
+        },
+    }
+    response = client.invoke(
+        FunctionName=function_name,
+        InvocationType="RequestResponse",
+        Payload=json.dumps(payload).encode("utf-8"),
+    )
+    if "FunctionError" in response:
+        error_payload = response["Payload"].read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Lambda subtree invocation failed: {error_payload}")
+    raw_payload = response["Payload"].read()
+    decoded = json.loads(raw_payload.decode("utf-8"))
+    return (
+        [_deserialize_partition_plan(plan) for plan in decoded["plans"]],
+        {key: float(value) for key, value in decoded.get("perf", {}).items()},
+    )
+
+
 def _solve_root_splits_via_lambda(
     tasks: list[RootSplitTask],
     context: SolverContext,
@@ -1420,6 +1509,28 @@ def _solve_root_splits_via_lambda(
     return plans, perf
 
 
+def _solve_subtrees_via_lambda(
+    tasks: list[tuple[int, str, SubtreeSolveTask]],
+    context: SolverContext,
+    max_workers: int,
+) -> tuple[dict[int, dict[str, list[PartitionPlan]]], dict[str, float]]:
+    function_name = os.environ.get("AWS_LAMBDA_FUNCTION_NAME")
+    if not function_name:
+        raise RuntimeError("AWS_LAMBDA_FUNCTION_NAME is required for Lambda subtree fan-out mode.")
+    perf = _make_perf()
+    subtree_results: dict[int, dict[str, list[PartitionPlan]]] = defaultdict(dict)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            (index, side, executor.submit(_invoke_subtree_lambda, function_name, context, task))
+            for index, side, task in tasks
+        ]
+        for index, side, future in futures:
+            frontier, subtree_perf = future.result()
+            subtree_results[index][side] = frontier
+            _merge_perf(perf, subtree_perf)
+    return subtree_results, perf
+
+
 def solve_partition_hierarchy(
     grid: GridData,
     feature_field: FeatureField,
@@ -1430,6 +1541,7 @@ def solve_partition_hierarchy(
     polygon_id: str | None = None,
     root_parallel_workers: int | None = None,
     root_parallel_mode: Literal["process", "lambda"] | None = None,
+    root_parallel_granularity: Literal["branch", "subtree"] | None = None,
 ) -> list[PartitionSolutionPreviewModel]:
     solve_started_at = time.perf_counter()
     if not grid.cells:
@@ -1455,6 +1567,7 @@ def solve_partition_hierarchy(
     root_cell_ids = tuple(sorted(cell_lookup))
     requested_workers = _resolve_root_parallel_workers(root_parallel_workers)
     parallel_mode = _resolve_root_parallel_mode(root_parallel_mode)
+    parallel_granularity = _resolve_root_parallel_granularity(root_parallel_granularity)
     all_plans: list[PartitionPlan]
     if requested_workers <= 1:
         all_plans = _solve_region_recursive(root_cell_ids, max_depth, context, caches, perf)
@@ -1496,24 +1609,88 @@ def solve_partition_hierarchy(
                     ]
                     try:
                         if parallel_mode == "lambda":
-                            lambda_plans, lambda_perf = _solve_root_splits_via_lambda(tasks, context, usable_workers)
-                            branch_candidates.extend(lambda_plans)
-                            _merge_perf(perf, lambda_perf)
+                            if parallel_granularity == "subtree":
+                                subtree_tasks: list[tuple[int, str, SubtreeSolveTask]] = []
+                                for index, split in enumerate(root_splits):
+                                    subtree_tasks.append((index, "left", SubtreeSolveTask(cell_ids=split.left_ids, depth=max_depth - 1)))
+                                    subtree_tasks.append((index, "right", SubtreeSolveTask(cell_ids=split.right_ids, depth=max_depth - 1)))
+                                subtree_workers = min(max(requested_workers, len(tasks)), len(subtree_tasks))
+                                perf["root_parallel_subtree_tasks"] = len(subtree_tasks)
+                                perf["root_parallel_workers_used"] = subtree_workers
+                                subtree_results, lambda_perf = _solve_subtrees_via_lambda(
+                                    subtree_tasks,
+                                    context,
+                                    subtree_workers,
+                                )
+                                _merge_perf(perf, lambda_perf)
+                                for index, split in enumerate(root_splits):
+                                    left_frontier = subtree_results.get(index, {}).get("left", [])
+                                    right_frontier = subtree_results.get(index, {}).get("right", [])
+                                    if not left_frontier or not right_frontier:
+                                        continue
+                                    for left_plan in left_frontier:
+                                        for right_plan in right_frontier:
+                                            combined = _combine_plans(left_plan, right_plan, split.boundary)
+                                            if combined.region_count > MAX_REGIONS:
+                                                perf["combine_region_limit_rejections"] += 1
+                                                continue
+                                            branch_candidates.append(combined)
+                                            perf["combined_plan_candidates"] += 1
+                            else:
+                                lambda_plans, lambda_perf = _solve_root_splits_via_lambda(tasks, context, usable_workers)
+                                branch_candidates.extend(lambda_plans)
+                                _merge_perf(perf, lambda_perf)
                         else:
-                            with ProcessPoolExecutor(
-                                max_workers=usable_workers,
-                                initializer=_init_parallel_solver_context,
-                                initargs=(context,),
-                            ) as executor:
-                                for branch_frontier, branch_perf in executor.map(_solve_root_split_branch, tasks):
-                                    branch_candidates.extend(branch_frontier)
-                                    _merge_perf(perf, branch_perf)
+                            if parallel_granularity == "subtree":
+                                subtree_tasks: list[tuple[int, str, SubtreeSolveTask]] = []
+                                for index, split in enumerate(root_splits):
+                                    subtree_tasks.append((index, "left", SubtreeSolveTask(cell_ids=split.left_ids, depth=max_depth - 1)))
+                                    subtree_tasks.append((index, "right", SubtreeSolveTask(cell_ids=split.right_ids, depth=max_depth - 1)))
+                                subtree_workers = min(max(requested_workers, len(tasks)), len(subtree_tasks))
+                                perf["root_parallel_subtree_tasks"] = len(subtree_tasks)
+                                perf["root_parallel_workers_used"] = subtree_workers
+                                subtree_results: dict[int, dict[str, list[PartitionPlan]]] = defaultdict(dict)
+                                with ProcessPoolExecutor(
+                                    max_workers=subtree_workers,
+                                    initializer=_init_parallel_solver_context,
+                                    initargs=(context,),
+                                ) as executor:
+                                    for (index, side, _), (subtree_frontier, subtree_perf) in zip(
+                                        subtree_tasks,
+                                        executor.map(_solve_subtree_task, [task for _, _, task in subtree_tasks]),
+                                        strict=True,
+                                    ):
+                                        subtree_results[index][side] = subtree_frontier
+                                        _merge_perf(perf, subtree_perf)
+                                for index, split in enumerate(root_splits):
+                                    left_frontier = subtree_results.get(index, {}).get("left", [])
+                                    right_frontier = subtree_results.get(index, {}).get("right", [])
+                                    if not left_frontier or not right_frontier:
+                                        continue
+                                    for left_plan in left_frontier:
+                                        for right_plan in right_frontier:
+                                            combined = _combine_plans(left_plan, right_plan, split.boundary)
+                                            if combined.region_count > MAX_REGIONS:
+                                                perf["combine_region_limit_rejections"] += 1
+                                                continue
+                                            branch_candidates.append(combined)
+                                            perf["combined_plan_candidates"] += 1
+                            else:
+                                with ProcessPoolExecutor(
+                                    max_workers=usable_workers,
+                                    initializer=_init_parallel_solver_context,
+                                    initargs=(context,),
+                                ) as executor:
+                                    for branch_frontier, branch_perf in executor.map(_solve_root_split_branch, tasks):
+                                        branch_candidates.extend(branch_frontier)
+                                        _merge_perf(perf, branch_perf)
                     except Exception:  # noqa: BLE001
                         logger.exception(
-                            "[terrain-split-backend][%s] root-parallel solve failed polygonId=%s mode=%s; falling back to serial",
+                            "[terrain-split-backend][%s] root-parallel solve failed polygonId=%s mode=%s granularity=%s; falling back to serial",
                             request_id or "<none>",
                             polygon_id or "<none>",
                             parallel_mode,
+                            parallel_granularity,
                         )
                         perf["root_parallel_failures"] += 1
                         all_plans = _solve_region_recursive(root_cell_ids, max_depth, context, caches, perf)
@@ -1524,13 +1701,14 @@ def solve_partition_hierarchy(
     if not all_plans:
         total_ms = (time.perf_counter() - solve_started_at) * 1000.0
         logger.info(
-            "[terrain-split-backend][%s] solver finished polygonId=%s cells=%d maxDepth=%d totalMs=%.1f allPlans=0 rootParallelMode=%s rootParallelRequested=%d rootParallelUsed=%d rootParallelSplits=%d solveRegionCalls=%d cacheHits=%d regionCacheHits=%d regionCacheMisses=%d regionStaticHits=%d regionStaticMisses=%d regionBearingHits=%d regionBearingMisses=%d buildRegionCalls=%d objectiveCalls=%d splitAttempts=%d kept=%d",
+            "[terrain-split-backend][%s] solver finished polygonId=%s cells=%d maxDepth=%d totalMs=%.1f allPlans=0 rootParallelMode=%s rootParallelGranularity=%s rootParallelRequested=%d rootParallelUsed=%d rootParallelSplits=%d solveRegionCalls=%d cacheHits=%d regionCacheHits=%d regionCacheMisses=%d regionStaticHits=%d regionStaticMisses=%d regionBearingHits=%d regionBearingMisses=%d buildRegionCalls=%d objectiveCalls=%d splitAttempts=%d kept=%d",
             request_id or "<none>",
             polygon_id or "<none>",
             len(grid.cells),
             max_depth,
             total_ms,
             parallel_mode,
+            parallel_granularity,
             requested_workers,
             int(perf["root_parallel_workers_used"]),
             int(perf["root_parallel_split_count"]),
@@ -1558,7 +1736,7 @@ def solve_partition_hierarchy(
     if not practical:
         total_ms = (time.perf_counter() - solve_started_at) * 1000.0
         logger.info(
-            "[terrain-split-backend][%s] solver finished polygonId=%s cells=%d maxDepth=%d totalMs=%.1f allPlans=%d practicalPlans=0 rootParallelMode=%s rootParallelRequested=%d rootParallelUsed=%d rootParallelSplits=%d rootParallelMs=%.1f solveRegionCalls=%d cacheHits=%d regionCacheHits=%d regionCacheMisses=%d regionStaticHits=%d regionStaticMisses=%d regionBearingHits=%d regionBearingMisses=%d buildRegionCalls=%d buildRegionMs=%.1f regionStaticBuildMs=%.1f polygonMs=%.1f objectiveCalls=%d objectiveMs=%.1f regionBearingCoreMs=%.1f nodeCostMs=%.1f lineLiftMs=%.1f flightTimeMs=%.1f shapeMetricMs=%.1f splitGenMs=%.1f splitAttempts=%d kept=%d returned=%d",
+            "[terrain-split-backend][%s] solver finished polygonId=%s cells=%d maxDepth=%d totalMs=%.1f allPlans=%d practicalPlans=0 rootParallelMode=%s rootParallelGranularity=%s rootParallelRequested=%d rootParallelUsed=%d rootParallelSplits=%d rootParallelSubtreeTasks=%d rootParallelMs=%.1f solveRegionCalls=%d cacheHits=%d regionCacheHits=%d regionCacheMisses=%d regionStaticHits=%d regionStaticMisses=%d regionBearingHits=%d regionBearingMisses=%d buildRegionCalls=%d buildRegionMs=%.1f regionStaticBuildMs=%.1f polygonMs=%.1f objectiveCalls=%d objectiveMs=%.1f regionBearingCoreMs=%.1f nodeCostMs=%.1f lineLiftMs=%.1f flightTimeMs=%.1f shapeMetricMs=%.1f splitGenMs=%.1f splitAttempts=%d kept=%d returned=%d",
             request_id or "<none>",
             polygon_id or "<none>",
             len(grid.cells),
@@ -1566,9 +1744,11 @@ def solve_partition_hierarchy(
             total_ms,
             len(all_plans),
             parallel_mode,
+            parallel_granularity,
             requested_workers,
             int(perf["root_parallel_workers_used"]),
             int(perf["root_parallel_split_count"]),
+            int(perf["root_parallel_subtree_tasks"]),
             perf["root_parallel_ms"],
             int(perf["solve_region_calls"]),
             int(perf["solve_region_cache_hits"]),
@@ -1666,7 +1846,7 @@ def solve_partition_hierarchy(
     region_static_attempts = perf["region_static_hits"] + perf["region_static_misses"]
     region_bearing_attempts = perf["region_bearing_hits"] + perf["region_bearing_misses"]
     logger.info(
-        "[terrain-split-backend][%s] solver finished polygonId=%s cells=%d maxDepth=%d totalMs=%.1f allPlans=%d practicalPlans=%d returnedSolutions=%d rootParallelMode=%s rootParallelRequested=%d rootParallelUsed=%d rootParallelSplits=%d rootParallelMs=%.1f rootParallelFailures=%d solveRegionCalls=%d cacheHits=%d regionCacheHits=%d regionCacheMisses=%d regionCacheHitRate=%.3f regionStaticHits=%d regionStaticMisses=%d regionStaticHitRate=%.3f regionStaticNullHits=%d regionBearingHits=%d regionBearingMisses=%d regionBearingHitRate=%.3f regionBearingRewraps=%d buildRegionCalls=%d buildRegionMs=%.1f regionStaticBuildMs=%.1f polygonMs=%.1f polygonFailures=%d objectiveCalls=%d objectiveMs=%.1f regionBearingCoreMs=%.1f nodeCostMs=%.1f lineLiftMs=%.1f flightTimeMs=%.1f shapeMetricMs=%.1f splitGenMs=%.1f splitDirections=%d splitAttempts=%d kept=%d returned=%d smallChildRejects=%d duplicateRejects=%d disconnectedRejects=%d boundaryRejects=%d regionBuildRejects=%d validityRejects=%d nonImprovingRejects=%d combinedCandidates=%d frontierStates=%d",
+        "[terrain-split-backend][%s] solver finished polygonId=%s cells=%d maxDepth=%d totalMs=%.1f allPlans=%d practicalPlans=%d returnedSolutions=%d rootParallelMode=%s rootParallelGranularity=%s rootParallelRequested=%d rootParallelUsed=%d rootParallelSplits=%d rootParallelSubtreeTasks=%d rootParallelMs=%.1f rootParallelFailures=%d solveRegionCalls=%d cacheHits=%d regionCacheHits=%d regionCacheMisses=%d regionCacheHitRate=%.3f regionStaticHits=%d regionStaticMisses=%d regionStaticHitRate=%.3f regionStaticNullHits=%d regionBearingHits=%d regionBearingMisses=%d regionBearingHitRate=%.3f regionBearingRewraps=%d buildRegionCalls=%d buildRegionMs=%.1f regionStaticBuildMs=%.1f polygonMs=%.1f polygonFailures=%d objectiveCalls=%d objectiveMs=%.1f regionBearingCoreMs=%.1f nodeCostMs=%.1f lineLiftMs=%.1f flightTimeMs=%.1f shapeMetricMs=%.1f splitGenMs=%.1f splitDirections=%d splitAttempts=%d kept=%d returned=%d smallChildRejects=%d duplicateRejects=%d disconnectedRejects=%d boundaryRejects=%d regionBuildRejects=%d validityRejects=%d nonImprovingRejects=%d combinedCandidates=%d frontierStates=%d",
         request_id or "<none>",
         polygon_id or "<none>",
         len(grid.cells),
@@ -1676,9 +1856,11 @@ def solve_partition_hierarchy(
         len(practical),
         len(previews),
         parallel_mode,
+        parallel_granularity,
         requested_workers,
         int(perf["root_parallel_workers_used"]),
         int(perf["root_parallel_split_count"]),
+        int(perf["root_parallel_subtree_tasks"]),
         perf["root_parallel_ms"],
         int(perf["root_parallel_failures"]),
         int(perf["solve_region_calls"]),

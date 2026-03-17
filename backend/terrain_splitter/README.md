@@ -87,6 +87,7 @@ Notes:
 - Memory is set to the Lambda maximum (`10240 MB`) because the solver is CPU-heavy and benefits from extra CPU allocation.
 - AWS deploys now enable exact root-branch fan-out via Lambda self-invocation:
   - `TERRAIN_SPLITTER_ROOT_PARALLEL_MODE=lambda`
-  - `TERRAIN_SPLITTER_ROOT_PARALLEL_WORKERS=6` by default
+  - `TERRAIN_SPLITTER_ROOT_PARALLEL_WORKERS`
+  - `TERRAIN_SPLITTER_ROOT_PARALLEL_GRANULARITY=branch|subtree`
 - Local runs still default to exact process-based root fan-out when `TERRAIN_SPLITTER_ROOT_PARALLEL_WORKERS > 1`.
 - Timeout is `900s`, matching Lambda's maximum.

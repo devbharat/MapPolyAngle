@@ -11,6 +11,7 @@ from terrain_splitter.solver_frontier import (
     BoundaryStats,
     EvaluatedRegion,
     RootSplitTask,
+    SubtreeSolveTask,
     SolverContext,
     _deserialize_partition_plan,
     _feature_lookup,
@@ -20,8 +21,10 @@ from terrain_splitter.solver_frontier import (
     _serialize_partition_plan,
     _serialize_solver_context,
     _solve_root_split_branch_with_context,
+    _solve_subtree_task_with_context,
     _cell_lookup,
     solve_root_split_branch_event,
+    solve_subtree_task_event,
 )
 
 
@@ -101,6 +104,13 @@ def test_solver_parallel_root_path_matches_serial_frontier() -> None:
 
     serial = solve_partition_hierarchy(grid, feature_field, params, root_parallel_workers=0)
     parallel = solve_partition_hierarchy(grid, feature_field, params, root_parallel_workers=2)
+    subtree_parallel = solve_partition_hierarchy(
+        grid,
+        feature_field,
+        params,
+        root_parallel_workers=2,
+        root_parallel_granularity="subtree",
+    )
 
     def summarize(solution_list):
         return [
@@ -121,6 +131,7 @@ def test_solver_parallel_root_path_matches_serial_frontier() -> None:
         ]
 
     assert summarize(serial) == summarize(parallel)
+    assert summarize(serial) == summarize(subtree_parallel)
 
 
 def test_lambda_root_split_worker_event_matches_direct_branch_solver() -> None:
@@ -163,6 +174,46 @@ def test_lambda_root_split_worker_event_matches_direct_branch_solver() -> None:
         },
     }
     worker_result = solve_root_split_branch_event(worker_payload)
+    worker_frontier = [_deserialize_partition_plan(plan) for plan in worker_result["plans"]]
+
+    assert [_serialize_partition_plan(plan) for plan in direct_frontier] == [
+        _serialize_partition_plan(plan) for plan in worker_frontier
+    ]
+
+
+def test_lambda_subtree_worker_event_matches_direct_subtree_solver() -> None:
+    grid = _toy_grid()
+    feature_field = FeatureField(
+        cells=[
+            CellFeatures(index=0, preferred_bearing_deg=0, slope_magnitude=0.3, break_strength=18, confidence=0.9, aspect_deg=270),
+            CellFeatures(index=1, preferred_bearing_deg=0, slope_magnitude=0.25, break_strength=18, confidence=0.85, aspect_deg=270),
+            CellFeatures(index=2, preferred_bearing_deg=90, slope_magnitude=0.28, break_strength=18, confidence=0.88, aspect_deg=0),
+            CellFeatures(index=3, preferred_bearing_deg=90, slope_magnitude=0.26, break_strength=18, confidence=0.86, aspect_deg=0),
+        ],
+        dominant_preferred_bearing_deg=45,
+        dominant_aspect_deg=315,
+    )
+    params = FlightParamsModel(payloadKind="camera", altitudeAGL=120, frontOverlap=70, sideOverlap=70, cameraKey="MAP61_17MM")
+    context = SolverContext(
+        grid=grid,
+        feature_field=feature_field,
+        params=params,
+        root_area_m2=max(1.0, grid.area_m2),
+        feature_lookup=_feature_lookup(feature_field),
+        cell_lookup=_cell_lookup(grid),
+        neighbors=_neighbor_lookup(grid),
+    )
+    task = SubtreeSolveTask(cell_ids=(0, 1), depth=1)
+
+    direct_frontier, _ = _solve_subtree_task_with_context(task, context)
+    worker_payload = {
+        "context": _serialize_solver_context(context),
+        "task": {
+            "cellIds": list(task.cell_ids),
+            "depth": task.depth,
+        },
+    }
+    worker_result = solve_subtree_task_event(worker_payload)
     worker_frontier = [_deserialize_partition_plan(plan) for plan in worker_result["plans"]]
 
     assert [_serialize_partition_plan(plan) for plan in direct_frontier] == [
