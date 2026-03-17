@@ -1,0 +1,72 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Terrain splitter backend deployed as an AWS Lambda Function URL
+
+Parameters:
+  StageName:
+    Type: String
+    Default: prod
+  MapboxToken:
+    Type: String
+    NoEcho: true
+    Description: Mapbox token used by the terrain splitter backend to fetch terrain-rgb tiles.
+  AllowedOrigin:
+    Type: String
+    Default: "*"
+    Description: CORS origin for the Lambda Function URL.
+
+Globals:
+  Function:
+    Runtime: python3.11
+    Timeout: 900
+    MemorySize: 3072
+    Architectures:
+      - x86_64
+    Environment:
+      Variables:
+        MAPBOX_TOKEN: !Ref MapboxToken
+        TERRAIN_SPLITTER_CACHE_DIR: /tmp/terrain-splitter/cache
+        TERRAIN_SPLITTER_DEBUG_DIR: /tmp/terrain-splitter/debug
+        TERRAIN_SPLITTER_ENABLE_APP_CORS: "false"
+        PYTHONPATH: /var/task
+
+Resources:
+  TerrainSplitterFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-terrain-splitter"
+      Handler: main.lambda_handler
+      CodeUri: .
+      Description: Terrain-aware polygon partition solver
+      EphemeralStorage:
+        Size: 2048
+
+  TerrainSplitterFunctionUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !Ref TerrainSplitterFunction
+      AuthType: NONE
+      Cors:
+        AllowOrigins:
+          - !Ref AllowedOrigin
+        AllowMethods:
+          - GET
+          - POST
+        AllowHeaders:
+          - "*"
+        ExposeHeaders:
+          - "*"
+        MaxAge: 3600
+
+  TerrainSplitterFunctionUrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TerrainSplitterFunction
+      Action: lambda:InvokeFunctionUrl
+      Principal: "*"
+      FunctionUrlAuthType: NONE
+
+Outputs:
+  TerrainSplitterFunctionUrl:
+    Description: Lambda Function URL for the terrain splitter backend
+    Value: !GetAtt TerrainSplitterFunctionUrl.FunctionUrl

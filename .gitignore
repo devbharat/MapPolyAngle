@@ -14,3 +14,5 @@ __pycache__/
 *.egg-info/
 backend/terrain_splitter/.cache/
 backend/terrain_splitter/.debug/
+backend/terrain_splitter/.aws-sam/
+.aws-sam/

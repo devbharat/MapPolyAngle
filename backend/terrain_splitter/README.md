@@ -27,3 +27,62 @@ When `debug=true` in the solve request, artifacts are written under:
 Fetched terrain tiles are cached under:
 
 - `backend/terrain_splitter/.cache/`
+
+## AWS SAM deployment
+
+This backend can also be deployed as an AWS Lambda Function URL in a similar style to
+[DetectAnythinBackend-main](/Users/bharat/Documents/src/MapPolyAngle/DetectAnythinBackend-main).
+
+Files:
+
+- [template.yaml](/Users/bharat/Documents/src/MapPolyAngle/backend/terrain_splitter/template.yaml)
+- [samconfig.toml](/Users/bharat/Documents/src/MapPolyAngle/backend/terrain_splitter/samconfig.toml)
+- [main.py](/Users/bharat/Documents/src/MapPolyAngle/backend/terrain_splitter/main.py)
+- [requirements.txt](/Users/bharat/Documents/src/MapPolyAngle/backend/terrain_splitter/requirements.txt)
+
+The SAM deployment uses:
+
+- Lambda Function URL
+- `main.lambda_handler` via `Mangum`
+- `/tmp/terrain-splitter/cache` for terrain tile cache
+- `/tmp/terrain-splitter/debug` for optional debug artifacts
+
+### Build and deploy
+
+From [backend/terrain_splitter](/Users/bharat/Documents/src/MapPolyAngle/backend/terrain_splitter):
+
+```bash
+sam build --use-container
+sam deploy --guided
+```
+
+Or with explicit parameter overrides:
+
+```bash
+sam build --use-container
+sam deploy \
+  --guided \
+  --parameter-overrides \
+    MapboxToken=YOUR_MAPBOX_TOKEN \
+    AllowedOrigin=https://your-frontend.example.com
+```
+
+Or use the helper script:
+
+```bash
+export MAPBOX_TOKEN=YOUR_MAPBOX_TOKEN
+./deploy_aws.sh
+```
+
+After deploy, set the frontend to the Function URL:
+
+```bash
+export VITE_TERRAIN_PARTITION_BACKEND_URL=https://<function-id>.lambda-url.<region>.on.aws
+```
+
+Notes:
+
+- The Lambda package is stateless. Cache/debug data is ephemeral in `/tmp`.
+- On macOS, `sam build` without `--use-container` can fail for `numpy`/`pillow` because Lambda needs Linux wheels.
+- Memory is set high (`3072 MB`) because the solver is CPU-heavy.
+- Timeout is `900s`, matching Lambda's maximum.

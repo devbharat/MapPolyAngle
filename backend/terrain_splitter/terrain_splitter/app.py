@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 import uuid
 from pathlib import Path
@@ -17,18 +18,35 @@ from .solver_graphcut import solve_partition_hierarchy
 
 
 BASE_DIR = Path(__file__).resolve().parents[1]
-CACHE_DIR = BASE_DIR / ".cache"
-DEBUG_DIR = BASE_DIR / ".debug"
+
+
+def _runtime_dir(env_name: str, local_dir_name: str) -> Path:
+    configured = (Path(path) for path in [os.environ.get(env_name)] if path)
+    path = next(configured, BASE_DIR / local_dir_name)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+CACHE_DIR = _runtime_dir("TERRAIN_SPLITTER_CACHE_DIR", ".cache")
+DEBUG_DIR = _runtime_dir("TERRAIN_SPLITTER_DEBUG_DIR", ".debug")
 logger = logging.getLogger("uvicorn.error")
 
 app = FastAPI(title="Terrain Splitter Backend", version="0.1.0")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+if _env_flag("TERRAIN_SPLITTER_ENABLE_APP_CORS", True):
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 
 @app.get("/healthz")
