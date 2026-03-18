@@ -14,11 +14,13 @@ import { useMapInitialization } from './hooks/useMapInitialization';
 import { usePolygonAnalysis } from './hooks/usePolygonAnalysis';
 import {
   addFlightLinesForPolygon,
+  animateProcessingPerimeter,
   removeFlightLinesForPolygon,
   clearAllFlightLines,
   addTriggerPointsForPolygon,
   removeTriggerPointsForPolygon,
-  clearAllTriggerPoints
+  clearAllTriggerPoints,
+  setProcessingPerimeterPolygons,
 } from './utils/mapbox-layers';
 import { update3DPathLayer, remove3DPathLayer, update3DCameraPointsLayer, remove3DCameraPointsLayer, update3DTriggerPointsLayer, remove3DTriggerPointsLayer } from './utils/deckgl-layers';
 import { build3DFlightPath, calculateOptimalTerrainZoom, sampleCameraPositionsOnFlightPath } from './utils/geometry';
@@ -26,8 +28,13 @@ import { PolygonAnalysisResult, PolygonParams } from './types';
 import { parseKmlPolygons, calculateKmlBounds, extractKmlFromKmz } from '@/utils/kml';
 import { SONY_RX1R2, DJI_ZENMUSE_P1_24MM, ILX_LR1_INSPECT_85MM, MAP61_17MM, RGB61_24MM, forwardSpacingRotated, lineSpacingRotated } from '@/domain/camera';
 import { DEFAULT_LIDAR, DEFAULT_LIDAR_MAX_RANGE_M, LIDAR_REGISTRY, lidarLineSpacing } from '@/domain/lidar';
-import type { MapFlightDirectionAPI, ImportedFlightplanArea } from './api';
+import type { MapFlightDirectionAPI, ImportedFlightplanArea, TerrainPartitionSolutionPreview } from './api';
 import { fetchTilesForPolygon } from './utils/terrain';
+import { partitionPolygonByTerrainFaces } from '@/utils/terrainFacePartition';
+import { buildPartitionFrontier } from '@/utils/terrainPartitionGraph';
+import { isTerrainPartitionBackendEnabled, solveTerrainPartitionWithBackend } from '@/services/terrainPartitionBackend';
+// @ts-ignore Turf typings are inconsistent in this repo.
+import * as turf from '@turf/turf';
 
 // NEW: Wingtra import helpers
 import { importWingtraFlightPlan } from '@/interop/wingtra/convert';
@@ -45,6 +52,22 @@ const DEFAULT_PAYLOAD_KIND = 'camera';
 const DEFAULT_ALTITUDE_AGL = 100;
 const DEFAULT_FRONT_OVERLAP = 70;
 const DEFAULT_SIDE_OVERLAP = 70;
+const DEFAULT_PARTITION_TRADEOFF_SAMPLES = [0.1, 0.25, 0.4, 0.55, 0.7, 0.85];
+const DEFAULT_PARTITION_TARGET_TRADEOFF = 0.7;
+const TERRAIN_SPLIT_DEBUG = true;
+
+function splitPerfNow() {
+  return typeof performance !== 'undefined' ? performance.now() : Date.now();
+}
+
+function splitPerfLog(scope: string, message: string, data?: unknown) {
+  if (!TERRAIN_SPLIT_DEBUG) return;
+  if (data === undefined) {
+    console.debug(`[terrain-split][${scope}] ${message}`);
+    return;
+  }
+  console.debug(`[terrain-split][${scope}] ${message}`, data);
+}
 
 function clampNumber(value: number | undefined, min: number, max: number, fallback: number): number {
   if (!Number.isFinite(value)) return fallback;
@@ -75,6 +98,74 @@ function sanitizePolygonParams(params: PolygonParams): PolygonParams {
     lidarReturnMode: isLidar ? (params.lidarReturnMode ?? 'single') : undefined,
     useCustomBearing: !!params.useCustomBearing,
     customBearingDeg: params.useCustomBearing ? normalizeBearing(params.customBearingDeg) : undefined,
+  };
+}
+
+function normalizeRingForGeometryOps(ring: [number, number][]): [number, number][] | null {
+  const coords = Array.isArray(ring)
+    ? ring.filter((coord): coord is [number, number] => (
+        Array.isArray(coord) &&
+        coord.length >= 2 &&
+        Number.isFinite(coord[0]) &&
+        Number.isFinite(coord[1])
+      ))
+    : [];
+  if (coords.length < 3) return null;
+  const [firstLng, firstLat] = coords[0];
+  const [lastLng, lastLat] = coords[coords.length - 1];
+  if (firstLng === lastLng && firstLat === lastLat) return coords;
+  return [...coords, [firstLng, firstLat]];
+}
+
+function unionTurfFeatures(a: any, b: any) {
+  const unionFn = (turf as any).union;
+  if (typeof unionFn !== 'function') return null;
+  return unionFn.length >= 2
+    ? unionFn(a, b)
+    : unionFn(turf.featureCollection([a, b]));
+}
+
+function intersectTurfFeatures(a: any, b: any) {
+  const intersectFn = (turf as any).intersect;
+  if (typeof intersectFn !== 'function') return null;
+  return intersectFn.length >= 2
+    ? intersectFn(a, b)
+    : intersectFn(turf.featureCollection([a, b]));
+}
+
+function computePartitionCoverageMetrics(
+  parentRing: [number, number][],
+  childRings: [number, number][][],
+) {
+  const normalizedParent = normalizeRingForGeometryOps(parentRing);
+  const normalizedChildren = childRings
+    .map((ring) => normalizeRingForGeometryOps(ring))
+    .filter((ring): ring is [number, number][] => ring !== null);
+  if (!normalizedParent || normalizedChildren.length === 0) {
+    return { coverageRatio: 0, overlapRatio: 1, normalizedChildren: [] as [number, number][][] };
+  }
+
+  const parentFeature = turf.polygon([normalizedParent]);
+  const parentArea = Math.max(1e-6, turf.area(parentFeature));
+  let unionFeature: any = null;
+  let summedArea = 0;
+
+  for (const childRing of normalizedChildren) {
+    const feature = turf.polygon([childRing]);
+    summedArea += turf.area(feature);
+    unionFeature = unionFeature ? unionTurfFeatures(unionFeature, feature) : feature;
+    if (!unionFeature) {
+      return { coverageRatio: 0, overlapRatio: 1, normalizedChildren };
+    }
+  }
+
+  const coveredFeature = intersectTurfFeatures(parentFeature, unionFeature);
+  const coveredArea = coveredFeature ? turf.area(coveredFeature) : 0;
+  const unionArea = turf.area(unionFeature);
+  return {
+    coverageRatio: coveredArea / parentArea,
+    overlapRatio: Math.max(0, summedArea - unionArea) / parentArea,
+    normalizedChildren,
   };
 }
 
@@ -150,6 +241,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
 
     const [polygonResults, setPolygonResults] = useState<Map<string, PolygonAnalysisResult>>(new Map());
     const [polygonTiles, setPolygonTiles] = useState<Map<string, any[]>>(new Map());
+    const backendPartitionSolutionsRef = useRef<Map<string, TerrainPartitionSolutionPreview[]>>(new Map());
 
     // Flight lines + spacing + altitude actually used to build 3D path.
     const [polygonFlightLines, setPolygonFlightLines] = useState<
@@ -185,6 +277,9 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
     const polygonTilesRef = React.useRef(polygonTiles);
     const polygonFlightLinesRef = React.useRef(polygonFlightLines);
     const polygonResultsRef = React.useRef(polygonResults);
+    const pendingGeometryRefreshRef = React.useRef<Set<string>>(new Set());
+    const processingPolygonIdsRef = React.useRef<Set<string>>(new Set());
+    const processingAnimationFrameRef = React.useRef<number | null>(null);
     // NEW: Suppress per‑polygon flight line update events during batched imports
     const suppressFlightLineEventsRef = React.useRef(false);
     const pendingOptimizeRef = React.useRef<Set<string>>(new Set());
@@ -201,6 +296,54 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
     React.useEffect(() => { polygonFlightLinesRef.current = polygonFlightLines; }, [polygonFlightLines]);
     React.useEffect(() => { polygonResultsRef.current = polygonResults; }, [polygonResults]);
 
+    const syncProcessingPerimeterOverlay = useCallback(() => {
+      const map = mapRef.current;
+      const draw = drawRef.current as any;
+      if (!map || !draw) return;
+      const polygons = Array.from(processingPolygonIdsRef.current)
+        .map((polygonId) => {
+          const feature = draw.get?.(polygonId);
+          const ring = feature?.geometry?.type === 'Polygon'
+            ? feature.geometry.coordinates?.[0] as [number, number][] | undefined
+            : undefined;
+          if (!ring || ring.length < 3) return null;
+          return { polygonId, ring };
+        })
+        .filter((polygon): polygon is NonNullable<typeof polygon> => polygon !== null);
+      setProcessingPerimeterPolygons(map, polygons);
+    }, []);
+
+    const stopProcessingPerimeterAnimation = useCallback(() => {
+      if (processingAnimationFrameRef.current != null && typeof window !== 'undefined') {
+        window.cancelAnimationFrame(processingAnimationFrameRef.current);
+        processingAnimationFrameRef.current = null;
+      }
+    }, []);
+
+    const startProcessingPerimeterAnimation = useCallback(() => {
+      if (typeof window === 'undefined' || processingAnimationFrameRef.current != null) return;
+      const tick = (timestamp: number) => {
+        const map = mapRef.current;
+        if (!map || processingPolygonIdsRef.current.size === 0) {
+          processingAnimationFrameRef.current = null;
+          return;
+        }
+        animateProcessingPerimeter(map, timestamp);
+        processingAnimationFrameRef.current = window.requestAnimationFrame(tick);
+      };
+      processingAnimationFrameRef.current = window.requestAnimationFrame(tick);
+    }, []);
+
+    const setProcessingPolygonIds = useCallback((polygonIds: string[]) => {
+      processingPolygonIdsRef.current = new Set(polygonIds);
+      syncProcessingPerimeterOverlay();
+      if (processingPolygonIdsRef.current.size === 0) {
+        stopProcessingPerimeterAnimation();
+        return;
+      }
+      startProcessingPerimeterAnimation();
+    }, [startProcessingPerimeterAnimation, stopProcessingPerimeterAnimation, syncProcessingPerimeterOverlay]);
+
     // Debounced callback to prevent React render conflicts when multiple analyses complete
     const debouncedAnalysisComplete = useCallback(() => {
       const timeoutId = setTimeout(() => {
@@ -211,11 +354,10 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
 
     const applyPolygonParams = useCallback((polygonId: string, params: PolygonParams, opts?: { skipEvent?: boolean; skipQueue?: boolean }) => {
       const safeParams = sanitizePolygonParams(params);
-      setPolygonParams((prev) => {
-        const next = new Map(prev);
-        next.set(polygonId, safeParams);
-        return next;
-      });
+      const nextParams = new Map(polygonParamsRef.current);
+      nextParams.set(polygonId, safeParams);
+      polygonParamsRef.current = nextParams;
+      setPolygonParams(nextParams);
 
       const res = polygonResultsRef.current.get(polygonId);
       const tiles = polygonTilesRef.current.get(polygonId) || [];
@@ -278,11 +420,10 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         res.result.fitQuality
       );
 
-      setPolygonFlightLines((prev) => {
-        const next = new Map(prev);
-        next.set(polygonId, { ...fl, altitudeAGL: safeParams.altitudeAGL });
-        return next;
-      });
+      const nextFlightLines = new Map(polygonFlightLinesRef.current);
+      nextFlightLines.set(polygonId, { ...fl, altitudeAGL: safeParams.altitudeAGL });
+      polygonFlightLinesRef.current = nextFlightLines;
+      setPolygonFlightLines(nextFlightLines);
 
       if (!opts?.skipEvent && !suppressFlightLineEventsRef.current) {
         onFlightLinesUpdated?.(polygonId);
@@ -406,11 +547,10 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         });
 
         // 2) Store tiles
-        setPolygonTiles((prev) => {
-          const next = new Map(prev);
-          next.set(result.polygonId, tiles);
-          return next;
-        });
+        const nextTiles = new Map(polygonTilesRef.current);
+        nextTiles.set(result.polygonId, tiles);
+        polygonTilesRef.current = nextTiles;
+        setPolygonTiles(nextTiles);
 
         // Decide which heading/spacing to use when drawing
       let params = polygonParamsRef.current.get(result.polygonId);
@@ -468,14 +608,17 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           result.result.fitQuality
         );
 
-        setPolygonFlightLines((prev) => {
-          const next = new Map(prev);
-          next.set(result.polygonId, { ...lines, altitudeAGL: safeParams.altitudeAGL });
-          return next;
-        });
+        const nextFlightLines = new Map(polygonFlightLinesRef.current);
+        nextFlightLines.set(result.polygonId, { ...lines, altitudeAGL: safeParams.altitudeAGL });
+        polygonFlightLinesRef.current = nextFlightLines;
+        setPolygonFlightLines(nextFlightLines);
 
         if (!suppressFlightLineEventsRef.current) {
-          onFlightLinesUpdated?.(result.polygonId);
+          if (pendingGeometryRefreshRef.current.delete(result.polygonId)) {
+            onFlightLinesUpdated?.('__all__');
+          } else {
+            onFlightLinesUpdated?.(result.polygonId);
+          }
         }
 
         if (deckOverlayRef.current && lines.flightLines.length > 0) {
@@ -582,10 +725,18 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         return next;
       });
       setPendingParamPolygons((prev) => prev.filter((id) => id !== polygonId));
+      if (processingPolygonIdsRef.current.delete(polygonId)) {
+        syncProcessingPerimeterOverlay();
+        if (processingPolygonIdsRef.current.size === 0) {
+          stopProcessingPerimeterAnimation();
+        }
+      }
 
       setTimeout(() => {
         onPolygonSelected?.(null);
-        onFlightLinesUpdated?.('__all__');
+        if (!suppressFlightLineEventsRef.current) {
+          onFlightLinesUpdated?.('__all__');
+        }
         try {
           const coll = (drawRef.current as any)?.getAll?.();
           const hasAny = Array.isArray(coll?.features) && coll.features.some((f: any) => f?.geometry?.type === 'Polygon');
@@ -631,6 +782,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       if (suspendAutoAnalysisRef.current) return;
       e.features.forEach((feature: any) => {
         if (feature.geometry.type === 'Polygon') {
+          pendingGeometryRefreshRef.current.add(String(feature.id));
           analyzePolygon(feature.id, feature);
         }
       });
@@ -655,6 +807,13 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         map.on('draw.create', handleDrawCreate);
         map.on('draw.update', handleDrawUpdate);
         map.on('draw.delete', handleDrawDelete);
+        map.on('draw.create', syncProcessingPerimeterOverlay);
+        map.on('draw.update', syncProcessingPerimeterOverlay);
+        map.on('draw.delete', syncProcessingPerimeterOverlay);
+        syncProcessingPerimeterOverlay();
+        if (processingPolygonIdsRef.current.size > 0) {
+          startProcessingPerimeterAnimation();
+        }
         // Open params dialog when user selects an existing polygon
         map.on('draw.selectionchange', (e: any) => {
           try {
@@ -1202,6 +1361,424 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       }
     }, [analyzePolygon]);
 
+    const getTerrainPartitionContext = useCallback(async (polygonId: string) => {
+      const draw = drawRef.current as any;
+      const feature = draw?.get?.(polygonId);
+      if (!feature?.geometry || feature.geometry.type !== 'Polygon') {
+        onError?.('Polygon not found for terrain-face splitting.', polygonId);
+        return null;
+      }
+
+      const ring = feature.geometry.coordinates?.[0] as [number, number][] | undefined;
+      if (!Array.isArray(ring) || ring.length < 4) {
+        onError?.('Polygon is invalid for terrain-face splitting.', polygonId);
+        return null;
+      }
+
+      const params = sanitizePolygonParams(
+        polygonParamsRef.current.get(polygonId) ?? { altitudeAGL: 100, frontOverlap: 80, sideOverlap: 70 },
+      );
+      const existingTiles = polygonTilesRef.current.get(polygonId);
+      const tiles = existingTiles && existingTiles.length > 0
+        ? existingTiles
+        : await fetchTilesForPolygon(
+            { coordinates: ring as any },
+            calculateOptimalTerrainZoom({ coordinates: ring as any }),
+            mapboxToken,
+            new AbortController().signal,
+          );
+
+      if (!tiles || tiles.length === 0) {
+        onError?.('Terrain tiles are required before the area can be auto-split.', polygonId);
+        return null;
+      }
+
+      return {
+        draw,
+        ring,
+        tiles,
+        params: sanitizePolygonParams({
+          ...params,
+          useCustomBearing: false,
+          customBearingDeg: undefined,
+        }),
+      };
+    }, [mapboxToken, onError]);
+
+    const getLocalTerrainPartitionSolutions = useCallback((
+      ring: [number, number][],
+      tiles: any[],
+      params: PolygonParams,
+    ): TerrainPartitionSolutionPreview[] => {
+      const { solutions } = buildPartitionFrontier(ring, tiles, params, {
+        tradeoffSamples: DEFAULT_PARTITION_TRADEOFF_SAMPLES,
+      });
+      return solutions
+        .filter((solution) => solution.regions.length > 1)
+        .map((solution) => ({
+          signature: solution.signature,
+          tradeoff: solution.tradeoff,
+          regionCount: solution.partition.regionCount,
+          totalMissionTimeSec: solution.partition.totalMissionTimeSec,
+          normalizedQualityCost: solution.partition.normalizedQualityCost,
+          weightedMeanMismatchDeg: solution.partition.weightedMeanMismatchDeg,
+          hierarchyLevel: solution.hierarchyLevel,
+          largestRegionFraction: solution.largestRegionFraction,
+          meanConvexity: solution.meanConvexity,
+          boundaryBreakAlignment: solution.boundaryBreakAlignment,
+          isFirstPracticalSplit: solution.isFirstPracticalSplit,
+          regions: solution.regions.map((region) => ({
+            areaM2: region.objective.regularization.areaM2,
+            bearingDeg: region.objective.bearingDeg,
+            atomCount: region.atomIds.length,
+            ring: region.ring,
+            convexity: region.convexity,
+            compactness: region.compactness,
+            baseAltitudeAGL: params.altitudeAGL,
+          })),
+        }));
+    }, []);
+
+    type TerrainPartitionRegionApplication = {
+      ring: [number, number][];
+      bearingDeg?: number;
+      baseAltitudeAGL?: number;
+    };
+
+    const getTerrainPartitionSolutions = useCallback(async (polygonId: string) => {
+      const startedAt = splitPerfNow();
+      const context = await getTerrainPartitionContext(polygonId);
+      if (!context) return [];
+      const { ring, tiles, params } = context;
+      if (isTerrainPartitionBackendEnabled()) {
+        try {
+          const backendStartedAt = splitPerfNow();
+          splitPerfLog(polygonId, 'requesting backend partition solutions', {
+            payloadKind: isLidarParams(params) ? 'lidar' : 'camera',
+          });
+          const solutions = await solveTerrainPartitionWithBackend({
+            polygonId,
+            ring,
+            payloadKind: isLidarParams(params) ? 'lidar' : 'camera',
+            params,
+            altitudeMode,
+            minClearanceM,
+            turnExtendM,
+          });
+          splitPerfLog(polygonId, 'backend partition solutions received', {
+            totalMs: Math.round(splitPerfNow() - backendStartedAt),
+            solutionCount: solutions.length,
+            regionCounts: solutions.map((solution) => solution.regionCount),
+          });
+          backendPartitionSolutionsRef.current.set(polygonId, solutions);
+          return solutions.filter((solution) => solution.regions.length > 1);
+        } catch (error) {
+          splitPerfLog(polygonId, 'backend partition solve failed; falling back to local solver', {
+            totalMs: Math.round(splitPerfNow() - startedAt),
+            error: error instanceof Error ? error.message : String(error),
+          });
+          console.warn('Terrain partition backend failed, falling back to local solver.', error);
+        }
+      }
+      const localStartedAt = splitPerfNow();
+      const local = getLocalTerrainPartitionSolutions(ring, tiles, params);
+      splitPerfLog(polygonId, 'local partition solutions computed', {
+        totalMs: Math.round(splitPerfNow() - localStartedAt),
+        solutionCount: local.length,
+      });
+      backendPartitionSolutionsRef.current.set(polygonId, local);
+      return local;
+    }, [altitudeMode, getLocalTerrainPartitionSolutions, getTerrainPartitionContext, minClearanceM, turnExtendM]);
+
+    const applyTerrainPartitionRings = useCallback(async (
+      polygonId: string,
+      partitionRegions: TerrainPartitionRegionApplication[],
+      inheritedParams: PolygonParams,
+    ): Promise<{ createdIds: string[]; replaced: boolean }> => {
+      const startedAt = splitPerfNow();
+      splitPerfLog(polygonId, 'begin applyTerrainPartitionRings', {
+        requestedRegionCount: partitionRegions.length,
+      });
+      const draw = drawRef.current as any;
+      if (!draw) {
+        onError?.('Map is not ready for terrain-face splitting.', polygonId);
+        return { createdIds: [], replaced: false };
+      }
+
+      const normalizedPartitionRegions = partitionRegions
+        .map((region) => {
+          const normalizedRing = normalizeRingForGeometryOps(region.ring);
+          if (!normalizedRing) return null;
+          return { ...region, ring: normalizedRing };
+        })
+        .filter((region): region is TerrainPartitionRegionApplication & { ring: [number, number][] } => region !== null);
+
+      const coverage = computePartitionCoverageMetrics(
+        (draw?.get?.(polygonId)?.geometry?.coordinates?.[0] as [number, number][] | undefined) ?? [],
+        normalizedPartitionRegions.map((region) => region.ring),
+      );
+      splitPerfLog(polygonId, 'partition coverage metrics', coverage);
+
+      if (normalizedPartitionRegions.length <= 1) {
+        onError?.('No useful terrain-face split was found for this area.', polygonId);
+        return { createdIds: [], replaced: false };
+      }
+
+      if (coverage.coverageRatio < 0.5 || coverage.overlapRatio > 0.35) {
+        onError?.('Auto-split produced incomplete child coverage for this area and was rejected.', polygonId);
+        return { createdIds: [], replaced: false };
+      }
+
+      suspendAutoAnalysisRef.current = true;
+      const prevSuppress = suppressFlightLineEventsRef.current;
+      suppressFlightLineEventsRef.current = true;
+      const createdIds: string[] = [];
+
+      try {
+        const createStartedAt = splitPerfNow();
+        const createdRegions: Array<{ id: string; region: TerrainPartitionRegionApplication & { ring: [number, number][] } }> = [];
+        for (const region of normalizedPartitionRegions) {
+          const id = addRingAsDrawFeature(region.ring, 'Terrain Face', { source: 'terrain-face-split', parentPolygonId: polygonId });
+          if (id) {
+            createdIds.push(id);
+            createdRegions.push({ id, region });
+          }
+        }
+        splitPerfLog(polygonId, 'child polygons created', {
+          totalMs: Math.round(splitPerfNow() - createStartedAt),
+          createdIds,
+        });
+
+        if (createdIds.length <= 1) {
+          onError?.('Auto-split did not produce enough valid child polygons.', polygonId);
+          return { createdIds: [], replaced: false };
+        }
+
+        const nextParams = new Map(polygonParamsRef.current);
+        nextParams.delete(polygonId);
+        createdRegions.forEach(({ id, region }) => {
+          nextParams.set(id, {
+            ...inheritedParams,
+            altitudeAGL: region.baseAltitudeAGL ?? inheritedParams.altitudeAGL,
+          });
+        });
+        polygonParamsRef.current = nextParams;
+        setPolygonParams(new Map(nextParams));
+
+        const nextOverrides = new Map(bearingOverridesRef.current);
+        nextOverrides.delete(polygonId);
+        createdRegions.forEach(({ id, region }) => {
+          if (!Number.isFinite(region.bearingDeg)) return;
+          const childParams = nextParams.get(id) ?? inheritedParams;
+          nextOverrides.set(id, {
+            bearingDeg: region.bearingDeg!,
+            lineSpacingM: getLineSpacingForParams(childParams),
+            source: 'user',
+          });
+        });
+        bearingOverridesRef.current = nextOverrides;
+        setBearingOverrides(new Map(nextOverrides));
+
+        setImportedOriginals((prev) => {
+          const next = new Map(prev);
+          next.delete(polygonId);
+          return next;
+        });
+        setPolygonResults((prev) => {
+          if (!prev.has(polygonId)) return prev;
+          const next = new Map(prev);
+          next.delete(polygonId);
+          polygonResultsRef.current = next;
+          debouncedAnalysisComplete();
+          return next;
+        });
+        if (polygonTilesRef.current.has(polygonId)) {
+          const nextTiles = new Map(polygonTilesRef.current);
+          nextTiles.delete(polygonId);
+          polygonTilesRef.current = nextTiles;
+          setPolygonTiles(nextTiles);
+        }
+        if (polygonFlightLinesRef.current.has(polygonId)) {
+          const nextFlightLines = new Map(polygonFlightLinesRef.current);
+          nextFlightLines.delete(polygonId);
+          polygonFlightLinesRef.current = nextFlightLines;
+          setPolygonFlightLines(nextFlightLines);
+        }
+        setPendingParamPolygons((prev) => prev.filter((id) => id !== polygonId));
+        backendPartitionSolutionsRef.current.delete(polygonId);
+        createdIds.forEach((id) => backendPartitionSolutionsRef.current.delete(id));
+
+        if (mapRef.current) {
+          removeFlightLinesForPolygon(mapRef.current, polygonId);
+          removeTriggerPointsForPolygon(mapRef.current, polygonId);
+        }
+        if (deckOverlayRef.current) {
+          remove3DPathLayer(deckOverlayRef.current, polygonId, setDeckLayers);
+          remove3DTriggerPointsLayer(deckOverlayRef.current, polygonId, setDeckLayers);
+          remove3DCameraPointsLayer(deckOverlayRef.current, polygonId, setDeckLayers);
+        }
+
+        pendingProgrammaticDeletesRef.current.add(polygonId);
+        draw.delete(polygonId);
+
+        fitMapToRings(normalizedPartitionRegions.map((region) => region.ring));
+
+        suspendAutoAnalysisRef.current = false;
+        const analyzeStartedAt = splitPerfNow();
+        const analysisPromises: Promise<any>[] = [];
+        for (const childId of createdIds) {
+          const childFeature = draw?.get?.(childId);
+          if (childFeature?.geometry?.type === 'Polygon') {
+            analysisPromises.push(analyzePolygon(childId, childFeature));
+          }
+        }
+        await Promise.allSettled(analysisPromises);
+        splitPerfLog(polygonId, 'child analyzePolygon calls settled', {
+          totalMs: Math.round(splitPerfNow() - analyzeStartedAt),
+          analyzedChildCount: analysisPromises.length,
+        });
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        for (const { id, region } of createdRegions) {
+          applyPolygonParams(id, {
+            ...inheritedParams,
+            altitudeAGL: region.baseAltitudeAGL ?? inheritedParams.altitudeAGL,
+          }, { skipEvent: true, skipQueue: true });
+        }
+
+        onPolygonSelected?.(createdIds[0] ?? null);
+        splitPerfLog(polygonId, 'applyTerrainPartitionRings completed', {
+          totalMs: Math.round(splitPerfNow() - startedAt),
+          createdIds,
+        });
+        return { createdIds, replaced: true };
+      } catch (error) {
+        for (const childId of createdIds) {
+          try {
+            pendingProgrammaticDeletesRef.current.add(childId);
+            draw?.delete?.(childId);
+          } catch {}
+        }
+        splitPerfLog(polygonId, 'applyTerrainPartitionRings failed', {
+          totalMs: Math.round(splitPerfNow() - startedAt),
+          error: error instanceof Error ? error.message : String(error),
+        });
+        onError?.(`Terrain-face split failed: ${error instanceof Error ? error.message : 'Unknown error'}`, polygonId);
+        return { createdIds: [], replaced: false };
+      } finally {
+        suspendAutoAnalysisRef.current = false;
+        suppressFlightLineEventsRef.current = prevSuppress;
+        if (!prevSuppress) {
+          onFlightLinesUpdated?.('__all__');
+        }
+      }
+    }, [addRingAsDrawFeature, analyzePolygon, applyPolygonParams, fitMapToRings, onError, onFlightLinesUpdated, onPolygonSelected]);
+
+    const applyTerrainPartitionSolution = useCallback(async (
+      polygonId: string,
+      signature: string,
+    ): Promise<{ createdIds: string[]; replaced: boolean }> => {
+      const context = await getTerrainPartitionContext(polygonId);
+      if (!context) return { createdIds: [], replaced: false };
+      const { ring, tiles, params } = context;
+      const cached = backendPartitionSolutionsRef.current.get(polygonId) ?? [];
+      const solutions = cached.length > 0 ? cached : await getTerrainPartitionSolutions(polygonId);
+      const selected = solutions.find((solution) => solution.signature === signature);
+      if (!selected || selected.regions.length <= 1) {
+        onError?.('Selected terrain partition is no longer valid for this area.', polygonId);
+        return { createdIds: [], replaced: false };
+      }
+      return applyTerrainPartitionRings(
+        polygonId,
+        selected.regions.map((region) => ({
+          ring: region.ring as [number, number][],
+          bearingDeg: region.bearingDeg,
+          baseAltitudeAGL: region.baseAltitudeAGL,
+        })),
+        params,
+      );
+    }, [applyTerrainPartitionRings, getTerrainPartitionContext, getTerrainPartitionSolutions, onError]);
+
+    const pickDefaultPartitionSolution = useCallback((solutions: TerrainPartitionSolutionPreview[]) => {
+      const candidates = solutions.filter((solution) => solution.regions.length > 1);
+      if (candidates.length === 0) return null;
+      const firstPractical = candidates.find((solution) => solution.isFirstPracticalSplit);
+      if (firstPractical) return firstPractical;
+      const bestTradeoffDistance = candidates.reduce(
+        (best, candidate) => Math.min(best, Math.abs(candidate.tradeoff - DEFAULT_PARTITION_TARGET_TRADEOFF)),
+        Infinity,
+      );
+      const tradeoffBucket = candidates.filter(
+        (candidate) => Math.abs(Math.abs(candidate.tradeoff - DEFAULT_PARTITION_TARGET_TRADEOFF) - bestTradeoffDistance) <= 1e-9,
+      );
+      const minRegionCount = tradeoffBucket.reduce(
+        (best, candidate) => Math.min(best, candidate.regionCount),
+        Infinity,
+      );
+      return tradeoffBucket
+        .filter((candidate) => candidate.regionCount === minRegionCount)
+        .reduce((best, candidate) => (
+          candidate.normalizedQualityCost < best.normalizedQualityCost ? candidate : best
+        ));
+    }, []);
+
+    const autoSplitPolygonByTerrain = useCallback(async (polygonId: string): Promise<{ createdIds: string[]; replaced: boolean }> => {
+      const startedAt = splitPerfNow();
+      splitPerfLog(polygonId, 'autoSplitPolygonByTerrain start');
+      const context = await getTerrainPartitionContext(polygonId);
+      if (!context) return { createdIds: [], replaced: false };
+      const { ring, tiles, params } = context;
+      const solutions = await getTerrainPartitionSolutions(polygonId);
+      splitPerfLog(polygonId, 'autoSplitPolygonByTerrain candidate solutions ready', {
+        totalMs: Math.round(splitPerfNow() - startedAt),
+        solutionCount: solutions.length,
+      });
+      const selected = pickDefaultPartitionSolution(solutions);
+      if (selected) {
+        splitPerfLog(polygonId, 'autoSplitPolygonByTerrain applying selected backend solution', {
+          signature: selected.signature,
+          regionCount: selected.regionCount,
+          tradeoff: selected.tradeoff,
+        });
+        const applied = await applyTerrainPartitionRings(
+          polygonId,
+          selected.regions.map((region) => ({
+            ring: region.ring as [number, number][],
+            bearingDeg: region.bearingDeg,
+            baseAltitudeAGL: region.baseAltitudeAGL,
+          })),
+          params,
+        );
+        if (applied.replaced) {
+          splitPerfLog(polygonId, 'autoSplitPolygonByTerrain completed via backend solution', {
+            totalMs: Math.round(splitPerfNow() - startedAt),
+            createdIds: applied.createdIds,
+          });
+          return applied;
+        }
+      }
+
+      splitPerfLog(polygonId, 'autoSplitPolygonByTerrain falling back to legacy local partitioner');
+      const partition = partitionPolygonByTerrainFaces(ring, tiles, {
+        ...params,
+        useCustomBearing: false,
+        customBearingDeg: undefined,
+      }, {
+        forceAtLeastOneSplit: true,
+        candidateAngleStepDeg: 10,
+        candidateOffsetFractions: [-0.42, -0.28, -0.14, 0, 0.14, 0.28, 0.42],
+      });
+      const fallbackResult = await applyTerrainPartitionRings(
+        polygonId,
+        partition.polygons.map((ring) => ({ ring })),
+        params,
+      );
+      splitPerfLog(polygonId, 'autoSplitPolygonByTerrain completed via legacy fallback', {
+        totalMs: Math.round(splitPerfNow() - startedAt),
+        createdIds: fallbackResult.createdIds,
+      });
+      return fallbackResult;
+    }, [applyTerrainPartitionRings, getTerrainPartitionContext, getTerrainPartitionSolutions, pickDefaultPartitionSolution]);
+
     // ---------- Map render ----------
     // Note: using `any` for now due to complex nested types from Mapbox GL and Deck.gl
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1219,6 +1796,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
 
     React.useImperativeHandle(ref, () => ({
       clearAllDrawings: () => {
+        setProcessingPolygonIds([]);
         if (drawRef.current) drawRef.current.deleteAll();
         if (deckOverlayRef.current) {
           setDeckLayers([]);
@@ -1245,6 +1823,9 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         onAnalysisComplete?.([]);
       },
       clearPolygon: (polygonId: string) => {
+        if (processingPolygonIdsRef.current.has(polygonId)) {
+          setProcessingPolygonIds(Array.from(processingPolygonIdsRef.current).filter((id) => id !== polygonId));
+        }
         const draw = drawRef.current as any;
         if (!draw) {
           cleanupPolygonState(polygonId);
@@ -1261,10 +1842,14 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         }, 0);
       },
       editPolygonBoundary,
+      setProcessingPolygonIds,
+      autoSplitPolygonByTerrain,
+      getTerrainPartitionSolutions,
+      applyTerrainPartitionSolution,
       startPolygonDrawing: () => {
         if (drawRef.current) (drawRef.current as any).changeMode('draw_polygon');
       },
-      getPolygonResults: () => Array.from(polygonResults.values()),
+      getPolygonResults: () => Array.from(polygonResultsRef.current.values()),
       getMap: () => mapRef.current,
       getPolygons: (): [number,number][][] => {
         const draw = drawRef.current;
@@ -1293,8 +1878,8 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         }
         return polygonsWithIds;
       },
-      getFlightLines: () => polygonFlightLines,
-      getPolygonTiles: () => polygonTiles,
+      getFlightLines: () => polygonFlightLinesRef.current,
+      getPolygonTiles: () => polygonTilesRef.current,
       addCameraPoints: (polygonId: string, positions: [number, number, number][]) => {
         if (deckOverlayRef.current) update3DCameraPointsLayer(deckOverlayRef.current, polygonId, positions, setDeckLayers);
       },
@@ -1305,7 +1890,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       applyPolygonParamsBatch,
       // expose bulk apply helper
       applyParamsToAllPending,
-      getPerPolygonParams: () => Object.fromEntries(polygonParams),
+      getPerPolygonParams: () => Object.fromEntries(polygonParamsRef.current),
       // Altitude strategy and clearance controls
       setAltitudeMode: (m: 'legacy' | 'min-clearance') => setAltitudeMode(m),
       getAltitudeMode: () => altitudeMode,
@@ -1371,12 +1956,17 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       },
     }), [
       polygonResults, polygonFlightLines, polygonTiles, polygonParams,
-      cancelAllAnalyses, applyPolygonParams, applyPolygonParamsBatch, cleanupPolygonState, editPolygonBoundary,
+      cancelAllAnalyses, applyPolygonParams, applyPolygonParamsBatch, cleanupPolygonState, editPolygonBoundary, setProcessingPolygonIds, autoSplitPolygonByTerrain,
+      getTerrainPartitionSolutions, applyTerrainPartitionSolution,
       bearingOverrides, importedOriginals,
       importKmlFromText, importWingtraFromText,
       optimizePolygonDirection, revertPolygonToImportedDirection, runFullAnalysis,
       lastImportedFlightplan
     ]);
+
+    React.useEffect(() => () => {
+      stopProcessingPerimeterAnimation();
+    }, [stopProcessingPerimeterAnimation]);
 
     return (
       <div style={{ position: 'relative', width: '100%', height: '100%' }}>

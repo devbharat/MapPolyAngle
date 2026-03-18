@@ -6,7 +6,11 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "compare:lidar": "python3 scripts/compare_lidar_mission.py"
+    "backend:terrain-splitter": "python3 -m uvicorn terrain_splitter.app:app --app-dir backend/terrain_splitter --host 127.0.0.1 --port 8090 --reload",
+    "compare:lidar": "python3 scripts/compare_lidar_mission.py",
+    "test:terrain-split": "npx --yes tsx src/tests/terrain_face_partition.test.ts",
+    "test:terrain-objective": "npx --yes tsx src/tests/terrain_partition_objective.test.ts",
+    "test:terrain-graph": "npx --yes tsx src/tests/terrain_partition_graph.test.ts"
   },
   "dependencies": {
     "@deck.gl/core": "^9.1.14",

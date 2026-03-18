@@ -1,0 +1,470 @@
+{
+  "locked": false,
+  "safety": {
+    "rthMode": 0,
+    "version": 2,
+    "maxGroundClearance": 243.5,
+    "minGroundClearance": 38.1,
+    "ceilingAboveTakeOff": 2000.1,
+    "connectionLossTimeout": 15,
+    "minRTHHeightAboveHome": 60
+  },
+  "siteId": "b91f59ff-1001-4b80-927e-a2363cee87f5",
+  "version": 1,
+  "fileType": "Plan",
+  "flightId": "6661c95f-0fba-4feb-9d48-42e6406b4d94",
+  "geofence": {
+    "polygon": [
+      [
+        33.51866796671498,
+        -117.59720193579211
+      ],
+      [
+        33.51866796671498,
+        -117.55773982339878
+      ],
+      [
+        33.55156150833857,
+        -117.55773982339878
+      ],
+      [
+        33.55156150833857,
+        -117.59720193579211
+      ],
+      [
+        33.51866796671498,
+        -117.59720193579211
+      ]
+    ],
+    "version": 1,
+    "geofenceType": 1,
+    "geofenceRadius": 1828.8,
+    "terminationSettings": null
+  },
+  "flightPlan": {
+    "items": [
+      {
+        "grid": {
+          "angle": 222.81175292451735,
+          "spacing": 53.99999999999999,
+          "altitude": 90,
+          "multithreading": false,
+          "turnAroundDistance": 80,
+          "turnAroundSideOffset": 70,
+          "safeRTHMaxSurveyAltitude": null
+        },
+        "type": "ComplexItem",
+        "camera": {
+          "pointDensity": 55.555555555555564,
+          "AltitudeOffset": 0,
+          "groundResolution": 55.555555555555564,
+          "imageSideOverlap": 70,
+          "imageFrontalOverlap": 70,
+          "cameraTriggerDistance": 0
+        },
+        "polygon": [
+          [
+            33.53934901089204,
+            -117.58028993700295
+          ],
+          [
+            33.53529170943543,
+            -117.58884962528073
+          ],
+          [
+            33.53436991414817,
+            -117.58743606202522
+          ],
+          [
+            33.53801741985886,
+            -117.57824689174333
+          ],
+          [
+            33.53934901089204,
+            -117.58028993700295
+          ]
+        ],
+        "version": 3,
+        "wasFlown": false,
+        "complexItemType": "area",
+        "terrainFollowing": true
+      },
+      {
+        "grid": {
+          "angle": 105.26314712238883,
+          "spacing": 53.99999999999999,
+          "altitude": 90,
+          "multithreading": false,
+          "turnAroundDistance": 80,
+          "turnAroundSideOffset": 70,
+          "safeRTHMaxSurveyAltitude": null
+        },
+        "type": "ComplexItem",
+        "camera": {
+          "pointDensity": 55.555555555555564,
+          "AltitudeOffset": 0,
+          "groundResolution": 55.555555555555564,
+          "imageSideOverlap": 70,
+          "imageFrontalOverlap": 70,
+          "cameraTriggerDistance": 0
+        },
+        "polygon": [
+          [
+            33.53803490130302,
+            -117.57801633287859
+          ],
+          [
+            33.536820592210375,
+            -117.57500959588707
+          ],
+          [
+            33.53349034349506,
+            -117.58706232162383
+          ],
+          [
+            33.53418062328001,
+            -117.58808472774675
+          ],
+          [
+            33.53803490130302,
+            -117.57801633287859
+          ]
+        ],
+        "version": 3,
+        "wasFlown": false,
+        "complexItemType": "area",
+        "terrainFollowing": true
+      },
+      {
+        "grid": {
+          "angle": 237.179302661439,
+          "spacing": 53.99999999999999,
+          "altitude": 90,
+          "multithreading": false,
+          "turnAroundDistance": 80,
+          "turnAroundSideOffset": 70,
+          "safeRTHMaxSurveyAltitude": null
+        },
+        "type": "ComplexItem",
+        "camera": {
+          "pointDensity": 55.555555555555564,
+          "AltitudeOffset": 0,
+          "groundResolution": 55.555555555555564,
+          "imageSideOverlap": 70,
+          "imageFrontalOverlap": 70,
+          "cameraTriggerDistance": 0
+        },
+        "polygon": [
+          [
+            33.53349464541485,
+            -117.57920935676015
+          ],
+          [
+            33.53237066041848,
+            -117.58796284943959
+          ],
+          [
+            33.53347336599123,
+            -117.58793729323187
+          ],
+          [
+            33.53615517169973,
+            -117.57712403290621
+          ],
+          [
+            33.53349464541485,
+            -117.57920935676015
+          ]
+        ],
+        "version": 3,
+        "wasFlown": false,
+        "complexItemType": "area",
+        "terrainFollowing": true
+      },
+      {
+        "grid": {
+          "angle": 104.49974184950332,
+          "spacing": 53.99999999999999,
+          "altitude": 90,
+          "multithreading": false,
+          "turnAroundDistance": 80,
+          "turnAroundSideOffset": 70,
+          "safeRTHMaxSurveyAltitude": null
+        },
+        "type": "ComplexItem",
+        "camera": {
+          "pointDensity": 55.555555555555564,
+          "AltitudeOffset": 0,
+          "groundResolution": 55.555555555555564,
+          "imageSideOverlap": 70,
+          "imageFrontalOverlap": 70,
+          "cameraTriggerDistance": 0
+        },
+        "polygon": [
+          [
+            33.533917398731674,
+            -117.57772644421267
+          ],
+          [
+            33.532215421411465,
+            -117.57962202392665
+          ],
+          [
+            33.53073002142723,
+            -117.58875119177587
+          ],
+          [
+            33.53230457137319,
+            -117.58853792543434
+          ],
+          [
+            33.533917398731674,
+            -117.57772644421267
+          ]
+        ],
+        "version": 3,
+        "wasFlown": false,
+        "complexItemType": "area",
+        "terrainFollowing": true
+      },
+      {
+        "grid": {
+          "angle": 241.3213215185292,
+          "spacing": 53.99999999999999,
+          "altitude": 90,
+          "multithreading": false,
+          "turnAroundDistance": 80,
+          "turnAroundSideOffset": 70,
+          "safeRTHMaxSurveyAltitude": null
+        },
+        "type": "ComplexItem",
+        "camera": {
+          "pointDensity": 55.555555555555564,
+          "AltitudeOffset": 0,
+          "groundResolution": 55.555555555555564,
+          "imageSideOverlap": 70,
+          "imageFrontalOverlap": 70,
+          "cameraTriggerDistance": 0
+        },
+        "polygon": [
+          [
+            33.53153041104157,
+            -117.57941579072681
+          ],
+          [
+            33.53019385844975,
+            -117.58784156333793
+          ],
+          [
+            33.53073250623733,
+            -117.58870511813535
+          ],
+          [
+            33.53231804318489,
+            -117.5791854148612
+          ],
+          [
+            33.53153041104157,
+            -117.57941579072681
+          ]
+        ],
+        "version": 3,
+        "wasFlown": false,
+        "complexItemType": "area",
+        "terrainFollowing": true
+      },
+      {
+        "grid": {
+          "angle": 41.07449194338881,
+          "spacing": 53.99999999999999,
+          "altitude": 90,
+          "multithreading": false,
+          "turnAroundDistance": 80,
+          "turnAroundSideOffset": 70,
+          "safeRTHMaxSurveyAltitude": null
+        },
+        "type": "ComplexItem",
+        "camera": {
+          "pointDensity": 55.555555555555564,
+          "AltitudeOffset": 0,
+          "groundResolution": 55.555555555555564,
+          "imageSideOverlap": 70,
+          "imageFrontalOverlap": 70,
+          "cameraTriggerDistance": 0
+        },
+        "polygon": [
+          [
+            33.53650008381065,
+            -117.57646055921994
+          ],
+          [
+            33.53669636062237,
+            -117.57736352465075
+          ],
+          [
+            33.53119050138733,
+            -117.58047261568599
+          ],
+          [
+            33.5304580129753,
+            -117.57816960073914
+          ],
+          [
+            33.53650008381065,
+            -117.57646055921994
+          ]
+        ],
+        "version": 3,
+        "wasFlown": false,
+        "complexItemType": "area",
+        "terrainFollowing": true
+      },
+      {
+        "grid": {
+          "angle": 112.11176634863614,
+          "spacing": 53.99999999999999,
+          "altitude": 90,
+          "multithreading": false,
+          "turnAroundDistance": 80,
+          "turnAroundSideOffset": 70,
+          "safeRTHMaxSurveyAltitude": null
+        },
+        "type": "ComplexItem",
+        "camera": {
+          "pointDensity": 55.555555555555564,
+          "AltitudeOffset": 0,
+          "groundResolution": 55.555555555555564,
+          "imageSideOverlap": 70,
+          "imageFrontalOverlap": 70,
+          "cameraTriggerDistance": 0
+        },
+        "polygon": [
+          [
+            33.536197755126565,
+            -117.57656803346043
+          ],
+          [
+            33.5341956007847,
+            -117.57051680267092
+          ],
+          [
+            33.53000292107717,
+            -117.57249764805921
+          ],
+          [
+            33.530590332089076,
+            -117.5782315647495
+          ],
+          [
+            33.536197755126565,
+            -117.57656803346043
+          ]
+        ],
+        "version": 3,
+        "wasFlown": false,
+        "complexItemType": "area",
+        "terrainFollowing": true
+      },
+      {
+        "grid": {
+          "angle": 325.5721209547355,
+          "spacing": 53.99999999999999,
+          "altitude": 90,
+          "multithreading": false,
+          "turnAroundDistance": 80,
+          "turnAroundSideOffset": 70,
+          "safeRTHMaxSurveyAltitude": null
+        },
+        "type": "ComplexItem",
+        "camera": {
+          "pointDensity": 55.555555555555564,
+          "AltitudeOffset": 0,
+          "groundResolution": 55.555555555555564,
+          "imageSideOverlap": 70,
+          "imageFrontalOverlap": 70,
+          "cameraTriggerDistance": 0
+        },
+        "polygon": [
+          [
+            33.53417824543499,
+            -117.57048847591646
+          ],
+          [
+            33.53564540765089,
+            -117.57062859853326
+          ],
+          [
+            33.537315221176485,
+            -117.57602666243417
+          ],
+          [
+            33.53614055687625,
+            -117.57657713672933
+          ],
+          [
+            33.53432340027787,
+            -117.570922707937
+          ],
+          [
+            33.53417824543499,
+            -117.57048847591646
+          ]
+        ],
+        "version": 3,
+        "wasFlown": false,
+        "complexItemType": "area",
+        "terrainFollowing": true
+      }
+    ],
+    "payload": "LIDAR",
+    "version": 6,
+    "gisItems": [],
+    "totalArea": 1254935.7560378073,
+    "hoverSpeed": 3,
+    "cruiseSpeed": 19,
+    "creationTime": 1773334430005,
+    "firmwareType": 12,
+    "flightNumber": 1,
+    "elevationData": {
+      "name": "SRTM",
+      "type": "Auto",
+      "enabled": true
+    },
+    "missionStatus": 0,
+    "planeHardware": {
+      "status": "ready",
+      "hwVersion": "5",
+      "vehicleId": 10055,
+      "displayName": "WingtraRAY 10055",
+      "isGenericPlane": false
+    },
+    "numberOfImages": 0,
+    "activeTotalArea": 1254935.7560378073,
+    "flownPercentage": 0,
+    "totalFlightTime": 2634.309258494118,
+    "lastModifiedTime": 1773334430172,
+    "resumeMissionIndex": 0,
+    "payloadUniqueString": "LIDAR_v5",
+    "plannedHomePosition": [
+      0,
+      0,
+      0
+    ],
+    "totalFlightDistance": 54171.994056934906,
+    "activeNumberOfImages": 0,
+    "maxTelemetryDistance": 0,
+    "resumeGridPointIndex": -1,
+    "totalFlightHoverTime": 0,
+    "activeTotalFlightTime": 2634.309258494118,
+    "totalFlightCruiseTime": 3153.4409152772755,
+    "totalFlightHoverDistance": 0,
+    "activeTotalFlightDistance": 54171.994056934906,
+    "totalFlightCruiseDistance": 54171.994056934906,
+    "activeMaxTelemetryDistance": 0,
+    "activeTotalFlightHoverTime": 0,
+    "activeTotalFlightCruiseTime": 3153.4409152772755,
+    "activeTotalFlightCruiseDistance": 54171.994056934906
+  },
+  "groundStation": "WingtraPilot",
+  "flightPlanHistory": []
+}
