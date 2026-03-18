@@ -143,7 +143,6 @@ function ringsRoughlyEqual(a: [number, number][], b: [number, number][], toleran
   }
   return true;
 }
-
 function lidarStripMayAffectTile(
   strip: LidarStripMeters,
   tileRef: { z: number; x: number; y: number }
@@ -151,7 +150,7 @@ function lidarStripMayAffectTile(
   const bounds = tileMetersBounds(tileRef.z, tileRef.x, tileRef.y);
   const reachPadM = Math.max(
     strip.halfWidthM ?? 0,
-    Number.isFinite(strip.maxRangeM ?? Number.NaN) ? strip.maxRangeM! : 0
+    typeof strip.maxRangeM === "number" && Number.isFinite(strip.maxRangeM) ? strip.maxRangeM : 0
   );
   const minXs = Math.min(strip.x1, strip.x2) - reachPadM;
   const maxXs = Math.max(strip.x1, strip.x2) + reachPadM;
@@ -164,7 +163,6 @@ function lidarStripMayAffectTile(
     minYs > bounds.maxY
   );
 }
-
 // NEW: helper for synthetic ring conversion (Spherical Mercator meters -> lng/lat)
 const R_SYNTH = 6378137;
 function metersBoundsToLngLatRing(minX:number,minY:number,maxX:number,maxY:number):[number,number][] {
