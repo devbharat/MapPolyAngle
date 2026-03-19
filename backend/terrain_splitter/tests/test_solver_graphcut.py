@@ -19,6 +19,7 @@ from terrain_splitter.solver_frontier import (
     _region_basic_validity,
     _region_gate_diagnostics,
     _region_practical,
+    _score_relaxed_fallback_candidate,
     _cell_lookup,
     _deserialize_partition_plan,
     _feature_lookup,
@@ -204,7 +205,8 @@ def test_lambda_root_split_worker_event_matches_direct_branch_solver() -> None:
         feature_lookup=_feature_lookup(feature_field),
         cell_lookup=_cell_lookup(grid),
         neighbors=_neighbor_lookup(grid),
-        line_length_scale=0.4,
+        basic_line_length_scale=0.35,
+        practical_line_length_scale=0.4,
     )
     task = RootSplitTask(
         left_ids=(0, 1),
@@ -252,7 +254,8 @@ def test_lambda_subtree_worker_event_matches_direct_subtree_solver() -> None:
         feature_lookup=_feature_lookup(feature_field),
         cell_lookup=_cell_lookup(grid),
         neighbors=_neighbor_lookup(grid),
-        line_length_scale=0.4,
+        basic_line_length_scale=0.35,
+        practical_line_length_scale=0.4,
     )
     task = SubtreeSolveTask(cell_ids=(0, 1), depth=1)
 
@@ -405,6 +408,29 @@ def test_relaxed_region_failure_sets_keep_convexity_and_20m_floor_hard() -> None
     assert "mean_line_length_m" not in soft_failures
 
 
+def test_relaxed_region_failure_sets_keep_practical_convexity_hard() -> None:
+    region = _mock_region(500.0, 260.0, region_id=11)
+    objective = replace(
+        region.objective,
+        convexity=0.6,
+        mean_line_length_m=40.0,
+    )
+    adjusted_region = region.__class__(
+        cell_ids=region.cell_ids,
+        polygon=region.polygon,
+        ring=region.ring,
+        objective=objective,
+        score=region.score,
+        hard_invalid=region.hard_invalid,
+    )
+
+    diagnostics = _region_gate_diagnostics(adjusted_region, 1_000.0, practical=True, line_length_scale=0.45)
+    hard_failures, soft_failures = _relaxed_region_failure_sets(diagnostics, practical=True)
+
+    assert "convexity" in hard_failures
+    assert "convexity" not in soft_failures
+
+
 def test_relaxed_region_failure_sets_treat_scaled_line_length_as_soft() -> None:
     region = _mock_region(500.0, 260.0, region_id=10)
     objective = replace(
@@ -427,3 +453,37 @@ def test_relaxed_region_failure_sets_treat_scaled_line_length_as_soft() -> None:
 
     assert "mean_line_length_hard_floor_m" not in hard_failures
     assert "mean_line_length_m" in soft_failures
+
+
+def test_relaxed_fallback_score_penalizes_quality_and_time_regression() -> None:
+    baseline = _plan_from_regions((_mock_region(1_000.0, 600.0, region_id=12),), 0.0, 0.0)
+    same_quality_slower = replace(
+        baseline,
+        mission_time_sec=baseline.mission_time_sec + 500.0,
+    )
+    worse_quality_same_time = replace(
+        baseline,
+        quality_cost=baseline.quality_cost + 0.5,
+    )
+
+    baseline_score = _score_relaxed_fallback_candidate(
+        baseline,
+        baseline,
+        soft_total_margin=0.0,
+        soft_max_margin=0.0,
+    )
+    slower_score = _score_relaxed_fallback_candidate(
+        same_quality_slower,
+        baseline,
+        soft_total_margin=0.0,
+        soft_max_margin=0.0,
+    )
+    worse_quality_score = _score_relaxed_fallback_candidate(
+        worse_quality_same_time,
+        baseline,
+        soft_total_margin=0.0,
+        soft_max_margin=0.0,
+    )
+
+    assert slower_score > baseline_score
+    assert worse_quality_score > baseline_score

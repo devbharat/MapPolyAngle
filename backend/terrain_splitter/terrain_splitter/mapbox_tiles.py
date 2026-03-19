@@ -29,7 +29,7 @@ def tile_bounds_mercator(z: int, x: int, y: int) -> tuple[float, float, float, f
 
 
 def choose_grid_step_m(area_m2: float) -> float:
-    return clamp(math.sqrt(max(area_m2, 1.0)) / 22.0, 24.0, 80.0)
+    return clamp(math.sqrt(max(area_m2, 1.0)) / 28.0, 24.0, 80.0)
 
 
 def choose_terrain_zoom(grid_step_m: float) -> int:

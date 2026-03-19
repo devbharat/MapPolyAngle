@@ -43,8 +43,10 @@ COARSE_NON_LARGEST_FRACTION_MIN = 0.22
 INTER_REGION_TRANSITION_SEC = 35.0
 REGION_COUNT_PENALTY = 0.012
 DOMINANCE_EPS = 1e-6
-DEFAULT_LINE_LENGTH_SCALE = 0.45
+DEFAULT_BASIC_LINE_LENGTH_SCALE = 0.35
+DEFAULT_PRACTICAL_LINE_LENGTH_SCALE = 0.40
 RELAXED_HARD_MIN_MEAN_LINE_LENGTH_M = 20.0
+RELAXED_FALLBACK_TIME_DIVISOR_SEC = 7_500.0
 RELAXED_FALLBACK_SOFT_TOTAL_WEIGHT = 0.01
 RELAXED_FALLBACK_SOFT_MAX_WEIGHT = 0.002
 MAX_RELAXED_FALLBACK_CANDIDATES = 6
@@ -147,7 +149,8 @@ class SolverContext:
     feature_lookup: dict[int, CellFeatures]
     cell_lookup: dict[int, GridCell]
     neighbors: dict[int, list[int]]
-    line_length_scale: float
+    basic_line_length_scale: float
+    practical_line_length_scale: float
 
 
 @dataclass(slots=True)
@@ -634,13 +637,31 @@ def _relaxed_region_failure_sets(
     for reason, margin in failures.items():
         if reason in {"hard_invalid", "min_child_fraction", "flight_line_count"}:
             hard_failures[reason] = margin
-        elif reason == "convexity" and not practical:
+        elif reason == "convexity":
             hard_failures[reason] = margin
         elif reason == "mean_line_length_m" and mean_line_length_m < RELAXED_HARD_MIN_MEAN_LINE_LENGTH_M:
             hard_failures["mean_line_length_hard_floor_m"] = RELAXED_HARD_MIN_MEAN_LINE_LENGTH_M - mean_line_length_m
         else:
             soft_failures[reason] = margin
     return hard_failures, soft_failures
+
+
+def _score_relaxed_fallback_candidate(
+    plan: PartitionPlan,
+    baseline_plan: PartitionPlan,
+    *,
+    soft_total_margin: float,
+    soft_max_margin: float,
+) -> float:
+    quality_regression = max(0.0, plan.quality_cost - baseline_plan.quality_cost)
+    mission_time_penalty = max(0.0, plan.mission_time_sec - baseline_plan.mission_time_sec) / RELAXED_FALLBACK_TIME_DIVISOR_SEC
+    return (
+        plan.quality_cost
+        + quality_regression
+        + mission_time_penalty
+        + RELAXED_FALLBACK_SOFT_TOTAL_WEIGHT * soft_total_margin
+        + RELAXED_FALLBACK_SOFT_MAX_WEIGHT * soft_max_margin
+    )
 
 
 def _relaxed_plan_soft_failure_values(
@@ -882,7 +903,7 @@ def _cut_direction_candidates(
 
     for fallback in (0.0, 30.0, 45.0, 60.0, 90.0, 120.0, 135.0, 150.0):
         add(fallback)
-    return candidates[:10]
+    return candidates[:16]
 
 
 def _boundary_stats_for_split(
@@ -1599,7 +1620,7 @@ def _generate_split_candidates_for_context(
         caches.polygon_cache,
         caches.basic_rejection_summary,
         caches.basic_split_rejection_summary,
-        context.line_length_scale,
+        context.basic_line_length_scale,
         perf,
     )
 
@@ -1675,7 +1696,7 @@ def _generate_relaxed_root_fallback_candidates(
                     region,
                     context.root_area_m2,
                     practical=False,
-                    line_length_scale=context.line_length_scale,
+                    line_length_scale=context.basic_line_length_scale,
                 )
                 hard_failures, soft_failures = _relaxed_region_failure_sets(diagnostics, practical=False)
                 if hard_failures:
@@ -1688,17 +1709,18 @@ def _generate_relaxed_root_fallback_candidates(
             plan_soft_values = _relaxed_plan_soft_failure_values(
                 exact_plan,
                 context.root_area_m2,
-                line_length_scale=context.line_length_scale,
+                line_length_scale=context.practical_line_length_scale,
             )
             if any(math.isinf(value) for value in plan_soft_values):
                 continue
             soft_values.extend(plan_soft_values)
             soft_total_margin = float(sum(soft_values))
             soft_max_margin = float(max(soft_values, default=0.0))
-            fallback_score = (
-                exact_plan.quality_cost
-                + RELAXED_FALLBACK_SOFT_TOTAL_WEIGHT * soft_total_margin
-                + RELAXED_FALLBACK_SOFT_MAX_WEIGHT * soft_max_margin
+            fallback_score = _score_relaxed_fallback_candidate(
+                exact_plan,
+                baseline_plan,
+                soft_total_margin=soft_total_margin,
+                soft_max_margin=soft_max_margin,
             )
             plan_signature = _plan_signature(exact_plan)
             existing = retained.get(plan_signature)
@@ -1775,7 +1797,7 @@ def _solve_region_recursive(
                 perf["combined_plan_candidates"] += 1
     perf["split_generation_ms"] += (time.perf_counter() - split_gen_started_at) * 1000.0
 
-    frontier = _pareto_frontier(candidates, context.root_area_m2, context.line_length_scale)
+    frontier = _pareto_frontier(candidates, context.root_area_m2, context.practical_line_length_scale)
     perf["frontier_plan_count"] += len(frontier)
     caches.frontier_cache[key] = frontier
     return frontier
@@ -1819,7 +1841,7 @@ def _solve_root_split_branch_with_context(
                 continue
             combined_candidates.append(combined)
             perf["combined_plan_candidates"] += 1
-    branch_frontier = _pareto_frontier(combined_candidates, context.root_area_m2, context.line_length_scale)
+    branch_frontier = _pareto_frontier(combined_candidates, context.root_area_m2, context.practical_line_length_scale)
     perf["frontier_plan_count"] += len(branch_frontier)
     return branch_frontier, dict(perf)
 
@@ -1949,7 +1971,8 @@ def _serialize_solver_context(context: SolverContext) -> dict[str, Any]:
         "grid": _serialize_grid(context.grid),
         "featureField": _serialize_feature_field(context.feature_field),
         "params": context.params.model_dump(mode="json"),
-        "lineLengthScale": context.line_length_scale,
+        "basicLineLengthScale": context.basic_line_length_scale,
+        "practicalLineLengthScale": context.practical_line_length_scale,
     }
 
 
@@ -1964,7 +1987,8 @@ def _deserialize_solver_context(payload: dict[str, Any]) -> SolverContext:
         feature_lookup=_feature_lookup(feature_field),
         cell_lookup=_cell_lookup(grid),
         neighbors=_neighbor_lookup(grid),
-        line_length_scale=float(payload.get("lineLengthScale", 0.37)),
+        basic_line_length_scale=float(payload.get("basicLineLengthScale", DEFAULT_BASIC_LINE_LENGTH_SCALE)),
+        practical_line_length_scale=float(payload.get("practicalLineLengthScale", DEFAULT_PRACTICAL_LINE_LENGTH_SCALE)),
     )
 
 
@@ -2295,8 +2319,10 @@ def solve_partition_hierarchy(
     root_parallel_granularity: Literal["branch", "subtree"] | None = None,
     line_length_scale: float | None = None,
 ) -> list[PartitionSolutionPreviewModel]:
-    if line_length_scale is None:
-        line_length_scale = DEFAULT_LINE_LENGTH_SCALE
+    practical_line_length_scale = (
+        DEFAULT_PRACTICAL_LINE_LENGTH_SCALE if line_length_scale is None else float(line_length_scale)
+    )
+    basic_line_length_scale = DEFAULT_BASIC_LINE_LENGTH_SCALE
 
     solve_started_at = time.perf_counter()
     if not grid.cells:
@@ -2316,7 +2342,8 @@ def solve_partition_hierarchy(
         feature_lookup=feature_lookup,
         cell_lookup=cell_lookup,
         neighbors=neighbors,
-        line_length_scale=line_length_scale,
+        basic_line_length_scale=basic_line_length_scale,
+        practical_line_length_scale=practical_line_length_scale,
     )
     max_depth = DEFAULT_DEPTH_SMALL if len(grid.cells) <= 140 else DEFAULT_DEPTH_LARGE
 
@@ -2454,7 +2481,11 @@ def solve_partition_hierarchy(
                         all_plans = _solve_region_recursive(root_cell_ids, max_depth, context, caches, perf)
                     else:
                         perf["root_parallel_ms"] += (time.perf_counter() - branch_started_at) * 1000.0
-                        all_plans = _pareto_frontier([baseline_plan] + branch_candidates, root_area_m2, line_length_scale)
+                        all_plans = _pareto_frontier(
+                            [baseline_plan] + branch_candidates,
+                            root_area_m2,
+                            practical_line_length_scale,
+                        )
                         perf["frontier_plan_count"] += len(all_plans)
     if not all_plans:
         total_ms = (time.perf_counter() - solve_started_at) * 1000.0
@@ -2496,7 +2527,7 @@ def solve_partition_hierarchy(
         if exact_plan is not None:
             exact_all_plans.append(exact_plan)
     if exact_all_plans:
-        all_plans = _pareto_frontier(exact_all_plans, root_area_m2, line_length_scale)
+        all_plans = _pareto_frontier(exact_all_plans, root_area_m2, practical_line_length_scale)
         baseline = min(
             (plan for plan in all_plans if plan.region_count == 1),
             key=lambda plan: (plan.quality_cost, plan.mission_time_sec),
@@ -2508,7 +2539,7 @@ def solve_partition_hierarchy(
     for plan in all_plans:
         if plan.region_count <= 1:
             continue
-        plan_diag = _plan_gate_diagnostics(plan, root_area_m2, line_length_scale=line_length_scale)
+        plan_diag = _plan_gate_diagnostics(plan, root_area_m2, line_length_scale=practical_line_length_scale)
         plan_failures, region_failures = _plan_gate_failure_margins(plan_diag)
         if plan_failures:
             _record_plan_failure_summary(
@@ -2519,7 +2550,7 @@ def solve_partition_hierarchy(
                 plan_failures,
                 region_failures,
             )
-    practical = [plan for plan in all_plans if _plan_is_practical(plan, root_area_m2, line_length_scale)]
+    practical = [plan for plan in all_plans if _plan_is_practical(plan, root_area_m2, practical_line_length_scale)]
     if not practical:
         relaxed_fallback: list[RelaxedFallbackCandidate] = []
         if baseline is not None:
@@ -2536,7 +2567,7 @@ def solve_partition_hierarchy(
                 "[terrain-split-backend][%s] relaxed fallback accepted polygonId=%s lineLengthScale=%.2f candidateCount=%d bestScore=%.4f bestSoftTotal=%.4f bestSoftMax=%.4f bestDirectionDeg=%.4f bestThreshold=%.4f",
                 request_id or "<none>",
                 polygon_id or "<none>",
-                line_length_scale,
+                practical_line_length_scale,
                 len(relaxed_fallback),
                 relaxed_fallback[0].fallback_score,
                 relaxed_fallback[0].soft_total_margin,
@@ -2612,11 +2643,11 @@ def solve_partition_hierarchy(
             json.dumps(
                 {
                     "basicRegionValidity": {
-                        "thresholds": _region_gate_thresholds(practical=False, line_length_scale=line_length_scale),
+                        "thresholds": _region_gate_thresholds(practical=False, line_length_scale=basic_line_length_scale),
                         **caches.basic_rejection_summary,
                     },
                     "basicSplitValidity": {
-                        "thresholds": _region_gate_thresholds(practical=False, line_length_scale=line_length_scale),
+                        "thresholds": _region_gate_thresholds(practical=False, line_length_scale=basic_line_length_scale),
                         **caches.basic_split_rejection_summary,
                     },
                     "practicalPlan": {
@@ -2624,7 +2655,7 @@ def solve_partition_hierarchy(
                         **practical_plan_rejection_summary,
                     },
                     "practicalRegion": {
-                        "thresholds": _region_gate_thresholds(practical=True, line_length_scale=line_length_scale),
+                        "thresholds": _region_gate_thresholds(practical=True, line_length_scale=practical_line_length_scale),
                         **practical_region_rejection_summary,
                     },
                 },
@@ -2687,8 +2718,12 @@ def solve_partition_hierarchy(
     comparison_pool = practical[:]
     if baseline is not None:
         comparison_pool.append(baseline)
-    filtered = _pareto_frontier(comparison_pool, root_area_m2, line_length_scale)
-    practical_filtered = [plan for plan in filtered if plan.region_count > 1 and _plan_is_practical(plan, root_area_m2, line_length_scale)]
+    filtered = _pareto_frontier(comparison_pool, root_area_m2, practical_line_length_scale)
+    practical_filtered = [
+        plan
+        for plan in filtered
+        if plan.region_count > 1 and _plan_is_practical(plan, root_area_m2, practical_line_length_scale)
+    ]
     if not practical_filtered:
         return []
 
@@ -2772,11 +2807,11 @@ def solve_partition_hierarchy(
         json.dumps(
             {
                 "basicRegionValidity": {
-                    "thresholds": _region_gate_thresholds(practical=False, line_length_scale=line_length_scale),
+                    "thresholds": _region_gate_thresholds(practical=False, line_length_scale=basic_line_length_scale),
                     **caches.basic_rejection_summary,
                 },
                 "basicSplitValidity": {
-                    "thresholds": _region_gate_thresholds(practical=False, line_length_scale=line_length_scale),
+                    "thresholds": _region_gate_thresholds(practical=False, line_length_scale=basic_line_length_scale),
                     **caches.basic_split_rejection_summary,
                 },
                 "practicalPlan": {
@@ -2784,7 +2819,7 @@ def solve_partition_hierarchy(
                     **practical_plan_rejection_summary,
                 },
                 "practicalRegion": {
-                    "thresholds": _region_gate_thresholds(practical=True, line_length_scale=line_length_scale),
+                    "thresholds": _region_gate_thresholds(practical=True, line_length_scale=practical_line_length_scale),
                     **practical_region_rejection_summary,
                 },
             },
