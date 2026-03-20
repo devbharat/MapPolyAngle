@@ -4,15 +4,22 @@
  */
 
 import type { Map as MapboxMap } from 'mapbox-gl';
-import type { 
-  FlightParams, 
-  TerrainTile
+import type {
+  FlightParams
 } from '@/domain/types';
 import type { PolygonAnalysisResult } from './types';
 
 export interface PolygonWithId {
   id?: string;
   ring: [number, number][];
+}
+
+export type BearingOverrideSource = 'wingtra' | 'user' | 'partition';
+
+export interface BearingOverride {
+  bearingDeg: number;
+  lineSpacingM?: number;
+  source: BearingOverrideSource;
 }
 
 export interface ImportedFlightplanArea {
@@ -54,7 +61,10 @@ export interface MapFlightDirectionAPI {
   clearPolygon(polygonId: string): void;
   editPolygonBoundary(polygonId: string): void;
   setProcessingPolygonIds(polygonIds: string[]): void;
-  autoSplitPolygonByTerrain(polygonId: string): Promise<{ createdIds: string[]; replaced: boolean }>;
+  autoSplitPolygonByTerrain(
+    polygonId: string,
+    options?: { skipBackend?: boolean }
+  ): Promise<{ createdIds: string[]; replaced: boolean }>;
   getTerrainPartitionSolutions(polygonId: string): Promise<TerrainPartitionSolutionPreview[]>;
   applyTerrainPartitionSolution(polygonId: string, signature: string): Promise<{ createdIds: string[]; replaced: boolean }>;
   startPolygonDrawing(): void;
@@ -70,10 +80,10 @@ export interface MapFlightDirectionAPI {
   applyPolygonParams(polygonId: string, params: FlightParams): void;
   applyPolygonParamsBatch(updates: Array<{ polygonId: string; params: FlightParams }>): void;
   applyParamsToAllPending(params: FlightParams): void; // bulk apply same params to queued polygons
-  getFlightLines(): Map<string, { 
-    flightLines: number[][][]; 
-    lineSpacing: number; 
-    altitudeAGL: number 
+  getFlightLines(): Map<string, {
+    flightLines: number[][][];
+    lineSpacing: number;
+    altitudeAGL: number
   }>;
   getPerPolygonParams(): Record<string, FlightParams>;
 
@@ -101,8 +111,9 @@ export interface MapFlightDirectionAPI {
   optimizePolygonDirection(polygonId: string): void;                 // drop override → use terrain-optimal
   revertPolygonToImportedDirection(polygonId: string): void;         // re-apply file heading/spacing
   runFullAnalysis(polygonId: string): void;                          // run complete analysis pipeline (as if manually drawn)
-  getBearingOverrides(): Record<string, { bearingDeg: number; lineSpacingM?: number; source: 'wingtra' | 'user' }>;
+  getBearingOverrides(): Record<string, BearingOverride>;
   getImportedOriginals(): Record<string, { bearingDeg: number; lineSpacingM: number }>;
+  getLastImportedFlightplanName(): string | undefined;
 
   // Export current (possibly optimized/edited) plan as Wingtra .flightplan JSON
   exportWingtraFlightPlan(): { json: string; blob: Blob };

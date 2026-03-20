@@ -2,7 +2,7 @@
 /***********************************************************************
  * MapFlightDirection.tsx
  ***********************************************************************/
-import React, { useRef, useState, useCallback, useImperativeHandle, useEffect } from 'react';
+import React, { useRef, useState, useCallback, useEffect } from 'react';
 import { Map as MapboxMap, LngLatLike } from 'mapbox-gl';
 import MapboxDraw from '@mapbox/mapbox-gl-draw';
 import { MapboxOverlay } from '@deck.gl/mapbox';
@@ -17,7 +17,6 @@ import {
   animateProcessingPerimeter,
   removeFlightLinesForPolygon,
   clearAllFlightLines,
-  addTriggerPointsForPolygon,
   removeTriggerPointsForPolygon,
   clearAllTriggerPoints,
   setProcessingPerimeterPolygons,
@@ -28,7 +27,7 @@ import { PolygonAnalysisResult, PolygonParams } from './types';
 import { parseKmlPolygons, calculateKmlBounds, extractKmlFromKmz } from '@/utils/kml';
 import { SONY_RX1R2, DJI_ZENMUSE_P1_24MM, ILX_LR1_INSPECT_85MM, MAP61_17MM, RGB61_24MM, forwardSpacingRotated, lineSpacingRotated } from '@/domain/camera';
 import { DEFAULT_LIDAR, DEFAULT_LIDAR_MAX_RANGE_M, LIDAR_REGISTRY, lidarLineSpacing } from '@/domain/lidar';
-import type { MapFlightDirectionAPI, ImportedFlightplanArea, TerrainPartitionSolutionPreview } from './api';
+import type { BearingOverride, MapFlightDirectionAPI, ImportedFlightplanArea, TerrainPartitionSolutionPreview } from './api';
 import { fetchTilesForPolygon } from './utils/terrain';
 import { partitionPolygonByTerrainFaces } from '@/utils/terrainFacePartition';
 import { buildPartitionFrontier } from '@/utils/terrainPartitionGraph';
@@ -55,6 +54,7 @@ const DEFAULT_SIDE_OVERLAP = 70;
 const DEFAULT_PARTITION_TRADEOFF_SAMPLES = [0.1, 0.25, 0.4, 0.55, 0.7, 0.85];
 const DEFAULT_PARTITION_TARGET_TRADEOFF = 0.7;
 const TERRAIN_SPLIT_DEBUG = true;
+const GEOMETRY_RING_EPSILON_DEG = 1e-7;
 
 function splitPerfNow() {
   return typeof performance !== 'undefined' ? performance.now() : Date.now();
@@ -77,6 +77,14 @@ function clampNumber(value: number | undefined, min: number, max: number, fallba
 function normalizeBearing(value?: number): number | undefined {
   if (!Number.isFinite(value)) return undefined;
   return (((value as number) % 360) + 360) % 360;
+}
+
+function areCoordsNear(a: [number, number], b: [number, number], epsilon = GEOMETRY_RING_EPSILON_DEG): boolean {
+  return Math.abs(a[0] - b[0]) <= epsilon && Math.abs(a[1] - b[1]) <= epsilon;
+}
+
+function roundCoordPair(coord: [number, number]): [number, number] {
+  return [Number(coord[0].toFixed(12)), Number(coord[1].toFixed(12))];
 }
 
 function isLidarParams(params?: PolygonParams | null): boolean {
@@ -108,29 +116,91 @@ function normalizeRingForGeometryOps(ring: [number, number][]): [number, number]
         coord.length >= 2 &&
         Number.isFinite(coord[0]) &&
         Number.isFinite(coord[1])
-      ))
+      )).map((coord) => roundCoordPair(coord))
     : [];
   if (coords.length < 3) return null;
-  const [firstLng, firstLat] = coords[0];
-  const [lastLng, lastLat] = coords[coords.length - 1];
-  if (firstLng === lastLng && firstLat === lastLat) return coords;
-  return [...coords, [firstLng, firstLat]];
+
+  const deduped: [number, number][] = [];
+  for (const coord of coords) {
+    if (deduped.length === 0 || !areCoordsNear(deduped[deduped.length - 1], coord)) {
+      deduped.push(coord);
+    }
+  }
+  if (deduped.length < 3) return null;
+
+  const first = deduped[0];
+  const last = deduped[deduped.length - 1];
+  if (areCoordsNear(first, last)) {
+    deduped[deduped.length - 1] = first;
+  } else {
+    deduped.push(first);
+  }
+
+  if (deduped.length < 4) return null;
+  return deduped;
+}
+
+function normalizePolygonFeature(feature: any) {
+  if (!feature?.geometry) return feature;
+  let next = feature;
+  try {
+    next = turf.cleanCoords(next as any);
+  } catch {}
+  try {
+    const truncateFn = (turf as any).truncate;
+    if (typeof truncateFn === 'function') {
+      next = truncateFn(next, { precision: 10, coordinates: 2, mutate: false });
+    }
+  } catch {}
+  try {
+    const bufferFn = (turf as any).buffer;
+    if (typeof bufferFn === 'function' && (next.geometry?.type === 'Polygon' || next.geometry?.type === 'MultiPolygon')) {
+      const repaired = bufferFn(next, 0, { units: 'meters' });
+      if (repaired?.geometry) next = repaired;
+    }
+  } catch {}
+  try {
+    next = turf.cleanCoords(next as any);
+  } catch {}
+  return next;
 }
 
 function unionTurfFeatures(a: any, b: any) {
   const unionFn = (turf as any).union;
   if (typeof unionFn !== 'function') return null;
-  return unionFn.length >= 2
-    ? unionFn(a, b)
-    : unionFn(turf.featureCollection([a, b]));
+  const attempt = (left: any, right: any) => (
+    unionFn.length >= 2
+      ? unionFn(left, right)
+      : unionFn(turf.featureCollection([left, right]))
+  );
+  try {
+    return attempt(a, b);
+  } catch {
+    try {
+      return attempt(normalizePolygonFeature(a), normalizePolygonFeature(b));
+    } catch {
+      return null;
+    }
+  }
 }
 
 function intersectTurfFeatures(a: any, b: any) {
   const intersectFn = (turf as any).intersect;
   if (typeof intersectFn !== 'function') return null;
-  return intersectFn.length >= 2
-    ? intersectFn(a, b)
-    : intersectFn(turf.featureCollection([a, b]));
+  const attempt = (left: any, right: any) => (
+    intersectFn.length >= 2
+      ? intersectFn(left, right)
+      : intersectFn(turf.featureCollection([left, right]))
+  );
+  try {
+    return attempt(a, b);
+  } catch {
+    try {
+      return attempt(normalizePolygonFeature(a), normalizePolygonFeature(b));
+    } catch {
+      return null;
+    }
+  }
 }
 
 function computePartitionCoverageMetrics(
@@ -145,13 +215,13 @@ function computePartitionCoverageMetrics(
     return { coverageRatio: 0, overlapRatio: 1, normalizedChildren: [] as [number, number][][] };
   }
 
-  const parentFeature = turf.polygon([normalizedParent]);
+  const parentFeature = normalizePolygonFeature(turf.polygon([normalizedParent]));
   const parentArea = Math.max(1e-6, turf.area(parentFeature));
   let unionFeature: any = null;
   let summedArea = 0;
 
   for (const childRing of normalizedChildren) {
-    const feature = turf.polygon([childRing]);
+    const feature = normalizePolygonFeature(turf.polygon([childRing]));
     summedArea += turf.area(feature);
     unionFeature = unionFeature ? unionTurfFeatures(unionFeature, feature) : feature;
     if (!unionFeature) {
@@ -196,7 +266,6 @@ interface Props {
   mapboxToken: string;
   center?: LngLatLike;
   zoom?: number;
-  terrainZoom?: number;
   sampleStep?: number;
 
   onRequestParams?: (polygonId: string, ring: [number, number][]) => void;
@@ -214,7 +283,6 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       mapboxToken,
       center = [8.54, 47.37],
       zoom = 13,
-      terrainZoom = 12,
       sampleStep = 2,
       onRequestParams,
       onAnalysisComplete,
@@ -255,7 +323,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
 
     // Overrides: force a heading/spacing (e.g., from Wingtra file)
     const [bearingOverrides, setBearingOverrides] = useState<
-      Map<string, { bearingDeg: number; lineSpacingM?: number; source: 'wingtra' | 'user' }>
+      Map<string, BearingOverride>
     >(new Map());
 
     // Original file meta for revert
@@ -263,9 +331,9 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       Map<string, { bearingDeg: number; lineSpacingM: number }>
     >(new Map());
 
-    const [deckLayers, setDeckLayers] = useState<any[]>([]);
+    const [, setDeckLayers] = useState<any[]>([]);
     const [lastImportedFlightplan, setLastImportedFlightplan] = useState<any | null>(null);
-    const [lastImportedFlightplanName, setLastImportedFlightplanName] = useState<string | undefined>(undefined);
+    const lastImportedFlightplanNameRef = useRef<string | undefined>(undefined);
     // Bulk apply guard to suppress sequential dialog popping
     const bulkApplyRef = useRef(false);
     // NEW: If user clicks "Apply All" while some polygons still analyzing, preset params
@@ -277,6 +345,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
     const polygonTilesRef = React.useRef(polygonTiles);
     const polygonFlightLinesRef = React.useRef(polygonFlightLines);
     const polygonResultsRef = React.useRef(polygonResults);
+    const importedOriginalsRef = React.useRef(importedOriginals);
     const pendingGeometryRefreshRef = React.useRef<Set<string>>(new Set());
     const processingPolygonIdsRef = React.useRef<Set<string>>(new Set());
     const processingAnimationFrameRef = React.useRef<number | null>(null);
@@ -295,6 +364,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
     React.useEffect(() => { polygonTilesRef.current = polygonTiles; }, [polygonTiles]);
     React.useEffect(() => { polygonFlightLinesRef.current = polygonFlightLines; }, [polygonFlightLines]);
     React.useEffect(() => { polygonResultsRef.current = polygonResults; }, [polygonResults]);
+    React.useEffect(() => { importedOriginalsRef.current = importedOriginals; }, [importedOriginals]);
 
     const syncProcessingPerimeterOverlay = useCallback(() => {
       const map = mapRef.current;
@@ -530,10 +600,19 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
     // ---------- analysis callbacks ----------
     const handleAnalysisResult = useCallback(
       (result: PolygonAnalysisResult, tiles: any[]) => {
+        if (pendingProgrammaticDeletesRef.current.has(result.polygonId)) {
+          splitPerfLog(result.polygonId, 'ignoring late analysis result for polygon pending deletion', {
+            polygonId: result.polygonId,
+          });
+          return;
+        }
         // If polygon no longer exists (deleted), ignore late results
         const draw = drawRef.current as any;
         const stillExists = !!draw?.get?.(result.polygonId);
         if (!stillExists) {
+          splitPerfLog(result.polygonId, 'ignoring late analysis result for polygon no longer in draw', {
+            polygonId: result.polygonId,
+          });
           return;
         }
         // 1) Commit result and defer parent notification to avoid React 18 render conflicts
@@ -567,7 +646,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         });
           params = sanitizePolygonParams(preset);
       }
-        
+
         if (!params) {
           if (override) {
             console.log(`Skipping params dialog for imported polygon ${result.polygonId}`);
@@ -598,7 +677,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
 
         // Remove existing flight lines first to avoid Mapbox layer conflicts
         removeFlightLinesForPolygon(mapRef.current, result.polygonId);
-        
+
         const lines = addFlightLinesForPolygon(
           mapRef.current,
           result.polygonId,
@@ -673,6 +752,14 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
     });
 
     const cleanupPolygonState = useCallback((polygonId: string) => {
+      splitPerfLog(polygonId, 'cleanupPolygonState start', {
+        hadResult: polygonResultsRef.current.has(polygonId),
+        hadTiles: polygonTilesRef.current.has(polygonId),
+        hadLines: polygonFlightLinesRef.current.has(polygonId),
+        hadParams: polygonParamsRef.current.has(polygonId),
+        hadOverride: bearingOverridesRef.current.has(polygonId),
+        hadImportedOriginal: importedOriginalsRef.current.has(polygonId),
+      });
       cancelAnalysis(polygonId);
       pendingOptimizeRef.current.delete(polygonId);
 
@@ -698,30 +785,35 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         if (!prev.has(polygonId)) return prev;
         const next = new Map(prev);
         next.delete(polygonId);
+        polygonFlightLinesRef.current = next;
         return next;
       });
       setPolygonTiles((prev) => {
         if (!prev.has(polygonId)) return prev;
         const next = new Map(prev);
         next.delete(polygonId);
+        polygonTilesRef.current = next;
         return next;
       });
       setPolygonParams((prev) => {
         if (!prev.has(polygonId)) return prev;
         const next = new Map(prev);
         next.delete(polygonId);
+        polygonParamsRef.current = next;
         return next;
       });
       setBearingOverrides((prev) => {
         if (!prev.has(polygonId)) return prev;
         const next = new Map(prev);
         next.delete(polygonId);
+        bearingOverridesRef.current = next;
         return next;
       });
       setImportedOriginals((prev) => {
         if (!prev.has(polygonId)) return prev;
         const next = new Map(prev);
         next.delete(polygonId);
+        importedOriginalsRef.current = next;
         return next;
       });
       setPendingParamPolygons((prev) => prev.filter((id) => id !== polygonId));
@@ -733,6 +825,17 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       }
 
       setTimeout(() => {
+        const draw = drawRef.current as any;
+        const remainingPolygonIds = Array.isArray(draw?.getAll?.()?.features)
+          ? draw.getAll().features
+              .filter((feature: any) => feature?.geometry?.type === 'Polygon')
+              .map((feature: any) => String(feature.id))
+          : [];
+        splitPerfLog(polygonId, 'cleanupPolygonState settled', {
+          remainingPolygonIds,
+          resultIds: Array.from(polygonResultsRef.current.keys()),
+          importedOriginalIds: Array.from(importedOriginalsRef.current.keys()),
+        });
         onPolygonSelected?.(null);
         if (!suppressFlightLineEventsRef.current) {
           onFlightLinesUpdated?.('__all__');
@@ -744,6 +847,83 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         } catch {}
       }, 0);
     }, [cancelAnalysis, debouncedAnalysisComplete, onClearGSD, onFlightLinesUpdated, onPolygonSelected]);
+
+    const deletePolygonFeature = useCallback((polygonId: string) => {
+      const draw = drawRef.current as any;
+      if (!draw) {
+        if (pendingProgrammaticDeletesRef.current.delete(polygonId)) {
+          cleanupPolygonState(polygonId);
+        }
+        return;
+      }
+
+      const attemptDelete = () => {
+        const beforeExists = !!draw.get?.(polygonId);
+        try {
+          draw.changeMode?.('simple_select');
+        } catch {}
+        try {
+          draw.delete?.(polygonId);
+        } catch {}
+        if (!draw.get?.(polygonId)) {
+          splitPerfLog(polygonId, 'deletePolygonFeature removed polygon via draw.delete(id)', {
+            beforeExists,
+          });
+          return true;
+        }
+        try {
+          draw.delete?.([polygonId]);
+        } catch {}
+        if (!draw.get?.(polygonId)) {
+          splitPerfLog(polygonId, 'deletePolygonFeature removed polygon via draw.delete([id])', {
+            beforeExists,
+          });
+          return true;
+        }
+        try {
+          const collection = draw.getAll?.();
+          const features = Array.isArray(collection?.features)
+            ? collection.features.filter((feature: any) => String(feature?.id ?? '') !== polygonId)
+            : null;
+          if (features && typeof draw.set === 'function') {
+            draw.set({
+              type: 'FeatureCollection',
+              features,
+            });
+          }
+        } catch {}
+        const removed = !draw.get?.(polygonId);
+        splitPerfLog(polygonId, 'deletePolygonFeature attempt finished', {
+          beforeExists,
+          removed,
+          remainingPolygonIds: Array.isArray(draw.getAll?.()?.features)
+            ? draw.getAll().features
+                .filter((feature: any) => feature?.geometry?.type === 'Polygon')
+                .map((feature: any) => String(feature.id))
+            : [],
+        });
+        return removed;
+      };
+
+      pendingProgrammaticDeletesRef.current.add(polygonId);
+      splitPerfLog(polygonId, 'deletePolygonFeature scheduled', {
+        remainingPolygonIds: Array.isArray(draw.getAll?.()?.features)
+          ? draw.getAll().features
+              .filter((feature: any) => feature?.geometry?.type === 'Polygon')
+              .map((feature: any) => String(feature.id))
+          : [],
+      });
+      attemptDelete();
+      setTimeout(() => {
+        if (draw.get?.(polygonId)) {
+          splitPerfLog(polygonId, 'deletePolygonFeature retrying after initial failure');
+          attemptDelete();
+        }
+        if (pendingProgrammaticDeletesRef.current.delete(polygonId)) {
+          cleanupPolygonState(polygonId);
+        }
+      }, 0);
+    }, [cleanupPolygonState]);
 
     const editPolygonBoundary = useCallback((polygonId: string) => {
       const draw = drawRef.current as any;
@@ -792,7 +972,15 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       e.features.forEach((feature: any) => {
         if (feature.geometry.type === 'Polygon') {
           const polygonId = String(feature.id);
-          pendingProgrammaticDeletesRef.current.delete(polygonId);
+          const wasProgrammatic = pendingProgrammaticDeletesRef.current.delete(polygonId);
+          splitPerfLog(polygonId, 'draw.delete event received', {
+            wasProgrammatic,
+            remainingPolygonIds: Array.isArray((drawRef.current as any)?.getAll?.()?.features)
+              ? (drawRef.current as any).getAll().features
+                  .filter((candidate: any) => candidate?.geometry?.type === 'Polygon')
+                  .map((candidate: any) => String(candidate.id))
+              : [],
+          });
           cleanupPolygonState(polygonId);
         }
       });
@@ -855,19 +1043,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       const draw = drawRef.current as any;
       if (!draw) return;
 
-      const normalizedRing = (() => {
-        const coords = Array.isArray(ring) ? ring.filter((coord): coord is [number, number] => (
-          Array.isArray(coord) &&
-          coord.length >= 2 &&
-          Number.isFinite(coord[0]) &&
-          Number.isFinite(coord[1])
-        )) : [];
-        if (coords.length < 3) return null;
-        const [firstLng, firstLat] = coords[0];
-        const [lastLng, lastLat] = coords[coords.length - 1];
-        if (firstLng === lastLng && firstLat === lastLat) return coords;
-        return [...coords, [firstLng, firstLat]];
-      })();
+      const normalizedRing = normalizeRingForGeometryOps(ring);
       if (!normalizedRing) return;
 
       const feature = {
@@ -940,7 +1116,6 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         onError?.("Please select valid .kml or .kmz files");
         return;
       }
-      let totalAdded = 0;
       for (const file of files) {
         try {
           let kmlText: string | null = null;
@@ -956,8 +1131,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
             kmlText = await file.text();
           }
           if (kmlText) {
-            const result = await importKmlFromText(kmlText);
-            totalAdded += result.added;
+            await importKmlFromText(kmlText);
           }
         } catch (error) {
           onError?.(`Failed to read file ${file.name}: ${error instanceof Error ? error.message : 'Unknown error'}`);
@@ -981,13 +1155,13 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         }
 
         console.log(`📦 Found ${imported.items.length} areas in flightplan`);
-        
+
         // Suspend automatic per‑polygon side effects during batch
         suspendAutoAnalysisRef.current = true;
         suppressFlightLineEventsRef.current = true;
         const newRings: [number, number][][] = [];
         const newIds: string[] = [];
-        
+
         // Batch state updates for better performance
         const polygonsToUpdate = new Map();
         const flightLinesToUpdate = new Map();
@@ -1075,21 +1249,25 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         setPolygonParams(prev => {
           const next = new Map(prev);
           for (const [id, state] of Array.from(polygonsToUpdate.entries())) next.set(id, state.params);
+          polygonParamsRef.current = next;
           return next;
         });
         setImportedOriginals(prev => {
           const next = new Map(prev);
           for (const [id, state] of Array.from(polygonsToUpdate.entries())) next.set(id, state.original);
+          importedOriginalsRef.current = next;
           return next;
         });
         setBearingOverrides(prev => {
           const next = new Map(prev);
           for (const [id, state] of Array.from(polygonsToUpdate.entries())) next.set(id, state.override);
+          bearingOverridesRef.current = next;
           return next;
         });
         setPolygonFlightLines(prev => {
           const next = new Map(prev);
-            for (const [id, lines] of Array.from(flightLinesToUpdate.entries())) next.set(id, lines);
+          for (const [id, lines] of Array.from(flightLinesToUpdate.entries())) next.set(id, lines);
+          polygonFlightLinesRef.current = next;
           return next;
         });
 
@@ -1105,6 +1283,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           setPolygonTiles(prev => {
             const next = new Map(prev);
             next.set(polygonId, tiles);
+            polygonTilesRef.current = next;
             return next;
           });
           const flEntry = flightLinesToUpdate.get(polygonId);
@@ -1155,7 +1334,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       for (const file of Array.from(files)) {
         try {
           const text = await file.text();
-          setLastImportedFlightplanName(file.name);
+          lastImportedFlightplanNameRef.current = file.name;
           await importWingtraFromText(text);
         } catch (err) {
           onError?.(`Failed to read flightplan file ${file.name}: ${err instanceof Error ? err.message : 'Unknown error'}`);
@@ -1194,7 +1373,6 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           return;
         }
 
-        let totalAdded = 0;
         for (const f of files) {
           try {
             let kmlText: string | null = null;
@@ -1210,8 +1388,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
               kmlText = await f.text();
             }
             if (kmlText) {
-              const result = await importKmlFromText(kmlText);
-              totalAdded += result.added;
+              await importKmlFromText(kmlText);
             }
           } catch (error) {
             onError?.(`Failed to read file ${f.name}: ${error instanceof Error ? error.message : 'Unknown error'}`);
@@ -1448,8 +1625,8 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
     const getTerrainPartitionSolutions = useCallback(async (polygonId: string) => {
       const startedAt = splitPerfNow();
       const context = await getTerrainPartitionContext(polygonId);
-      if (!context) return [];
-      const { ring, tiles, params } = context;
+	      if (!context) return [];
+	      const { ring, tiles, params } = context;
       if (isTerrainPartitionBackendEnabled()) {
         try {
           const backendStartedAt = splitPerfNow();
@@ -1505,18 +1682,34 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         return { createdIds: [], replaced: false };
       }
 
-      const normalizedPartitionRegions = partitionRegions
-        .map((region) => {
-          const normalizedRing = normalizeRingForGeometryOps(region.ring);
-          if (!normalizedRing) return null;
-          return { ...region, ring: normalizedRing };
-        })
-        .filter((region): region is TerrainPartitionRegionApplication & { ring: [number, number][] } => region !== null);
+      let normalizedPartitionRegions: Array<TerrainPartitionRegionApplication & { ring: [number, number][] }>;
+      let coverage: ReturnType<typeof computePartitionCoverageMetrics>;
+      try {
+        normalizedPartitionRegions = partitionRegions
+          .map((region) => {
+            const normalizedRing = normalizeRingForGeometryOps(region.ring);
+            if (!normalizedRing) return null;
+            return { ...region, ring: normalizedRing };
+          })
+          .filter((region): region is TerrainPartitionRegionApplication & { ring: [number, number][] } => region !== null);
+        splitPerfLog(polygonId, 'normalized partition regions', {
+          requestedRegionCount: partitionRegions.length,
+          normalizedRegionCount: normalizedPartitionRegions.length,
+          ringPointCounts: normalizedPartitionRegions.map((region) => region.ring.length),
+        });
 
-      const coverage = computePartitionCoverageMetrics(
-        (draw?.get?.(polygonId)?.geometry?.coordinates?.[0] as [number, number][] | undefined) ?? [],
-        normalizedPartitionRegions.map((region) => region.ring),
-      );
+        coverage = computePartitionCoverageMetrics(
+          (draw?.get?.(polygonId)?.geometry?.coordinates?.[0] as [number, number][] | undefined) ?? [],
+          normalizedPartitionRegions.map((region) => region.ring),
+        );
+      } catch (error) {
+        splitPerfLog(polygonId, 'applyTerrainPartitionRings preflight failed', {
+          error: error instanceof Error ? error.message : String(error),
+          requestedRegionCount: partitionRegions.length,
+          regionRingPointCounts: partitionRegions.map((region) => Array.isArray(region.ring) ? region.ring.length : 0),
+        });
+        throw error;
+      }
       splitPerfLog(polygonId, 'partition coverage metrics', coverage);
 
       if (normalizedPartitionRegions.length <= 1) {
@@ -1573,7 +1766,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           nextOverrides.set(id, {
             bearingDeg: region.bearingDeg!,
             lineSpacingM: getLineSpacingForParams(childParams),
-            source: 'user',
+            source: 'partition',
           });
         });
         bearingOverridesRef.current = nextOverrides;
@@ -1582,6 +1775,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         setImportedOriginals((prev) => {
           const next = new Map(prev);
           next.delete(polygonId);
+          importedOriginalsRef.current = next;
           return next;
         });
         setPolygonResults((prev) => {
@@ -1618,8 +1812,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           remove3DCameraPointsLayer(deckOverlayRef.current, polygonId, setDeckLayers);
         }
 
-        pendingProgrammaticDeletesRef.current.add(polygonId);
-        draw.delete(polygonId);
+        deletePolygonFeature(polygonId);
 
         fitMapToRings(normalizedPartitionRegions.map((region) => region.ring));
 
@@ -1671,7 +1864,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           onFlightLinesUpdated?.('__all__');
         }
       }
-    }, [addRingAsDrawFeature, analyzePolygon, applyPolygonParams, fitMapToRings, onError, onFlightLinesUpdated, onPolygonSelected]);
+    }, [addRingAsDrawFeature, analyzePolygon, applyPolygonParams, deletePolygonFeature, fitMapToRings, onError, onFlightLinesUpdated, onPolygonSelected]);
 
     const applyTerrainPartitionSolution = useCallback(async (
       polygonId: string,
@@ -1679,7 +1872,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
     ): Promise<{ createdIds: string[]; replaced: boolean }> => {
       const context = await getTerrainPartitionContext(polygonId);
       if (!context) return { createdIds: [], replaced: false };
-      const { ring, tiles, params } = context;
+	      const { params } = context;
       const cached = backendPartitionSolutionsRef.current.get(polygonId) ?? [];
       const solutions = cached.length > 0 ? cached : await getTerrainPartitionSolutions(polygonId);
       const selected = solutions.find((solution) => solution.signature === signature);
@@ -1721,39 +1914,44 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         ));
     }, []);
 
-    const autoSplitPolygonByTerrain = useCallback(async (polygonId: string): Promise<{ createdIds: string[]; replaced: boolean }> => {
+    const autoSplitPolygonByTerrain = useCallback(async (
+      polygonId: string,
+      options?: { skipBackend?: boolean },
+    ): Promise<{ createdIds: string[]; replaced: boolean }> => {
       const startedAt = splitPerfNow();
       splitPerfLog(polygonId, 'autoSplitPolygonByTerrain start');
       const context = await getTerrainPartitionContext(polygonId);
       if (!context) return { createdIds: [], replaced: false };
       const { ring, tiles, params } = context;
-      const solutions = await getTerrainPartitionSolutions(polygonId);
-      splitPerfLog(polygonId, 'autoSplitPolygonByTerrain candidate solutions ready', {
-        totalMs: Math.round(splitPerfNow() - startedAt),
-        solutionCount: solutions.length,
-      });
-      const selected = pickDefaultPartitionSolution(solutions);
-      if (selected) {
-        splitPerfLog(polygonId, 'autoSplitPolygonByTerrain applying selected backend solution', {
-          signature: selected.signature,
-          regionCount: selected.regionCount,
-          tradeoff: selected.tradeoff,
+      if (!options?.skipBackend) {
+        const solutions = await getTerrainPartitionSolutions(polygonId);
+        splitPerfLog(polygonId, 'autoSplitPolygonByTerrain candidate solutions ready', {
+          totalMs: Math.round(splitPerfNow() - startedAt),
+          solutionCount: solutions.length,
         });
-        const applied = await applyTerrainPartitionRings(
-          polygonId,
-          selected.regions.map((region) => ({
-            ring: region.ring as [number, number][],
-            bearingDeg: region.bearingDeg,
-            baseAltitudeAGL: region.baseAltitudeAGL,
-          })),
-          params,
-        );
-        if (applied.replaced) {
-          splitPerfLog(polygonId, 'autoSplitPolygonByTerrain completed via backend solution', {
-            totalMs: Math.round(splitPerfNow() - startedAt),
-            createdIds: applied.createdIds,
+        const selected = pickDefaultPartitionSolution(solutions);
+        if (selected) {
+          splitPerfLog(polygonId, 'autoSplitPolygonByTerrain applying selected backend solution', {
+            signature: selected.signature,
+            regionCount: selected.regionCount,
+            tradeoff: selected.tradeoff,
           });
-          return applied;
+          const applied = await applyTerrainPartitionRings(
+            polygonId,
+            selected.regions.map((region) => ({
+              ring: region.ring as [number, number][],
+              bearingDeg: region.bearingDeg,
+              baseAltitudeAGL: region.baseAltitudeAGL,
+            })),
+            params,
+          );
+          if (applied.replaced) {
+            splitPerfLog(polygonId, 'autoSplitPolygonByTerrain completed via backend solution', {
+              totalMs: Math.round(splitPerfNow() - startedAt),
+              createdIds: applied.createdIds,
+            });
+            return applied;
+          }
         }
       }
 
@@ -1779,22 +1977,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       return fallbackResult;
     }, [applyTerrainPartitionRings, getTerrainPartitionContext, getTerrainPartitionSolutions, pickDefaultPartitionSolution]);
 
-    // ---------- Map render ----------
-    // Note: using `any` for now due to complex nested types from Mapbox GL and Deck.gl
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const mapRenderProps: any = {
-      ref: mapRef,
-      style: { width: '100%', height: '100%' },
-      mapboxApiAccessToken: mapboxToken,
-      onError: memoizedOnError,
-      // Pass-through props
-      center,
-      zoom,
-      terrainZoom,
-      sampleStep,
-    };
-
-    React.useImperativeHandle(ref, () => ({
+	    React.useImperativeHandle(ref, () => ({
       clearAllDrawings: () => {
         setProcessingPolygonIds([]);
         if (drawRef.current) drawRef.current.deleteAll();
@@ -1807,11 +1990,17 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           clearAllTriggerPoints(mapRef.current);
         }
         setPolygonResults(new Map());
+        polygonResultsRef.current = new Map();
         setPolygonTiles(new Map());
+        polygonTilesRef.current = new Map();
         setPolygonFlightLines(new Map());
+        polygonFlightLinesRef.current = new Map();
         setPolygonParams(new Map());
+        polygonParamsRef.current = new Map();
         setBearingOverrides(new Map());
+        bearingOverridesRef.current = new Map();
         setImportedOriginals(new Map());
+        importedOriginalsRef.current = new Map();
         setPendingParamPolygons([]);
         pendingProgrammaticDeletesRef.current.clear();
         suppressSelectionDialogUntilRef.current = 0;
@@ -1831,15 +2020,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           cleanupPolygonState(polygonId);
           return;
         }
-        pendingProgrammaticDeletesRef.current.add(polygonId);
-        try {
-          draw.delete(polygonId);
-        } catch {}
-        setTimeout(() => {
-          if (pendingProgrammaticDeletesRef.current.delete(polygonId)) {
-            cleanupPolygonState(polygonId);
-          }
-        }, 0);
+        deletePolygonFeature(polygonId);
       },
       editPolygonBoundary,
       setProcessingPolygonIds,
@@ -1912,10 +2093,11 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       optimizePolygonDirection,
       revertPolygonToImportedDirection,
       runFullAnalysis,
-      
-      getBearingOverrides: () => Object.fromEntries(bearingOverrides),
-      getImportedOriginals: () => Object.fromEntries(importedOriginals),
-      exportWingtraFlightPlan: () => {
+
+	      getBearingOverrides: () => Object.fromEntries(bearingOverridesRef.current),
+	      getImportedOriginals: () => Object.fromEntries(importedOriginalsRef.current),
+	      getLastImportedFlightplanName: () => lastImportedFlightplanNameRef.current,
+	      exportWingtraFlightPlan: () => {
         // Build area list from current state
         const polys: Array<{ ring:[number,number][]; params: PolygonParams; bearingDeg:number; lineSpacingM?:number; triggerDistanceM?:number }> = [];
         polygonParams.forEach((params, pid) => {
@@ -1956,7 +2138,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       },
     }), [
       polygonResults, polygonFlightLines, polygonTiles, polygonParams,
-      cancelAllAnalyses, applyPolygonParams, applyPolygonParamsBatch, cleanupPolygonState, editPolygonBoundary, setProcessingPolygonIds, autoSplitPolygonByTerrain,
+      cancelAllAnalyses, applyPolygonParams, applyPolygonParamsBatch, cleanupPolygonState, deletePolygonFeature, editPolygonBoundary, setProcessingPolygonIds, autoSplitPolygonByTerrain,
       getTerrainPartitionSolutions, applyTerrainPartitionSolution,
       bearingOverrides, importedOriginals,
       importKmlFromText, importWingtraFromText,

@@ -6,8 +6,8 @@ import math
 import os
 import time
 from collections import defaultdict, deque
-from dataclasses import dataclass, replace
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from dataclasses import dataclass, replace
 from typing import Any, Literal
 
 import numpy as np
@@ -33,7 +33,6 @@ from .geometry import (
 from .grid import GridCell, GridData, GridEdge
 from .postprocess import region_polygon_from_cells
 from .schemas import FlightParamsModel, PartitionSolutionPreviewModel, RegionPreview
-
 
 MAX_REGIONS = 8
 MAX_SPLIT_OPTIONS = 8

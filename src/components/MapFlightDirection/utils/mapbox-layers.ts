@@ -245,6 +245,28 @@ export function generateFlightLinesForPolygon(
     return inside;
   };
 
+  const refineBoundaryPoint = (
+    outsidePoint: [number, number],
+    insidePoint: [number, number],
+  ): [number, number] => {
+    let lo = outsidePoint;
+    let hi = insidePoint;
+
+    for (let iter = 0; iter < 18; iter++) {
+      const mid: [number, number] = [
+        (lo[0] + hi[0]) * 0.5,
+        (lo[1] + hi[1]) * 0.5,
+      ];
+      if (pointInPolygon(mid[0], mid[1])) {
+        hi = mid;
+      } else {
+        lo = mid;
+      }
+    }
+
+    return hi;
+  };
+
   for (let i = -numLines; i <= numLines; i++) {
     const distance = i * lineSpacing;
     const [centerLineLng, centerLineLat] = geoDestination([centerLng, centerLat], perpBearing, distance);
@@ -254,26 +276,37 @@ export function generateFlightLinesForPolygon(
     const p1 = geoDestination([centerLineLng, centerLineLat], bearingDeg, extendDistance);
     const p2 = geoDestination([centerLineLng, centerLineLat], (bearingDeg + 180) % 360, extendDistance);
 
-    // Sample points along the line and find entry/exit points of polygon
-    const linePoints: [number, number][] = [];
-    const samples = 50;
-    
-    for (let s = 0; s <= samples; s++) {
-      const t = s / samples;
-      const lng = p2[0] + t * (p1[0] - p2[0]);
-      const lat = p2[1] + t * (p1[1] - p2[1]);
-      
-      if (pointInPolygon(lng, lat)) {
-        linePoints.push([lng, lat]);
-      }
-    }
+    // Preserve every contiguous inside segment. This avoids dropping narrow
+    // intersections or incorrectly merging disjoint segments on concave polygons.
+    const sampleStepM = Math.max(5, Math.min(15, lineSpacing * 0.2));
+    const samples = Math.max(120, Math.min(1200, Math.ceil((extendDistance * 2) / sampleStepM)));
 
-    // Only add lines that have points inside the polygon
-    if (linePoints.length > 0) {
-      // Find the start and end of the continuous segment inside the polygon
-      const startPoint = linePoints[0];
-      const endPoint = linePoints[linePoints.length - 1];
-      flightLines.push([startPoint, endPoint]);
+    let previousPoint: [number, number] = [p2[0], p2[1]];
+    let previousInside = pointInPolygon(previousPoint[0], previousPoint[1]);
+    let currentSegmentStart: [number, number] | null = previousInside ? previousPoint : null;
+
+    for (let s = 1; s <= samples; s++) {
+      const t = s / samples;
+      const currentPoint: [number, number] = [
+        p2[0] + t * (p1[0] - p2[0]),
+        p2[1] + t * (p1[1] - p2[1]),
+      ];
+      const currentInside = pointInPolygon(currentPoint[0], currentPoint[1]);
+
+      if (currentInside && !previousInside) {
+        currentSegmentStart = refineBoundaryPoint(previousPoint, currentPoint);
+      } else if (!currentInside && previousInside && currentSegmentStart) {
+        const segmentEnd = refineBoundaryPoint(currentPoint, previousPoint);
+        flightLines.push([currentSegmentStart, segmentEnd]);
+        currentSegmentStart = null;
+      }
+
+      if (s === samples && currentInside && currentSegmentStart) {
+        flightLines.push([currentSegmentStart, currentPoint]);
+      }
+
+      previousPoint = currentPoint;
+      previousInside = currentInside;
     }
   }
 
@@ -339,6 +372,8 @@ export function addFlightLinesForPolygon(
   if (flightLines.length === 0) {
     try {
       const b = bounds;
+      const centerLng = (b.minLng + b.maxLng) / 2;
+      const centerLat = (b.minLat + b.maxLat) / 2;
       console.warn(
         `[flight-lines] No segments inside polygon for ${polygonId}. Debug: bearing=${bearingDeg.toFixed(2)}, spacing=${lineSpacing.toFixed(2)}m, center=(${centerLng.toFixed(5)},${centerLat.toFixed(5)}), bbox=lng[${b.minLng.toFixed(5)},${b.maxLng.toFixed(5)}], lat[${b.minLat.toFixed(5)},${b.maxLat.toFixed(5)}]`
       );
@@ -351,7 +386,7 @@ export function addFlightLinesForPolygon(
 export function removeFlightLinesForPolygon(map: MapboxMap, polygonId: string) {
   const layerId = `flight-lines-layer-${polygonId}`;
   const sourceId = `flight-lines-source-${polygonId}`;
-  
+
   try { if (map.getLayer(layerId)) map.removeLayer(layerId); } catch {}
   try { if (map.getSource(sourceId)) map.removeSource(sourceId); } catch {}
 }
@@ -365,7 +400,7 @@ function sampleTriggerPoints(line: [number, number][], spacingM: number): [numbe
   const [A, B] = line as [[number, number], [number, number]];
   const total = haversineDistance(A, B);
   if (total === 0) return [A];
-  
+
   // Calculate bearing from A to B
   const dLng = B[0] - A[0];
   const dLat = B[1] - A[1];
@@ -450,7 +485,7 @@ export function removeTriggerPointsForPolygon(map: MapboxMap, polygonId: string)
   const sourceId = `flight-triggers-source-${polygonId}`;
   const circleLayerId = `flight-triggers-layer-${polygonId}`;
   const labelLayerId = `flight-triggers-label-${polygonId}`;
-  
+
   try { if (map.getLayer(circleLayerId)) map.removeLayer(circleLayerId); } catch {}
   try { if (map.getLayer(labelLayerId)) map.removeLayer(labelLayerId); } catch {}
   try { if (map.getSource(sourceId)) map.removeSource(sourceId); } catch {}
@@ -462,14 +497,14 @@ export function removeTriggerPointsForPolygon(map: MapboxMap, polygonId: string)
 export function clearAllFlightLines(map: MapboxMap) {
   const layers = map.getStyle().layers || [];
   const sources = map.getStyle().sources || {};
-  
+
   // Remove all flight line layers
   for (const layer of layers) {
     if (layer.id.startsWith('flight-lines-layer-')) {
       try { map.removeLayer(layer.id); } catch {}
     }
   }
-  
+
   // Remove all flight line sources
   for (const sourceId of Object.keys(sources)) {
     if (sourceId.startsWith('flight-lines-source-')) {
@@ -484,14 +519,14 @@ export function clearAllFlightLines(map: MapboxMap) {
 export function clearAllTriggerPoints(map: MapboxMap) {
   const layers = map.getStyle().layers || [];
   const sources = map.getStyle().sources || {};
-  
+
   // Remove all trigger point layers
   for (const layer of layers) {
     if (layer.id.startsWith('flight-triggers-')) {
       try { map.removeLayer(layer.id); } catch {}
     }
   }
-  
+
   // Remove all trigger point sources
   for (const sourceId of Object.keys(sources)) {
     if (sourceId.startsWith('flight-triggers-source-')) {

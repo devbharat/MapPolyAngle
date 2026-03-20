@@ -1,17 +1,46 @@
-import React, { useState, useRef, useCallback, useMemo } from 'react';
-import { MapFlightDirection } from '@/components/MapFlightDirection';
-import type { MapFlightDirectionAPI } from '@/components/MapFlightDirection/api';
-import { PolygonAnalysisResult } from '@/components/MapFlightDirection/types';
+import React, { Suspense, lazy, useState, useRef, useCallback, useMemo } from 'react';
+import type { BearingOverride, MapFlightDirectionAPI } from '@/components/MapFlightDirection/api';
+import type { PolygonAnalysisResult } from '@/components/MapFlightDirection/types';
 import { Card, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { LoadingSpinner } from '@/components/ui/loading-spinner';
 import { useIsMobile } from '@/hooks/use-mobile';
 import { Map, Trash2, AlertCircle, Upload, Download } from 'lucide-react';
-import OverlapGSDPanel from "@/components/OverlapGSDPanel";
-import PolygonParamsDialog from "@/components/PolygonParamsDialog";
 import type { PolygonParams } from '@/components/MapFlightDirection/types';
 import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator } from '@/components/ui/dropdown-menu';
 import { toast } from "@/hooks/use-toast";
+
+const MapFlightDirection = lazy(async () => {
+  const mod = await import('@/components/MapFlightDirection');
+  return { default: mod.MapFlightDirection };
+});
+
+const OverlapGSDPanel = lazy(() => import('@/components/OverlapGSDPanel'));
+const PolygonParamsDialog = lazy(() => import('@/components/PolygonParamsDialog'));
+
+function DeferredPanelFallback() {
+  return (
+    <Card className="backdrop-blur-md bg-white/95">
+      <CardContent className="p-6">
+        <div className="flex items-center justify-center gap-2 text-sm text-gray-600">
+          <LoadingSpinner size="sm" />
+          <span>Loading analysis tools…</span>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+function DeferredMapFallback() {
+  return (
+    <div className="absolute inset-0 flex items-center justify-center bg-gray-100">
+      <div className="flex items-center gap-3 rounded-lg bg-white/90 px-4 py-3 text-sm text-gray-700 shadow-sm">
+        <LoadingSpinner size="sm" />
+        <span>Loading map workspace…</span>
+      </div>
+    </div>
+  );
+}
 
 export default function Home() {
   const isMobile = useIsMobile();
@@ -26,7 +55,7 @@ export default function Home() {
 
   // Imported/or override state (queried from Map component)
   const [importedOriginals, setImportedOriginals] = useState<Record<string, { bearingDeg: number; lineSpacingM: number }>>({});
-  const [overrides, setOverrides] = useState<Record<string, { bearingDeg: number; lineSpacingM?: number; source: 'wingtra' | 'user' }>>({});
+  const [overrides, setOverrides] = useState<Record<string, BearingOverride>>({});
   const [selectedPolygonId, setSelectedPolygonId] = useState<string | null>(null);
   // NEW: track imported pose count
   const [importedPoseCount, setImportedPoseCount] = useState(0);
@@ -36,12 +65,11 @@ export default function Home() {
   const clearGSDRef = useRef<(() => void) | null>(null);
   // NEW: ref to open pose JSON importer (DJI or Wingtra) inside OverlapGSDPanel
   const openDJIImporterRef = useRef<((mode?: 'dji' | 'wingtra') => void) | null>(null);
-  
-  const terrainZoom = 15; // This is now a fallback - actual zoom is calculated dynamically
+
   const sampleStep = 1;
-  const mapboxToken = useMemo(() => 
-    import.meta.env.VITE_MAPBOX_TOKEN || 
-    import.meta.env.VITE_MAPBOX_ACCESS_TOKEN || 
+  const mapboxToken = useMemo(() =>
+    import.meta.env.VITE_MAPBOX_TOKEN ||
+    import.meta.env.VITE_MAPBOX_ACCESS_TOKEN ||
     "", []
   );
 
@@ -51,11 +79,14 @@ export default function Home() {
 
   // Expose mapRef to window for console testing
   React.useEffect(() => {
-    if (mapRef.current) {
-      (window as any).mapApi = mapRef.current;
-      console.log('🔧 Map API available as window.mapApi for console testing');
-    }
-  }, [mapRef.current]);
+    const timer = window.setTimeout(() => {
+      if (mapRef.current) {
+        (window as any).mapApi = mapRef.current;
+        console.log('🔧 Map API available as window.mapApi for console testing');
+      }
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, []);
 
   // Memoize handlers to prevent unnecessary re-renders
   const handleAnalysisStart = useCallback((polygonId: string) => {
@@ -63,8 +94,25 @@ export default function Home() {
   }, []);
 
   const handleAnalysisComplete = useCallback((results: PolygonAnalysisResult[]) => {
+    console.log('[home] handleAnalysisComplete', {
+      resultIds: results.map((result) => result.polygonId),
+    });
     setPolygonResults(results);
     setAnalyzingPolygons(new Set()); // Clear all analyzing states
+    const api = mapRef.current;
+    if (api) {
+      const imported = api.getImportedOriginals?.() ?? {};
+      const overrides = api.getBearingOverrides?.() ?? {};
+      setImportedOriginals(imported);
+      setOverrides(overrides);
+      const mapParams = api.getPerPolygonParams?.() ?? {};
+      setParamsByPolygon(mapParams as any);
+      console.log('[home] synced map state after analysis complete', {
+        importedOriginalIds: Object.keys(imported),
+        overrideIds: Object.keys(overrides),
+        polygonParamIds: Object.keys(mapParams),
+      });
+    }
   }, []);
 
   const handleError = useCallback((error: string, polygonId?: string) => {
@@ -159,20 +207,16 @@ export default function Home() {
     setSelectedPolygonId(null);
   }, []);
 
-  // Helper function to get quality indicator
-  const getQualityIndicator = useCallback((quality?: string) => {
-    switch (quality) {
-      case 'excellent':
-        return { color: 'text-green-600', bgColor: 'bg-green-100', icon: '●', label: 'Excellent' };
-      case 'good':
-        return { color: 'text-blue-600', bgColor: 'bg-blue-100', icon: '●', label: 'Good' };
-      case 'fair':
-        return { color: 'text-orange-600', bgColor: 'bg-orange-100', icon: '●', label: 'Fair' };
-      case 'poor':
-        return { color: 'text-red-600', bgColor: 'bg-red-100', icon: '●', label: 'Poor' };
-      default:
-        return { color: 'text-gray-600', bgColor: 'bg-gray-100', icon: '○', label: 'Unknown' };
-    }
+  // helper to export Wingtra flight plan
+  const handleExportWingtra = useCallback(() => {
+    const api = mapRef.current; if (!api?.exportWingtraFlightPlan) return;
+    const { blob } = api.exportWingtraFlightPlan();
+    const original = api.getLastImportedFlightplanName?.();
+    const fn = (original && /\.flightplan$/.test(original)) ? original.replace(/\.flightplan$/, '-exported.flightplan') : 'exported.flightplan';
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = fn; document.body.appendChild(a); a.click();
+    setTimeout(()=>{ URL.revokeObjectURL(url); a.remove(); }, 1000);
   }, []);
 
   if (!mapboxToken) {
@@ -203,18 +247,6 @@ export default function Home() {
   const hasImportedPolygons = Object.keys(importedOriginals).length > 0;
   const hasPolygonsToAnalyze = hasResults || hasImportedPolygons;
   const panelEnabled = hasPolygonsToAnalyze || importedPoseCount>0; // enable if poses-only
-
-  // helper to export Wingtra flight plan
-  const handleExportWingtra = useCallback(() => {
-    const api = mapRef.current; if (!api?.exportWingtraFlightPlan) return;
-    const { json, blob } = api.exportWingtraFlightPlan();
-    const original = (mapRef.current as any)?.lastImportedFlightplanName;
-    const fn = (original && /\.flightplan$/.test(original)) ? original.replace(/\.flightplan$/, '-exported.flightplan') : 'exported.flightplan';
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url; a.download = fn; document.body.appendChild(a); a.click();
-    setTimeout(()=>{ URL.revokeObjectURL(url); a.remove(); }, 1000);
-  }, []);
 
   return (
     <div className="h-screen flex flex-col bg-gray-50">
@@ -294,6 +326,7 @@ export default function Home() {
 
       <div className="flex-1 relative">
         {/* PER‑POLYGON PARAMS DIALOG */}
+        <Suspense fallback={null}>
         {(() => {
           const pid = paramsDialog.polygonId || "";
           const mapParams = mapRef.current?.getPerPolygonParams?.() || {} as any;
@@ -328,6 +361,7 @@ export default function Home() {
             customBearingDeg: current.customBearingDeg ?? undefined,
           }}
         />); })()}
+        </Suspense>
 
         {/* Right Side Panel - Combined Controls and Instructions - Hidden on mobile */}
         {!isMobile && (
@@ -339,7 +373,7 @@ export default function Home() {
               <div className="flex items-center justify-between">
                 <h3 className="text-sm font-medium text-gray-900">Analysis</h3>
               </div>
-              
+
               {isAnalyzing && (
                 <div className="flex items-center justify-center py-4 border-b mb-3">
                   <div className="text-center">
@@ -350,7 +384,7 @@ export default function Home() {
                   </div>
                 </div>
               )}
-              
+
               {!isAnalyzing && !hasResults && (
                 <div className="text-center py-6 text-gray-500">
                   <p className="text-xs">Draw polygons to start analysis</p>
@@ -361,21 +395,23 @@ export default function Home() {
               {/* Multiple Polygon Results */}
 
               <div className={panelEnabled ? '' : 'opacity-50 pointer-events-none'}>
-                <OverlapGSDPanel 
-                  mapRef={mapRef} 
-                  mapboxToken={mapboxToken} 
-                  getPerPolygonParams={() => paramsByPolygon}
-                  onEditPolygonParams={handleEditPolygonParams}
-                  onAutoRun={handleAutoRunReceived}
-                  onClearExposed={handleClearReceived}
-                  onExposePoseImporter={(fn)=>{ openDJIImporterRef.current = fn; }}
-                  onPosesImported={(c)=> setImportedPoseCount(c)}
-                  polygonAnalyses={polygonResults}
-                  overrides={overrides}
-                  importedOriginals={importedOriginals}
-                  selectedPolygonId={selectedPolygonId}
-                  onSelectPolygon={setSelectedPolygonId}
-                />
+                <Suspense fallback={<DeferredPanelFallback />}>
+                  <OverlapGSDPanel
+                    mapRef={mapRef}
+                    mapboxToken={mapboxToken}
+                    getPerPolygonParams={() => paramsByPolygon}
+                    onEditPolygonParams={handleEditPolygonParams}
+                    onAutoRun={handleAutoRunReceived}
+                    onClearExposed={handleClearReceived}
+                    onExposePoseImporter={(fn)=>{ openDJIImporterRef.current = fn; }}
+                    onPosesImported={(c)=> setImportedPoseCount(c)}
+                    polygonAnalyses={polygonResults}
+                    overrides={overrides}
+                    importedOriginals={importedOriginals}
+                    selectedPolygonId={selectedPolygonId}
+                    onSelectPolygon={setSelectedPolygonId}
+                  />
+                </Suspense>
               </div>
             </CardContent>
           </Card>
@@ -383,21 +419,22 @@ export default function Home() {
         )}
 
         {/* Map Container */}
-        <MapFlightDirection
-          ref={mapRef}
-          mapboxToken={mapboxToken}
-          center={center}
-          zoom={initialZoom}
-          terrainZoom={terrainZoom}
-          sampleStep={sampleStep}
-          onAnalysisStart={handleAnalysisStart}
-          onAnalysisComplete={handleAnalysisComplete}
-          onError={handleError}
-          onRequestParams={handleRequestParams}
-          onFlightLinesUpdated={handleFlightLinesUpdated}
-          onClearGSD={() => clearGSDRef.current?.()}
-          onPolygonSelected={setSelectedPolygonId}
-        />
+        <Suspense fallback={<DeferredMapFallback />}>
+          <MapFlightDirection
+            ref={mapRef}
+            mapboxToken={mapboxToken}
+            center={center}
+            zoom={initialZoom}
+            sampleStep={sampleStep}
+            onAnalysisStart={handleAnalysisStart}
+            onAnalysisComplete={handleAnalysisComplete}
+            onError={handleError}
+            onRequestParams={handleRequestParams}
+            onFlightLinesUpdated={handleFlightLinesUpdated}
+            onClearGSD={() => clearGSDRef.current?.()}
+            onPolygonSelected={setSelectedPolygonId}
+          />
+        </Suspense>
       </div>
     </div>
   );

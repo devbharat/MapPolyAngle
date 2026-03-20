@@ -4,7 +4,6 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
-
 PayloadKind = Literal["camera", "lidar"]
 AltitudeMode = Literal["legacy", "min-clearance"]
 LidarReturnMode = Literal["single", "dual", "triple"]

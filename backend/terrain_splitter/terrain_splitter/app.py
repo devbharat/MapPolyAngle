@@ -17,7 +17,6 @@ from .mapbox_tiles import fetch_dem_for_ring
 from .schemas import DebugArtifacts, PartitionSolveRequest, PartitionSolveResponse
 from .solver_graphcut import solve_partition_hierarchy
 
-
 BASE_DIR = Path(__file__).resolve().parents[1]
 
 

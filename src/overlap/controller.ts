@@ -1,8 +1,8 @@
-import type { CameraModel, PoseMeters, PolygonLngLat, WorkerOut, LidarWorkerOut } from "./types";
+import type { PolygonLngLat, WorkerOut, LidarWorkerOut } from "./types";
 import { lngLatToTile, tileCornersLngLat } from "./mercator";
 
 export async function fetchTerrainRGBA(
-  z: number, x: number, y: number, token: string, size = 512, signal?: AbortSignal
+  z: number, x: number, y: number, token: string, _size = 512, signal?: AbortSignal
 ): Promise<ImageData> {
   const url = `https://api.mapbox.com/v4/mapbox.terrain-rgb/${z}/${x}/${y}.pngraw?access_token=${token}`;
   const img = await loadImage(url, signal);

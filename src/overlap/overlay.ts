@@ -9,7 +9,7 @@ import { tileCornersForImageSource } from "./controller";
 function heatmapColor(t: number): [number, number, number] {
   // Clamp t to [0, 1]
   t = Math.max(0, Math.min(1, t));
-  
+
   if (t < 0.25) {
     // Blue to Cyan (0 -> 0.25)
     const s = t / 0.25;
@@ -50,29 +50,29 @@ function encodeOverlapToImage(overlap: Uint16Array, size: number, maxValue: numb
     // Normalize to 0-1 range (consistent)
     const t = effectiveMax > 0 ? Math.min(1, v / effectiveMax) : 0;
     const [r, g, b] = heatmapColor(t);
-    
+
     img.data[j] = r;
     img.data[j + 1] = g;
     img.data[j + 2] = b;
     img.data[j + 3] = 200; // Good opacity for overlay
   }
-  
+
   ctx.putImageData(img, 0, 0);
   return canvas;
 }
 
 /**
- * Convert GSD values to a heatmap visualization  
+ * Convert GSD values to a heatmap visualization
  * Higher GSD = worse resolution = warmer colors (red), Lower GSD = better resolution = cooler colors (blue/green)
  */
-function encodeGsdToImage(gsd: Float32Array, size: number, gsdMin = 0.005, gsdMax = 0.05): HTMLCanvasElement {
+function encodeGsdToImage(gsd: Float32Array, size: number, gsdMin = 0.005, gsdMax = 0.06): HTMLCanvasElement {
   const canvas = document.createElement("canvas");
   canvas.width = size; canvas.height = size;
   const ctx = canvas.getContext("2d", { willReadFrequently: true })!;
   const img = ctx.createImageData(size, size);
   const lo = Math.max(0, gsdMin);
   const hi = Math.max(lo + 1e-6, gsdMax);
-  
+
   for (let i = 0, j = 0; i < gsd.length; i++, j += 4) {
     const g = gsd[i];
     if (!Number.isFinite(g)) {
@@ -83,13 +83,13 @@ function encodeGsdToImage(gsd: Float32Array, size: number, gsdMin = 0.005, gsdMa
     // Normalize within [gsdMin, gsdMax]: higher GSD (worse) → 1 (warmer); lower (better) → 0 (cooler)
     const t = Math.max(0, Math.min(1, (g - lo) / (hi - lo)));
     const [r, g_color, b] = heatmapColor(t);
-    
+
     img.data[j] = r;
     img.data[j + 1] = g_color;
     img.data[j + 2] = b;
     img.data[j + 3] = 200; // Good opacity for overlay
   }
-  
+
   ctx.putImageData(img, 0, 0);
   return canvas;
 }
@@ -141,7 +141,7 @@ function smoothDensityForDisplay(density: Float32Array, size: number): Float32Ar
   return smoothed;
 }
 
-function encodeDensityToImage(density: Float32Array, size: number, densityMin = 0, densityMax = 200): HTMLCanvasElement {
+function encodeDensityToImage(density: Float32Array, size: number, densityMin = 10, densityMax = 100): HTMLCanvasElement {
   const canvas = document.createElement("canvas");
   canvas.width = size;
   canvas.height = size;
@@ -197,9 +197,9 @@ export function addOrUpdateTileOverlay(
   if (opts.kind === "overlap" || opts.kind === "pass") {
     canvas = encodeOverlapToImage(result.overlap, result.size, result.maxOverlap || 1);
   } else if (opts.kind === "density") {
-    canvas = encodeDensityToImage(result.density ?? new Float32Array(result.size * result.size), result.size, opts.densityMin ?? 0, opts.densityMax ?? Math.max(1, result.maxDensity ?? 1));
+    canvas = encodeDensityToImage(result.density ?? new Float32Array(result.size * result.size), result.size, opts.densityMin ?? 10, opts.densityMax ?? 100);
   } else {
-    canvas = encodeGsdToImage(result.gsdMin, result.size, opts.gsdMin ?? 0.005, opts.gsdMax ?? 0.05);
+    canvas = encodeGsdToImage(result.gsdMin, result.size, opts.gsdMin ?? 0.005, opts.gsdMax ?? 0.06);
   }
 
   // Convert to data URL (required for Mapbox image source)
@@ -240,7 +240,7 @@ export function addOrUpdateTileOverlay(
           paint: { "raster-opacity": opts.opacity ?? 0.85 },
         });
       }
-    } catch (e) {
+    } catch {
       // Fallback to remove/add pattern for robustness
       if (map.getLayer(layerId)) map.removeLayer(layerId);
       if (map.getSource(sourceId)) map.removeSource(sourceId);
@@ -261,7 +261,7 @@ export function addOrUpdateTileOverlay(
 
 export function clearRunOverlays(map: mapboxgl.Map, runId: string) {
   if (!map.isStyleLoaded?.()) return;
-  
+
   const layers = map.getStyle().layers || [];
   for (const layer of layers) {
     const id = layer.id;
