@@ -60,6 +60,9 @@ SPLIT_NON_IMPROVING_MAX_QUALITY_REGRESSION = 0.03
 SPLIT_NON_IMPROVING_MIN_RANK_SCORE = -0.02
 DEFAULT_DEPTH_SMALL = 3
 DEFAULT_DEPTH_LARGE = 3
+DEFAULT_NESTED_LAMBDA_MIN_DEPTH = 2
+DEFAULT_NESTED_LAMBDA_MIN_CELLS = 64
+DEFAULT_NESTED_LAMBDA_MAX_INFLIGHT = 8
 SPLIT_QUANTILES = (0.20, 0.25, 0.33, 0.40, 0.50, 0.60, 0.67, 0.75, 0.80)
 OUTPUT_RING_SIMPLIFY_FACTOR = 0.4
 OUTPUT_RING_SIMPLIFY_MIN_M = 6.0
@@ -283,6 +286,41 @@ def _resolve_lambda_invoke_read_timeout_sec(requested: int | None) -> int:
             raw,
         )
         return 300
+
+
+def _resolve_nested_lambda_min_cells(requested: int | None) -> int:
+    if requested is not None:
+        return max(1, int(requested))
+    raw = os.environ.get("TERRAIN_SPLITTER_NESTED_LAMBDA_MIN_CELLS")
+    if raw is None or raw.strip() == "":
+        return DEFAULT_NESTED_LAMBDA_MIN_CELLS
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        logger.warning(
+            "[terrain-split-backend] invalid TERRAIN_SPLITTER_NESTED_LAMBDA_MIN_CELLS=%r; falling back to %d",
+            raw,
+            DEFAULT_NESTED_LAMBDA_MIN_CELLS,
+        )
+        return DEFAULT_NESTED_LAMBDA_MIN_CELLS
+
+
+def _resolve_nested_lambda_max_inflight(requested: int | None) -> int:
+    if requested is not None:
+        return max(0, int(requested))
+    raw = os.environ.get("TERRAIN_SPLITTER_NESTED_LAMBDA_MAX_INFLIGHT")
+    if raw is None or raw.strip() == "":
+        return DEFAULT_NESTED_LAMBDA_MAX_INFLIGHT
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        logger.warning(
+            "[terrain-split-backend] invalid TERRAIN_SPLITTER_NESTED_LAMBDA_MAX_INFLIGHT=%r; falling back to %d",
+            raw,
+            DEFAULT_NESTED_LAMBDA_MAX_INFLIGHT,
+        )
+        return DEFAULT_NESTED_LAMBDA_MAX_INFLIGHT
+
 
 
 def _resolve_lambda_parallel_invocations(
@@ -686,6 +724,9 @@ def _populate_solver_debug_output(
                     "practicalLineLengthScale": practical_line_length_scale,
                     "lineLengthNearMissRatioBasic": LINE_LENGTH_NEAR_MISS_RATIO_BASIC,
                     "lineLengthNearMissRatioPractical": LINE_LENGTH_NEAR_MISS_RATIO_PRACTICAL,
+                    "defaultNestedLambdaMinDepth": DEFAULT_NESTED_LAMBDA_MIN_DEPTH,
+                    "defaultNestedLambdaMinCells": DEFAULT_NESTED_LAMBDA_MIN_CELLS,
+                    "defaultNestedLambdaMaxInflight": DEFAULT_NESTED_LAMBDA_MAX_INFLIGHT,
                 },
                 "performance": _rounded_debug_mapping(dict(perf)),
             },
@@ -2032,6 +2073,8 @@ def _solve_region_recursive(
     context: SolverContext,
     caches: SolverCaches,
     perf: dict[str, float],
+    *,
+    allow_nested_lambda_fanout: bool = False,
 ) -> list[PartitionPlan]:
     perf["solve_region_calls"] += 1
     key = (cell_ids, depth)
@@ -2053,26 +2096,87 @@ def _solve_region_recursive(
 
     candidates = [baseline_plan]
     split_gen_started_at = time.perf_counter()
-    for split in _generate_split_candidates_for_context(
+    split_candidates = _generate_split_candidates_for_context(
         baseline_region,
         baseline_plan,
         cell_ids,
         context,
         caches,
         perf,
-    ):
-        left_frontier = _solve_region_recursive(split.left_ids, depth - 1, context, caches, perf) or []
-        right_frontier = _solve_region_recursive(split.right_ids, depth - 1, context, caches, perf) or []
-        if not left_frontier or not right_frontier:
-            continue
-        for left_plan in left_frontier:
-            for right_plan in right_frontier:
-                combined = _combine_plans(left_plan, right_plan, split.boundary, split)
-                if combined.region_count > MAX_REGIONS:
-                    perf["combine_region_limit_rejections"] += 1
+    )
+    if allow_nested_lambda_fanout and _should_use_nested_lambda_fanout(cell_ids, depth, split_candidates):
+        try:
+            candidates.extend(
+                _solve_split_candidates_via_nested_lambda(
+                    split_candidates,
+                    depth,
+                    context,
+                    perf,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            perf["nested_parallel_failures"] += 1
+            logger.warning(
+                "[terrain-split-backend] nested lambda fan-out failed cells=%d depth=%d; falling back to serial",
+                len(cell_ids),
+                depth,
+                exc_info=exc,
+            )
+            for split in split_candidates:
+                left_frontier = _solve_region_recursive(
+                    split.left_ids,
+                    depth - 1,
+                    context,
+                    caches,
+                    perf,
+                    allow_nested_lambda_fanout=allow_nested_lambda_fanout,
+                ) or []
+                right_frontier = _solve_region_recursive(
+                    split.right_ids,
+                    depth - 1,
+                    context,
+                    caches,
+                    perf,
+                    allow_nested_lambda_fanout=allow_nested_lambda_fanout,
+                ) or []
+                if not left_frontier or not right_frontier:
                     continue
-                candidates.append(combined)
-                perf["combined_plan_candidates"] += 1
+                for left_plan in left_frontier:
+                    for right_plan in right_frontier:
+                        combined = _combine_plans(left_plan, right_plan, split.boundary, split)
+                        if combined.region_count > MAX_REGIONS:
+                            perf["combine_region_limit_rejections"] += 1
+                            continue
+                        candidates.append(combined)
+                        perf["combined_plan_candidates"] += 1
+    else:
+        for split in split_candidates:
+            left_frontier = _solve_region_recursive(
+                split.left_ids,
+                depth - 1,
+                context,
+                caches,
+                perf,
+                allow_nested_lambda_fanout=allow_nested_lambda_fanout,
+            ) or []
+            right_frontier = _solve_region_recursive(
+                split.right_ids,
+                depth - 1,
+                context,
+                caches,
+                perf,
+                allow_nested_lambda_fanout=allow_nested_lambda_fanout,
+            ) or []
+            if not left_frontier or not right_frontier:
+                continue
+            for left_plan in left_frontier:
+                for right_plan in right_frontier:
+                    combined = _combine_plans(left_plan, right_plan, split.boundary, split)
+                    if combined.region_count > MAX_REGIONS:
+                        perf["combine_region_limit_rejections"] += 1
+                        continue
+                    candidates.append(combined)
+                    perf["combined_plan_candidates"] += 1
     perf["split_generation_ms"] += (time.perf_counter() - split_gen_started_at) * 1000.0
 
     frontier = _pareto_frontier(candidates, context.root_area_m2, context.practical_line_length_scale)
@@ -2094,8 +2198,22 @@ def _solve_root_split_branch_with_context(
 ) -> tuple[list[PartitionPlan], dict[str, float]]:
     caches = _make_solver_caches()
     perf = _make_perf()
-    left_frontier = _solve_region_recursive(task.left_ids, task.depth, context, caches, perf) or []
-    right_frontier = _solve_region_recursive(task.right_ids, task.depth, context, caches, perf) or []
+    left_frontier = _solve_region_recursive(
+        task.left_ids,
+        task.depth,
+        context,
+        caches,
+        perf,
+        allow_nested_lambda_fanout=True,
+    ) or []
+    right_frontier = _solve_region_recursive(
+        task.right_ids,
+        task.depth,
+        context,
+        caches,
+        perf,
+        allow_nested_lambda_fanout=True,
+    ) or []
     if not left_frontier or not right_frontier:
         return [], dict(perf)
     combined_candidates: list[PartitionPlan] = []
@@ -2136,7 +2254,14 @@ def _solve_subtree_task_with_context(
 ) -> tuple[list[PartitionPlan], dict[str, float]]:
     caches = _make_solver_caches()
     perf = _make_perf()
-    frontier = _solve_region_recursive(task.cell_ids, task.depth, context, caches, perf) or []
+    frontier = _solve_region_recursive(
+        task.cell_ids,
+        task.depth,
+        context,
+        caches,
+        perf,
+        allow_nested_lambda_fanout=True,
+    ) or []
     return frontier, dict(perf)
 
 
@@ -2608,6 +2733,77 @@ def _solve_subtrees_via_lambda(
     return subtree_results, perf
 
 
+def _should_use_nested_lambda_fanout(
+    cell_ids: tuple[int, ...],
+    depth: int,
+    split_candidates: list[SplitCandidate],
+) -> bool:
+    if depth < DEFAULT_NESTED_LAMBDA_MIN_DEPTH:
+        return False
+    if len(cell_ids) < _resolve_nested_lambda_min_cells(None):
+        return False
+    if len(split_candidates) < 2:
+        return False
+    if _resolve_root_parallel_mode(None) != "lambda":
+        return False
+    if _resolve_root_parallel_granularity(None) != "subtree":
+        return False
+    if _resolve_root_parallel_workers(None) <= 1:
+        return False
+    if _resolve_nested_lambda_max_inflight(None) <= 1:
+        return False
+    if not os.environ.get("AWS_LAMBDA_FUNCTION_NAME"):
+        return False
+    return True
+
+
+def _solve_split_candidates_via_nested_lambda(
+    split_candidates: list[SplitCandidate],
+    depth: int,
+    context: SolverContext,
+    perf: dict[str, float],
+) -> list[PartitionPlan]:
+    subtree_tasks: list[tuple[int, str, SubtreeSolveTask]] = []
+    for index, split in enumerate(split_candidates):
+        subtree_tasks.append((index, "left", SubtreeSolveTask(cell_ids=split.left_ids, depth=depth - 1)))
+        subtree_tasks.append((index, "right", SubtreeSolveTask(cell_ids=split.right_ids, depth=depth - 1)))
+    requested_workers = _resolve_root_parallel_workers(None)
+    nested_max_inflight = _resolve_nested_lambda_max_inflight(None)
+    subtree_workers = _resolve_lambda_parallel_invocations(
+        len(subtree_tasks),
+        min(max(requested_workers, len(split_candidates)), len(subtree_tasks)),
+        nested_max_inflight,
+    )
+    perf["nested_parallel_invocations"] += 1
+    perf["nested_parallel_split_count"] += len(split_candidates)
+    perf["nested_parallel_subtree_tasks"] += len(subtree_tasks)
+    perf["nested_parallel_workers_used_max"] = max(perf["nested_parallel_workers_used_max"], subtree_workers)
+    nested_started_at = time.perf_counter()
+    subtree_results, lambda_perf = _solve_subtrees_via_lambda(
+        subtree_tasks,
+        context,
+        subtree_workers,
+    )
+    perf["nested_parallel_ms"] += (time.perf_counter() - nested_started_at) * 1000.0
+    _merge_perf(perf, lambda_perf)
+
+    candidates: list[PartitionPlan] = []
+    for index, split in enumerate(split_candidates):
+        left_frontier = subtree_results.get(index, {}).get("left", [])
+        right_frontier = subtree_results.get(index, {}).get("right", [])
+        if not left_frontier or not right_frontier:
+            continue
+        for left_plan in left_frontier:
+            for right_plan in right_frontier:
+                combined = _combine_plans(left_plan, right_plan, split.boundary, split)
+                if combined.region_count > MAX_REGIONS:
+                    perf["combine_region_limit_rejections"] += 1
+                    continue
+                candidates.append(combined)
+                perf["combined_plan_candidates"] += 1
+    return candidates
+
+
 def solve_partition_hierarchy(
     grid: GridData,
     feature_field: FeatureField,
@@ -3008,7 +3204,7 @@ def solve_partition_hierarchy(
         )
         total_ms = (time.perf_counter() - solve_started_at) * 1000.0
         logger.info(
-            "[terrain-split-backend][%s] solver finished polygonId=%s cells=%d maxDepth=%d totalMs=%.1f allPlans=%d practicalPlans=0 rootParallelMode=%s rootParallelGranularity=%s rootParallelRequested=%d rootParallelUsed=%d rootParallelSplits=%d rootParallelSubtreeTasks=%d rootParallelMs=%.1f solveRegionCalls=%d cacheHits=%d regionCacheHits=%d regionCacheMisses=%d regionStaticHits=%d regionStaticMisses=%d regionBearingHits=%d regionBearingMisses=%d buildRegionCalls=%d buildRegionMs=%.1f regionStaticBuildMs=%.1f polygonMs=%.1f objectiveCalls=%d objectiveMs=%.1f regionBearingCoreMs=%.1f exactRegionObjectiveCalls=%d exactRegionObjectiveMs=%.1f nodeCostMs=%.1f lineLiftMs=%.1f flightTimeMs=%.1f shapeMetricMs=%.1f splitGenMs=%.1f splitAttempts=%d kept=%d returned=%d smallChildRejects=%d duplicateRejects=%d disconnectedRejects=%d boundaryRejects=%d regionBuildRejects=%d validityRejects=%d nonImprovingRejects=%d combinedCandidates=%d frontierStates=%d",
+            "[terrain-split-backend][%s] solver finished polygonId=%s cells=%d maxDepth=%d totalMs=%.1f allPlans=%d practicalPlans=0 rootParallelMode=%s rootParallelGranularity=%s rootParallelRequested=%d rootParallelUsed=%d rootParallelSplits=%d rootParallelSubtreeTasks=%d rootParallelMs=%.1f nestedParallelInvocations=%d nestedParallelWorkersMax=%d nestedParallelTasks=%d nestedParallelMs=%.1f nestedParallelFailures=%d solveRegionCalls=%d cacheHits=%d regionCacheHits=%d regionCacheMisses=%d regionStaticHits=%d regionStaticMisses=%d regionBearingHits=%d regionBearingMisses=%d buildRegionCalls=%d buildRegionMs=%.1f regionStaticBuildMs=%.1f polygonMs=%.1f objectiveCalls=%d objectiveMs=%.1f regionBearingCoreMs=%.1f exactRegionObjectiveCalls=%d exactRegionObjectiveMs=%.1f nodeCostMs=%.1f lineLiftMs=%.1f flightTimeMs=%.1f shapeMetricMs=%.1f splitGenMs=%.1f splitAttempts=%d kept=%d returned=%d smallChildRejects=%d duplicateRejects=%d disconnectedRejects=%d boundaryRejects=%d regionBuildRejects=%d validityRejects=%d nonImprovingRejects=%d combinedCandidates=%d frontierStates=%d",
             request_id or "<none>",
             polygon_id or "<none>",
             len(grid.cells),
@@ -3022,6 +3218,11 @@ def solve_partition_hierarchy(
             int(perf["root_parallel_split_count"]),
             int(perf["root_parallel_subtree_tasks"]),
             perf["root_parallel_ms"],
+            int(perf["nested_parallel_invocations"]),
+            int(perf["nested_parallel_workers_used_max"]),
+            int(perf["nested_parallel_subtree_tasks"]),
+            perf["nested_parallel_ms"],
+            int(perf["nested_parallel_failures"]),
             int(perf["solve_region_calls"]),
             int(perf["solve_region_cache_hits"]),
             int(perf["region_cache_hits"]),
@@ -3196,7 +3397,7 @@ def solve_partition_hierarchy(
         ),
     )
     logger.info(
-        "[terrain-split-backend][%s] solver finished polygonId=%s cells=%d maxDepth=%d totalMs=%.1f allPlans=%d practicalPlans=%d returnedSolutions=%d rootParallelMode=%s rootParallelGranularity=%s rootParallelRequested=%d rootParallelUsed=%d rootParallelSplits=%d rootParallelSubtreeTasks=%d rootParallelMs=%.1f rootParallelFailures=%d solveRegionCalls=%d cacheHits=%d regionCacheHits=%d regionCacheMisses=%d regionCacheHitRate=%.3f regionStaticHits=%d regionStaticMisses=%d regionStaticHitRate=%.3f regionStaticNullHits=%d regionBearingHits=%d regionBearingMisses=%d regionBearingHitRate=%.3f regionBearingRewraps=%d buildRegionCalls=%d buildRegionMs=%.1f regionStaticBuildMs=%.1f polygonMs=%.1f polygonFailures=%d objectiveCalls=%d objectiveMs=%.1f regionBearingCoreMs=%.1f exactRegionObjectiveCalls=%d exactRegionObjectiveMs=%.1f nodeCostMs=%.1f lineLiftMs=%.1f flightTimeMs=%.1f shapeMetricMs=%.1f splitGenMs=%.1f splitDirections=%d splitAttempts=%d kept=%d returned=%d smallChildRejects=%d duplicateRejects=%d disconnectedRejects=%d boundaryRejects=%d regionBuildRejects=%d validityRejects=%d nonImprovingRejects=%d combinedCandidates=%d frontierStates=%d",
+        "[terrain-split-backend][%s] solver finished polygonId=%s cells=%d maxDepth=%d totalMs=%.1f allPlans=%d practicalPlans=%d returnedSolutions=%d rootParallelMode=%s rootParallelGranularity=%s rootParallelRequested=%d rootParallelUsed=%d rootParallelSplits=%d rootParallelSubtreeTasks=%d rootParallelMs=%.1f rootParallelFailures=%d nestedParallelInvocations=%d nestedParallelWorkersMax=%d nestedParallelTasks=%d nestedParallelMs=%.1f nestedParallelFailures=%d solveRegionCalls=%d cacheHits=%d regionCacheHits=%d regionCacheMisses=%d regionCacheHitRate=%.3f regionStaticHits=%d regionStaticMisses=%d regionStaticHitRate=%.3f regionStaticNullHits=%d regionBearingHits=%d regionBearingMisses=%d regionBearingHitRate=%.3f regionBearingRewraps=%d buildRegionCalls=%d buildRegionMs=%.1f regionStaticBuildMs=%.1f polygonMs=%.1f polygonFailures=%d objectiveCalls=%d objectiveMs=%.1f regionBearingCoreMs=%.1f exactRegionObjectiveCalls=%d exactRegionObjectiveMs=%.1f nodeCostMs=%.1f lineLiftMs=%.1f flightTimeMs=%.1f shapeMetricMs=%.1f splitGenMs=%.1f splitDirections=%d splitAttempts=%d kept=%d returned=%d smallChildRejects=%d duplicateRejects=%d disconnectedRejects=%d boundaryRejects=%d regionBuildRejects=%d validityRejects=%d nonImprovingRejects=%d combinedCandidates=%d frontierStates=%d",
         request_id or "<none>",
         polygon_id or "<none>",
         len(grid.cells),
@@ -3213,6 +3414,11 @@ def solve_partition_hierarchy(
         int(perf["root_parallel_subtree_tasks"]),
         perf["root_parallel_ms"],
         int(perf["root_parallel_failures"]),
+        int(perf["nested_parallel_invocations"]),
+        int(perf["nested_parallel_workers_used_max"]),
+        int(perf["nested_parallel_subtree_tasks"]),
+        perf["nested_parallel_ms"],
+        int(perf["nested_parallel_failures"]),
         int(perf["solve_region_calls"]),
         int(perf["solve_region_cache_hits"]),
         int(perf["region_cache_hits"]),

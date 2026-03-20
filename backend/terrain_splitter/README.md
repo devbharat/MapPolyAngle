@@ -102,5 +102,9 @@ Notes:
   - `TERRAIN_SPLITTER_ROOT_PARALLEL_WORKERS`
   - `TERRAIN_SPLITTER_ROOT_PARALLEL_GRANULARITY=branch|subtree`
   - `TERRAIN_SPLITTER_ROOT_PARALLEL_MAX_INFLIGHT`
+  - `TERRAIN_SPLITTER_LAMBDA_INVOKE_READ_TIMEOUT_SEC`
+  - `TERRAIN_SPLITTER_NESTED_LAMBDA_MIN_CELLS`
+  - `TERRAIN_SPLITTER_NESTED_LAMBDA_MAX_INFLIGHT`
+- Subtree workers can now re-fan out one level deeper when a child solve is still large enough, using a smaller nested inflight cap to keep the invocation tree bounded.
 - Local runs still default to exact process-based root fan-out when `TERRAIN_SPLITTER_ROOT_PARALLEL_WORKERS > 1`.
 - Timeout is `900s`, matching Lambda's maximum.

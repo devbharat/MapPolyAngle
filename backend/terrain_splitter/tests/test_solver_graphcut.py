@@ -4,6 +4,7 @@ from dataclasses import replace
 
 from shapely.geometry import Polygon, box
 
+import terrain_splitter.solver_frontier as solver_frontier_module
 from terrain_splitter.costs import RegionObjective
 from terrain_splitter.features import CellFeatures, FeatureField
 from terrain_splitter.geometry import simplify_polygon_coverage
@@ -28,10 +29,13 @@ from terrain_splitter.solver_frontier import (
     _pareto_frontier,
     _plan_from_regions,
     _resolve_lambda_invoke_read_timeout_sec,
+    _resolve_nested_lambda_max_inflight,
+    _resolve_nested_lambda_min_cells,
     _resolve_lambda_parallel_invocations,
     _resolve_root_parallel_max_inflight,
     _serialize_partition_plan,
     _serialize_solver_context,
+    _solve_region_recursive,
     _solve_root_split_branch_with_context,
     _solve_subtree_task_with_context,
     solve_root_split_branch_event,
@@ -202,6 +206,82 @@ def test_root_parallel_max_inflight_reads_environment(monkeypatch) -> None:
 def test_lambda_invoke_read_timeout_reads_environment(monkeypatch) -> None:
     monkeypatch.setenv("TERRAIN_SPLITTER_LAMBDA_INVOKE_READ_TIMEOUT_SEC", "300")
     assert _resolve_lambda_invoke_read_timeout_sec(None) == 300
+
+
+def test_nested_lambda_controls_read_environment(monkeypatch) -> None:
+    monkeypatch.setenv("TERRAIN_SPLITTER_NESTED_LAMBDA_MIN_CELLS", "72")
+    monkeypatch.setenv("TERRAIN_SPLITTER_NESTED_LAMBDA_MAX_INFLIGHT", "5")
+    assert _resolve_nested_lambda_min_cells(None) == 72
+    assert _resolve_nested_lambda_max_inflight(None) == 5
+
+
+def test_subtree_worker_nested_lambda_matches_serial_frontier(monkeypatch) -> None:
+    grid = _multimodal_grid()
+    feature_field = FeatureField(
+        cells=[
+            CellFeatures(index=index, preferred_bearing_deg=(0 if (index % 4) < 2 else 90), slope_magnitude=0.25, break_strength=18, confidence=0.9, aspect_deg=(270 if (index % 4) < 2 else 0))
+            for index in range(8)
+        ],
+        dominant_preferred_bearing_deg=45,
+    )
+    params = FlightParamsModel(payloadKind="camera", altitudeAGL=120, frontOverlap=70, sideOverlap=70, cameraKey="MAP61_17MM")
+    context = SolverContext(
+        grid=grid,
+        feature_field=feature_field,
+        params=params,
+        root_area_m2=max(1.0, grid.area_m2),
+        feature_lookup=_feature_lookup(feature_field),
+        cell_lookup=_cell_lookup(grid),
+        neighbors=_neighbor_lookup(grid),
+        basic_line_length_scale=solver_frontier_module.DEFAULT_BASIC_LINE_LENGTH_SCALE,
+        practical_line_length_scale=solver_frontier_module.DEFAULT_PRACTICAL_LINE_LENGTH_SCALE,
+    )
+    task = SubtreeSolveTask(cell_ids=tuple(sorted(context.cell_lookup)), depth=2)
+
+    monkeypatch.setenv("AWS_LAMBDA_FUNCTION_NAME", "terrain-splitter-test")
+    monkeypatch.setenv("TERRAIN_SPLITTER_ROOT_PARALLEL_MODE", "lambda")
+    monkeypatch.setenv("TERRAIN_SPLITTER_ROOT_PARALLEL_GRANULARITY", "subtree")
+    monkeypatch.setenv("TERRAIN_SPLITTER_ROOT_PARALLEL_WORKERS", "4")
+    monkeypatch.setenv("TERRAIN_SPLITTER_NESTED_LAMBDA_MIN_CELLS", "1")
+    monkeypatch.setenv("TERRAIN_SPLITTER_NESTED_LAMBDA_MAX_INFLIGHT", "4")
+
+    nested_calls: dict[str, int] = {}
+
+    def fake_solve_subtrees_via_lambda(tasks, context_arg, max_workers):
+        nested_calls["task_count"] = len(tasks)
+        nested_calls["max_workers"] = max_workers
+        results: dict[int, dict[str, list]] = {}
+        for index, side, subtask in tasks:
+            caches = solver_frontier_module._make_solver_caches()
+            perf = solver_frontier_module._make_perf()
+            frontier = _solve_region_recursive(
+                subtask.cell_ids,
+                subtask.depth,
+                context_arg,
+                caches,
+                perf,
+                allow_nested_lambda_fanout=False,
+            )
+            results.setdefault(index, {})[side] = frontier
+        return results, {"fake_nested_parallel": 1.0}
+
+    monkeypatch.setattr(solver_frontier_module, "_solve_subtrees_via_lambda", fake_solve_subtrees_via_lambda)
+
+    nested_frontier, _ = _solve_subtree_task_with_context(task, context)
+    serial_frontier = _solve_region_recursive(
+        task.cell_ids,
+        task.depth,
+        context,
+        solver_frontier_module._make_solver_caches(),
+        solver_frontier_module._make_perf(),
+        allow_nested_lambda_fanout=False,
+    )
+
+    assert nested_calls["task_count"] > 0
+    assert nested_calls["max_workers"] == 4
+    assert [_serialize_partition_plan(plan) for plan in nested_frontier] == [
+        _serialize_partition_plan(plan) for plan in serial_frontier
+    ]
 
 
 def test_lambda_root_split_worker_event_matches_direct_branch_solver() -> None:
