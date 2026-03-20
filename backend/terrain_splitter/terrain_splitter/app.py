@@ -5,6 +5,7 @@ import os
 import time
 import uuid
 from pathlib import Path
+from typing import Any
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -81,6 +82,7 @@ def solve_partition(request: PartitionSolveRequest) -> PartitionSolveResponse:
         compute_features_ms = (time.perf_counter() - stage_started_at) * 1000.0
 
         stage_started_at = time.perf_counter()
+        solver_debug_payload: dict[str, Any] | None = {} if request.debug else None
         solutions = solve_partition_hierarchy(
             grid,
             feature_field,
@@ -88,6 +90,7 @@ def solve_partition(request: PartitionSolveRequest) -> PartitionSolveResponse:
             request.tradeoff,
             request_id=request_id,
             polygon_id=request.polygonId,
+            debug_output=solver_debug_payload,
         )
         solve_ms = (time.perf_counter() - stage_started_at) * 1000.0
 
@@ -120,6 +123,7 @@ def solve_partition(request: PartitionSolveRequest) -> PartitionSolveResponse:
                         ],
                     },
                     "solutions": [solution.model_dump(mode="json") for solution in solutions],
+                    "solver": solver_debug_payload or {},
                     "timing": {
                         "fetchDemMs": round(fetch_dem_ms, 3),
                         "buildGridMs": round(build_grid_ms, 3),

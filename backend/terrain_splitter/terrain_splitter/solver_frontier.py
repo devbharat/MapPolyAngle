@@ -36,22 +36,31 @@ from .schemas import FlightParamsModel, PartitionSolutionPreviewModel, RegionPre
 
 
 MAX_REGIONS = 8
-MAX_SPLIT_OPTIONS = 6
-MAX_FRONTIER_STATES = 14
+MAX_SPLIT_OPTIONS = 8
+MAX_FRONTIER_STATES = 20
 MIN_CHILD_AREA_FRACTION = 0.14
 COARSE_NON_LARGEST_FRACTION_MIN = 0.22
-INTER_REGION_TRANSITION_SEC = 35.0
-REGION_COUNT_PENALTY = 0.012
+INTER_REGION_TRANSITION_SEC = 45.0
+REGION_COUNT_PENALTY = 0.02
 DOMINANCE_EPS = 1e-6
 DEFAULT_BASIC_LINE_LENGTH_SCALE = 0.35
 DEFAULT_PRACTICAL_LINE_LENGTH_SCALE = 0.40
+LINE_LENGTH_NEAR_MISS_RATIO_BASIC = 0.10
+LINE_LENGTH_NEAR_MISS_RATIO_PRACTICAL = 0.08
+LINE_LENGTH_NEAR_MISS_MIN_M = 12.0
+LINE_LENGTH_NEAR_MISS_MAX_M = 30.0
 RELAXED_HARD_MIN_MEAN_LINE_LENGTH_M = 20.0
 RELAXED_FALLBACK_TIME_DIVISOR_SEC = 7_500.0
 RELAXED_FALLBACK_SOFT_TOTAL_WEIGHT = 0.01
 RELAXED_FALLBACK_SOFT_MAX_WEIGHT = 0.002
 MAX_RELAXED_FALLBACK_CANDIDATES = 6
+PRACTICAL_FRONTIER_BUCKET_KEEP = 5
+NON_PRACTICAL_FRONTIER_BUCKET_KEEP = 3
+SPLIT_RANK_TIME_DIVISOR_SEC = 6_000.0
+SPLIT_NON_IMPROVING_MAX_QUALITY_REGRESSION = 0.03
+SPLIT_NON_IMPROVING_MIN_RANK_SCORE = -0.02
 DEFAULT_DEPTH_SMALL = 3
-DEFAULT_DEPTH_LARGE = 2
+DEFAULT_DEPTH_LARGE = 3
 SPLIT_QUANTILES = (0.20, 0.25, 0.33, 0.40, 0.50, 0.60, 0.67, 0.75, 0.80)
 OUTPUT_RING_SIMPLIFY_FACTOR = 0.4
 OUTPUT_RING_SIMPLIFY_MIN_M = 6.0
@@ -324,6 +333,11 @@ def _capture_efficiency(objective: RegionObjective) -> float:
     )
 
 
+def _line_length_tolerance_m(min_line_length_m: float, *, practical: bool) -> float:
+    ratio = LINE_LENGTH_NEAR_MISS_RATIO_PRACTICAL if practical else LINE_LENGTH_NEAR_MISS_RATIO_BASIC
+    return clamp(min_line_length_m * ratio, LINE_LENGTH_NEAR_MISS_MIN_M, LINE_LENGTH_NEAR_MISS_MAX_M)
+
+
 def _region_gate_thresholds(*, practical: bool, line_length_scale: float) -> dict[str, float]:
     return {
         "min_child_fraction": MIN_CHILD_AREA_FRACTION,
@@ -351,6 +365,8 @@ def _region_gate_diagnostics(
         thresholds["line_length_floor_m"],
         thresholds["line_length_scale"] * line_length_span,
     )
+    line_length_shortfall = max(0.0, min_line_length - region.objective.mean_line_length_m)
+    line_length_tolerance = _line_length_tolerance_m(min_line_length, practical=practical)
     return {
         "hard_invalid": region.hard_invalid,
         "fraction": fraction,
@@ -359,6 +375,9 @@ def _region_gate_diagnostics(
         "min_flight_line_count": int(thresholds["min_flight_line_count"]),
         "mean_line_length_m": region.objective.mean_line_length_m,
         "min_line_length_m": min_line_length,
+        "line_length_shortfall_m": line_length_shortfall,
+        "line_length_tolerance_m": line_length_tolerance,
+        "line_length_near_miss_allowed": 0.0 < line_length_shortfall <= line_length_tolerance,
         "along_track_length_m": region.objective.along_track_length_m,
         "cross_track_width_m": region.objective.cross_track_width_m,
         "convexity": region.objective.convexity,
@@ -382,8 +401,6 @@ def _region_gate_failure_margins(diagnostics: dict[str, float | int | bool], *, 
         failures["min_child_fraction"] = float(diagnostics["min_child_fraction"] - diagnostics["fraction"])
     if diagnostics["flight_line_count"] < diagnostics["min_flight_line_count"]:
         failures["flight_line_count"] = float(diagnostics["min_flight_line_count"] - diagnostics["flight_line_count"])
-    if diagnostics["mean_line_length_m"] < diagnostics["min_line_length_m"]:
-        failures["mean_line_length_m"] = float(diagnostics["min_line_length_m"] - diagnostics["mean_line_length_m"])
     if diagnostics["convexity"] < diagnostics["min_convexity"]:
         failures["convexity"] = float(diagnostics["min_convexity"] - diagnostics["convexity"])
     if diagnostics["compactness"] > diagnostics["max_compactness"]:
@@ -394,6 +411,11 @@ def _region_gate_failure_margins(diagnostics: dict[str, float | int | bool], *, 
         failures["overflight_transit_fraction"] = float(
             diagnostics["overflight_transit_fraction"] - diagnostics["max_overflight_transit_fraction"]
         )
+    line_length_shortfall = float(diagnostics["line_length_shortfall_m"])
+    if line_length_shortfall > 0.0:
+        line_length_tolerance = float(diagnostics["line_length_tolerance_m"])
+        if line_length_shortfall > line_length_tolerance or failures:
+            failures["mean_line_length_m"] = line_length_shortfall
     return failures
 
 
@@ -467,6 +489,188 @@ def _summarize_diagnostic_value(value: Any) -> Any:
     if isinstance(value, float):
         return round(value, 4)
     return value
+
+
+def _rounded_debug_mapping(values: dict[str, Any]) -> dict[str, Any]:
+    return {key: _summarize_diagnostic_value(value) for key, value in values.items()}
+
+
+def _rejection_debug_payload(
+    *,
+    caches: SolverCaches,
+    basic_line_length_scale: float,
+    practical_line_length_scale: float,
+    practical_plan_rejection_summary: dict[str, Any],
+    practical_region_rejection_summary: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "basicRegionValidity": {
+            "thresholds": _region_gate_thresholds(practical=False, line_length_scale=basic_line_length_scale),
+            **caches.basic_rejection_summary,
+        },
+        "basicSplitValidity": {
+            "thresholds": _region_gate_thresholds(practical=False, line_length_scale=basic_line_length_scale),
+            **caches.basic_split_rejection_summary,
+        },
+        "practicalPlan": {
+            "thresholds": _plan_gate_thresholds(),
+            **practical_plan_rejection_summary,
+        },
+        "practicalRegion": {
+            "thresholds": _region_gate_thresholds(practical=True, line_length_scale=practical_line_length_scale),
+            **practical_region_rejection_summary,
+        },
+    }
+
+
+def _plan_debug_signature(plan: PartitionPlan) -> str:
+    return hash_signature(
+        {
+            "regions": [
+                {
+                    "cellIds": list(region.cell_ids),
+                    "bearingDeg": round(region.objective.bearing_deg, 4),
+                }
+                for region in plan.regions
+            ]
+        }
+    )
+
+
+def _serialize_plan_debug_snapshot(
+    plan: PartitionPlan,
+    root_area_m2: float,
+    *,
+    line_length_scale: float,
+) -> dict[str, Any]:
+    diagnostics = _plan_gate_diagnostics(plan, root_area_m2, line_length_scale=line_length_scale)
+    plan_failures, region_failures = _plan_gate_failure_margins(diagnostics)
+    region_failure_lookup = {
+        index: {
+            "diagnostics": region_diag,
+            "failures": failures,
+        }
+        for index, region_diag, failures in region_failures
+    }
+    regions: list[dict[str, Any]] = []
+    for index, (region, region_diag) in enumerate(zip(plan.regions, diagnostics["region_diagnostics"], strict=True)):
+        failure_payload = region_failure_lookup.get(index, {})
+        regions.append(
+            {
+                "regionIndex": index,
+                "areaM2": round(region.objective.area_m2, 3),
+                "bearingDeg": round(region.objective.bearing_deg, 4),
+                "atomCount": len(region.cell_ids),
+                "captureEfficiency": _summarize_diagnostic_value(region_diag["capture_efficiency"]),
+                "meanLineLengthM": _summarize_diagnostic_value(region_diag["mean_line_length_m"]),
+                "minLineLengthM": _summarize_diagnostic_value(region_diag["min_line_length_m"]),
+                "lineLengthShortfallM": _summarize_diagnostic_value(region_diag["line_length_shortfall_m"]),
+                "lineLengthToleranceM": _summarize_diagnostic_value(region_diag["line_length_tolerance_m"]),
+                "lineLengthNearMissAllowed": bool(region_diag["line_length_near_miss_allowed"]),
+                "convexity": _summarize_diagnostic_value(region_diag["convexity"]),
+                "compactness": _summarize_diagnostic_value(region_diag["compactness"]),
+                "overflightTransitFraction": _summarize_diagnostic_value(region_diag["overflight_transit_fraction"]),
+                "failures": _rounded_debug_mapping(failure_payload.get("failures", {})),
+            }
+        )
+    return {
+        "signature": _plan_debug_signature(plan),
+        "regionCount": plan.region_count,
+        "qualityCost": round(plan.quality_cost, 6),
+        "missionTimeSec": round(plan.mission_time_sec, 3),
+        "largestRegionFraction": round(plan.largest_region_fraction, 4),
+        "meanConvexity": round(plan.mean_convexity, 4),
+        "boundaryBreakAlignment": round(_plan_boundary_alignment(plan), 4),
+        "isPractical": not plan_failures,
+        "planFailures": _rounded_debug_mapping(plan_failures),
+        "regions": regions,
+    }
+
+
+def _populate_solver_debug_output(
+    debug_output: dict[str, Any] | None,
+    *,
+    request_id: str | None,
+    polygon_id: str | None,
+    grid: GridData,
+    requested_tradeoff: float | None,
+    max_depth: int,
+    basic_line_length_scale: float,
+    practical_line_length_scale: float,
+    caches: SolverCaches,
+    perf: dict[str, float],
+    all_plans: list[PartitionPlan],
+    practical_plans: list[PartitionPlan],
+    returned_plans: list[PartitionPlan],
+    returned_previews: list[PartitionSolutionPreviewModel],
+    practical_plan_rejection_summary: dict[str, Any],
+    practical_region_rejection_summary: dict[str, Any],
+    relaxed_fallback: list[RelaxedFallbackCandidate] | None = None,
+) -> None:
+    if debug_output is None:
+        return
+    root_area_m2 = max(1.0, grid.area_m2)
+    debug_output.clear()
+    debug_output.update(
+        {
+            "solverSummary": {
+                "requestId": request_id,
+                "polygonId": polygon_id,
+                "requestedTradeoff": requested_tradeoff,
+                "gridCellCount": len(grid.cells),
+                "gridEdgeCount": len(grid.edges),
+                "gridStepM": round(grid.grid_step_m, 4),
+                "maxDepth": max_depth,
+                "counts": {
+                    "allPlans": len(all_plans),
+                    "practicalPlans": len(practical_plans),
+                    "returnedSolutions": len(returned_previews),
+                    "relaxedFallbackCandidates": len(relaxed_fallback or []),
+                },
+                "constants": {
+                    "maxSplitOptions": MAX_SPLIT_OPTIONS,
+                    "maxFrontierStates": MAX_FRONTIER_STATES,
+                    "interRegionTransitionSec": INTER_REGION_TRANSITION_SEC,
+                    "regionCountPenalty": REGION_COUNT_PENALTY,
+                    "defaultDepthSmall": DEFAULT_DEPTH_SMALL,
+                    "defaultDepthLarge": DEFAULT_DEPTH_LARGE,
+                    "basicLineLengthScale": basic_line_length_scale,
+                    "practicalLineLengthScale": practical_line_length_scale,
+                    "lineLengthNearMissRatioBasic": LINE_LENGTH_NEAR_MISS_RATIO_BASIC,
+                    "lineLengthNearMissRatioPractical": LINE_LENGTH_NEAR_MISS_RATIO_PRACTICAL,
+                },
+                "performance": _rounded_debug_mapping(dict(perf)),
+            },
+            "rejectionDiagnostics": _rejection_debug_payload(
+                caches=caches,
+                basic_line_length_scale=basic_line_length_scale,
+                practical_line_length_scale=practical_line_length_scale,
+                practical_plan_rejection_summary=practical_plan_rejection_summary,
+                practical_region_rejection_summary=practical_region_rejection_summary,
+            ),
+            "returnedPreviewSignatures": [preview.signature for preview in returned_previews],
+            "returnedPlans": [
+                _serialize_plan_debug_snapshot(plan, root_area_m2, line_length_scale=practical_line_length_scale)
+                for plan in returned_plans
+            ],
+            "practicalPlanSample": [
+                _serialize_plan_debug_snapshot(plan, root_area_m2, line_length_scale=practical_line_length_scale)
+                for plan in practical_plans[: min(len(practical_plans), 12)]
+            ],
+        }
+    )
+    if relaxed_fallback:
+        debug_output["relaxedFallback"] = [
+            {
+                "signature": _plan_debug_signature(candidate.plan),
+                "directionDeg": round(candidate.direction_deg, 4),
+                "threshold": round(candidate.threshold, 4),
+                "softTotalMargin": round(candidate.soft_total_margin, 4),
+                "softMaxMargin": round(candidate.soft_max_margin, 4),
+                "fallbackScore": round(candidate.fallback_score, 6),
+            }
+            for candidate in relaxed_fallback
+        ]
 
 
 def _update_failure_summary(
@@ -768,15 +972,36 @@ def _thin_frontier(plans: list[PartitionPlan], root_area_m2: float, line_length_
         baseline_bucket.sort(key=lambda plan: (plan.mission_time_sec, plan.quality_cost))
         retained.extend(baseline_bucket[:1])
 
+    def append_unique(bucket_retained: list[PartitionPlan], source: list[PartitionPlan], limit: int) -> None:
+        seen = {_plan_signature(plan) for plan in bucket_retained}
+        for plan in source:
+            signature = _plan_signature(plan)
+            if signature in seen:
+                continue
+            bucket_retained.append(plan)
+            seen.add(signature)
+            if len(bucket_retained) >= limit:
+                break
+
     for region_count, bucket in practical_buckets.items():
-        bucket.sort(key=lambda plan: (plan.quality_cost, plan.mission_time_sec))
-        retained.extend(bucket[:4])
+        quality_sorted = sorted(bucket, key=lambda plan: (plan.quality_cost, plan.mission_time_sec))
+        time_sorted = sorted(bucket, key=lambda plan: (plan.mission_time_sec, plan.quality_cost))
+        bucket_retained: list[PartitionPlan] = []
+        append_unique(bucket_retained, quality_sorted[:1], PRACTICAL_FRONTIER_BUCKET_KEEP)
+        append_unique(bucket_retained, time_sorted[:1], PRACTICAL_FRONTIER_BUCKET_KEEP)
+        append_unique(bucket_retained, quality_sorted, PRACTICAL_FRONTIER_BUCKET_KEEP)
+        retained.extend(bucket_retained[:PRACTICAL_FRONTIER_BUCKET_KEEP])
 
     remaining = max(0, MAX_FRONTIER_STATES - len(retained))
     if remaining > 0:
         for region_count, bucket in non_practical_buckets.items():
-            bucket.sort(key=lambda plan: (plan.quality_cost, plan.mission_time_sec))
-            retained.extend(bucket[: min(2, remaining)])
+            quality_sorted = sorted(bucket, key=lambda plan: (plan.quality_cost, plan.mission_time_sec))
+            time_sorted = sorted(bucket, key=lambda plan: (plan.mission_time_sec, plan.quality_cost))
+            bucket_retained: list[PartitionPlan] = []
+            append_unique(bucket_retained, quality_sorted[:1], NON_PRACTICAL_FRONTIER_BUCKET_KEEP)
+            append_unique(bucket_retained, time_sorted[:1], NON_PRACTICAL_FRONTIER_BUCKET_KEEP)
+            append_unique(bucket_retained, quality_sorted, NON_PRACTICAL_FRONTIER_BUCKET_KEEP)
+            retained.extend(bucket_retained[: min(NON_PRACTICAL_FRONTIER_BUCKET_KEEP, remaining)])
             remaining = max(0, MAX_FRONTIER_STATES - len(retained))
             if remaining <= 0:
                 break
@@ -1547,8 +1772,13 @@ def _generate_split_candidates(
             immediate_plan = _plan_from_regions((left_region, right_region), boundary.shared_boundary_m, boundary.break_weight_sum)
             quality_gain = baseline_plan.quality_cost - immediate_plan.quality_cost
             time_delta = immediate_plan.mission_time_sec - baseline_plan.mission_time_sec
-            rank_score = quality_gain - max(0.0, time_delta) / 7_500.0 + boundary_alignment / 28.0 - abs(left_fraction - right_fraction) * 0.2
-            if quality_gain <= 0.0 and rank_score <= 0.05:
+            rank_score = (
+                quality_gain
+                - max(0.0, time_delta) / SPLIT_RANK_TIME_DIVISOR_SEC
+                + boundary_alignment / 28.0
+                - abs(left_fraction - right_fraction) * 0.2
+            )
+            if quality_gain <= -SPLIT_NON_IMPROVING_MAX_QUALITY_REGRESSION and rank_score <= SPLIT_NON_IMPROVING_MIN_RANK_SCORE:
                 perf["split_non_improving_rejections"] += 1
                 continue
             candidates.append(
@@ -2318,6 +2548,7 @@ def solve_partition_hierarchy(
     root_parallel_mode: Literal["process", "lambda"] | None = None,
     root_parallel_granularity: Literal["branch", "subtree"] | None = None,
     line_length_scale: float | None = None,
+    debug_output: dict[str, Any] | None = None,
 ) -> list[PartitionSolutionPreviewModel]:
     practical_line_length_scale = (
         DEFAULT_PRACTICAL_LINE_LENGTH_SCALE if line_length_scale is None else float(line_length_scale)
@@ -2514,6 +2745,24 @@ def solve_partition_hierarchy(
             int(perf["split_attempts"]),
             int(perf["split_candidates_kept"]),
         )
+        _populate_solver_debug_output(
+            debug_output,
+            request_id=request_id,
+            polygon_id=polygon_id,
+            grid=grid,
+            requested_tradeoff=requested_tradeoff,
+            max_depth=max_depth,
+            basic_line_length_scale=basic_line_length_scale,
+            practical_line_length_scale=practical_line_length_scale,
+            caches=caches,
+            perf=perf,
+            all_plans=[],
+            practical_plans=[],
+            returned_plans=[],
+            returned_previews=[],
+            practical_plan_rejection_summary={},
+            practical_region_rejection_summary={},
+        )
         return []
 
     baseline = min(
@@ -2635,30 +2884,39 @@ def solve_partition_hierarchy(
                         ],
                     )
                 )
+            _populate_solver_debug_output(
+                debug_output,
+                request_id=request_id,
+                polygon_id=polygon_id,
+                grid=grid,
+                requested_tradeoff=requested_tradeoff,
+                max_depth=max_depth,
+                basic_line_length_scale=basic_line_length_scale,
+                practical_line_length_scale=practical_line_length_scale,
+                caches=caches,
+                perf=perf,
+                all_plans=all_plans,
+                practical_plans=practical_filtered,
+                returned_plans=practical_filtered,
+                returned_previews=previews,
+                practical_plan_rejection_summary=practical_plan_rejection_summary,
+                practical_region_rejection_summary=practical_region_rejection_summary,
+                relaxed_fallback=relaxed_fallback,
+            )
             return previews
+        rejection_payload = _rejection_debug_payload(
+            caches=caches,
+            basic_line_length_scale=basic_line_length_scale,
+            practical_line_length_scale=practical_line_length_scale,
+            practical_plan_rejection_summary=practical_plan_rejection_summary,
+            practical_region_rejection_summary=practical_region_rejection_summary,
+        )
         logger.info(
             "[terrain-split-backend][%s] rejection diagnostics polygonId=%s details=%s",
             request_id or "<none>",
             polygon_id or "<none>",
             json.dumps(
-                {
-                    "basicRegionValidity": {
-                        "thresholds": _region_gate_thresholds(practical=False, line_length_scale=basic_line_length_scale),
-                        **caches.basic_rejection_summary,
-                    },
-                    "basicSplitValidity": {
-                        "thresholds": _region_gate_thresholds(practical=False, line_length_scale=basic_line_length_scale),
-                        **caches.basic_split_rejection_summary,
-                    },
-                    "practicalPlan": {
-                        "thresholds": _plan_gate_thresholds(),
-                        **practical_plan_rejection_summary,
-                    },
-                    "practicalRegion": {
-                        "thresholds": _region_gate_thresholds(practical=True, line_length_scale=practical_line_length_scale),
-                        **practical_region_rejection_summary,
-                    },
-                },
+                rejection_payload,
                 sort_keys=True,
             ),
         )
@@ -2713,6 +2971,24 @@ def solve_partition_hierarchy(
             int(perf["combined_plan_candidates"]),
             int(perf["frontier_plan_count"]),
         )
+        _populate_solver_debug_output(
+            debug_output,
+            request_id=request_id,
+            polygon_id=polygon_id,
+            grid=grid,
+            requested_tradeoff=requested_tradeoff,
+            max_depth=max_depth,
+            basic_line_length_scale=basic_line_length_scale,
+            practical_line_length_scale=practical_line_length_scale,
+            caches=caches,
+            perf=perf,
+            all_plans=all_plans,
+            practical_plans=[],
+            returned_plans=[],
+            returned_previews=[],
+            practical_plan_rejection_summary=practical_plan_rejection_summary,
+            practical_region_rejection_summary=practical_region_rejection_summary,
+        )
         return []
 
     comparison_pool = practical[:]
@@ -2725,6 +3001,24 @@ def solve_partition_hierarchy(
         if plan.region_count > 1 and _plan_is_practical(plan, root_area_m2, practical_line_length_scale)
     ]
     if not practical_filtered:
+        _populate_solver_debug_output(
+            debug_output,
+            request_id=request_id,
+            polygon_id=polygon_id,
+            grid=grid,
+            requested_tradeoff=requested_tradeoff,
+            max_depth=max_depth,
+            basic_line_length_scale=basic_line_length_scale,
+            practical_line_length_scale=practical_line_length_scale,
+            caches=caches,
+            perf=perf,
+            all_plans=all_plans,
+            practical_plans=practical,
+            returned_plans=[],
+            returned_previews=[],
+            practical_plan_rejection_summary=practical_plan_rejection_summary,
+            practical_region_rejection_summary=practical_region_rejection_summary,
+        )
         return []
 
     best_two_region = min(
@@ -2805,24 +3099,13 @@ def solve_partition_hierarchy(
         request_id or "<none>",
         polygon_id or "<none>",
         json.dumps(
-            {
-                "basicRegionValidity": {
-                    "thresholds": _region_gate_thresholds(practical=False, line_length_scale=basic_line_length_scale),
-                    **caches.basic_rejection_summary,
-                },
-                "basicSplitValidity": {
-                    "thresholds": _region_gate_thresholds(practical=False, line_length_scale=basic_line_length_scale),
-                    **caches.basic_split_rejection_summary,
-                },
-                "practicalPlan": {
-                    "thresholds": _plan_gate_thresholds(),
-                    **practical_plan_rejection_summary,
-                },
-                "practicalRegion": {
-                    "thresholds": _region_gate_thresholds(practical=True, line_length_scale=practical_line_length_scale),
-                    **practical_region_rejection_summary,
-                },
-            },
+            _rejection_debug_payload(
+                caches=caches,
+                basic_line_length_scale=basic_line_length_scale,
+                practical_line_length_scale=practical_line_length_scale,
+                practical_plan_rejection_summary=practical_plan_rejection_summary,
+                practical_region_rejection_summary=practical_region_rejection_summary,
+            ),
             sort_keys=True,
         ),
     )
@@ -2885,5 +3168,23 @@ def solve_partition_hierarchy(
         int(perf["split_non_improving_rejections"]),
         int(perf["combined_plan_candidates"]),
         int(perf["frontier_plan_count"]),
+    )
+    _populate_solver_debug_output(
+        debug_output,
+        request_id=request_id,
+        polygon_id=polygon_id,
+        grid=grid,
+        requested_tradeoff=requested_tradeoff,
+        max_depth=max_depth,
+        basic_line_length_scale=basic_line_length_scale,
+        practical_line_length_scale=practical_line_length_scale,
+        caches=caches,
+        perf=perf,
+        all_plans=all_plans,
+        practical_plans=practical,
+        returned_plans=practical_filtered,
+        returned_previews=previews,
+        practical_plan_rejection_summary=practical_plan_rejection_summary,
+        practical_region_rejection_summary=practical_region_rejection_summary,
     )
     return previews

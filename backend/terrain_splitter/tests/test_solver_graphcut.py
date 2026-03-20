@@ -10,6 +10,7 @@ from terrain_splitter.geometry import simplify_polygon_coverage
 from terrain_splitter.grid import GridCell, GridData, GridEdge
 from terrain_splitter.schemas import FlightParamsModel
 from terrain_splitter.solver_frontier import (
+    DEFAULT_DEPTH_LARGE,
     BoundaryStats,
     EvaluatedRegion,
     RootSplitTask,
@@ -453,6 +454,77 @@ def test_relaxed_region_failure_sets_treat_scaled_line_length_as_soft() -> None:
 
     assert "mean_line_length_hard_floor_m" not in hard_failures
     assert "mean_line_length_m" in soft_failures
+
+
+def test_region_practical_accepts_small_line_length_near_miss_when_other_gates_pass() -> None:
+    region = _mock_region(500.0, 260.0, region_id=13)
+    objective = replace(
+        region.objective,
+        cross_track_width_m=700.0,
+        mean_line_length_m=260.0,
+    )
+    adjusted_region = region.__class__(
+        cell_ids=region.cell_ids,
+        polygon=region.polygon,
+        ring=region.ring,
+        objective=objective,
+        score=region.score,
+        hard_invalid=region.hard_invalid,
+    )
+
+    diagnostics = _region_gate_diagnostics(adjusted_region, 1_000.0, practical=True, line_length_scale=0.4)
+
+    assert diagnostics["line_length_shortfall_m"] == 20.0
+    assert diagnostics["line_length_near_miss_allowed"] is True
+    assert _region_practical(adjusted_region, 1_000.0, 0.4)
+
+
+def test_region_practical_rejects_large_line_length_miss_even_without_other_gates() -> None:
+    region = _mock_region(500.0, 230.0, region_id=14)
+    objective = replace(
+        region.objective,
+        cross_track_width_m=700.0,
+        mean_line_length_m=230.0,
+    )
+    adjusted_region = region.__class__(
+        cell_ids=region.cell_ids,
+        polygon=region.polygon,
+        ring=region.ring,
+        objective=objective,
+        score=region.score,
+        hard_invalid=region.hard_invalid,
+    )
+
+    diagnostics = _region_gate_diagnostics(adjusted_region, 1_000.0, practical=True, line_length_scale=0.4)
+
+    assert diagnostics["line_length_shortfall_m"] == 50.0
+    assert diagnostics["line_length_near_miss_allowed"] is False
+    assert not _region_practical(adjusted_region, 1_000.0, 0.4)
+
+
+def test_solver_populates_debug_output_with_returned_plan_snapshots() -> None:
+    grid = _multimodal_grid()
+    feature_field = FeatureField(
+        cells=[
+            CellFeatures(index=index, preferred_bearing_deg=(0 if (index % 4) < 2 else 90), slope_magnitude=0.25, break_strength=18, confidence=0.9, aspect_deg=(270 if (index % 4) < 2 else 0))
+            for index in range(8)
+        ],
+        dominant_preferred_bearing_deg=45,
+    )
+    params = FlightParamsModel(payloadKind="camera", altitudeAGL=120, frontOverlap=70, sideOverlap=70, cameraKey="MAP61_17MM")
+    debug_output: dict[str, object] = {}
+
+    solutions = solve_partition_hierarchy(grid, feature_field, params, debug_output=debug_output)
+
+    assert solutions
+    assert debug_output["solverSummary"]
+    assert debug_output["rejectionDiagnostics"]
+    assert debug_output["returnedPlans"]
+    assert len(debug_output["returnedPlans"]) == len(solutions)
+
+
+def test_large_root_default_depth_is_three() -> None:
+    assert DEFAULT_DEPTH_LARGE == 3
 
 
 def test_relaxed_fallback_score_penalizes_quality_and_time_regression() -> None:
