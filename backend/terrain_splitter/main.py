@@ -5,7 +5,6 @@ from mangum import Mangum
 from terrain_splitter.app import app
 from terrain_splitter.solver_frontier import solve_root_split_branch_event, solve_subtree_task_event
 
-
 # Lambda Function URL / API Gateway entrypoint for the terrain splitter backend.
 _http_handler = Mangum(app, lifespan="off")
 

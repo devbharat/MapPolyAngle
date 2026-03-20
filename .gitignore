@@ -16,3 +16,16 @@ backend/terrain_splitter/.cache/
 backend/terrain_splitter/.debug/
 backend/terrain_splitter/.aws-sam/
 .aws-sam/
+
+# Local planning / status notes
+/PLAN.md
+/backend_region_objective_cache_plan.md
+/lidar_camera_node_cost_plan.md
+/lidar_fidelity_improvement_plan.md
+/line_lift_objective_plan.md
+/problem_formulation.md
+/terrain_face_partition_plan.md
+/terrain_partition_boundary_cost_plan.md
+/terrain_partition_current_state.md
+/terrain_partition_tradeoff_design.md
+/wingtra_lidar_plan.md

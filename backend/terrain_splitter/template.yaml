@@ -25,6 +25,22 @@ Parameters:
       - branch
       - subtree
     Description: Whether Lambda fan-out dispatches whole root branches or individual left/right subtrees.
+  RootParallelMaxInflight:
+    Type: Number
+    Default: 16
+    Description: Maximum number of internal Lambda self-invocations allowed in flight at once during root fan-out.
+  LambdaInvokeReadTimeoutSec:
+    Type: Number
+    Default: 300
+    Description: Read timeout in seconds for synchronous internal Lambda self-invokes used during root fan-out.
+  NestedLambdaMinCells:
+    Type: Number
+    Default: 64
+    Description: Minimum subtree cell count required before a subtree worker is allowed to fan out again via Lambda.
+  NestedLambdaMaxInflight:
+    Type: Number
+    Default: 8
+    Description: Maximum number of nested Lambda subtree self-invocations allowed in flight per worker.
 
 Globals:
   Function:
@@ -42,6 +58,10 @@ Globals:
         TERRAIN_SPLITTER_ROOT_PARALLEL_MODE: "lambda"
         TERRAIN_SPLITTER_ROOT_PARALLEL_WORKERS: !Ref RootParallelWorkers
         TERRAIN_SPLITTER_ROOT_PARALLEL_GRANULARITY: !Ref RootParallelGranularity
+        TERRAIN_SPLITTER_ROOT_PARALLEL_MAX_INFLIGHT: !Ref RootParallelMaxInflight
+        TERRAIN_SPLITTER_LAMBDA_INVOKE_READ_TIMEOUT_SEC: !Ref LambdaInvokeReadTimeoutSec
+        TERRAIN_SPLITTER_NESTED_LAMBDA_MIN_CELLS: !Ref NestedLambdaMinCells
+        TERRAIN_SPLITTER_NESTED_LAMBDA_MAX_INFLIGHT: !Ref NestedLambdaMaxInflight
         PYTHONPATH: /var/task
 
 Resources:

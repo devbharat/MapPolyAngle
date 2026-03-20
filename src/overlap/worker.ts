@@ -49,44 +49,44 @@ function cropCenter(src: Uint8Array, sizePad: number, size: number, pad: number)
 }
 
 // --- Convert terrain elevations from EGM96 geoid to WGS84 ellipsoid ---
-/** 
+/**
  * Converts Mapbox Terrain-RGB elevations (EGM96 geoid) to WGS84 ellipsoid heights.
  * This ensures vertical datum consistency with DJI pose Z coordinates.
  */
 function convertElevationsToWGS84Ellipsoid(
-  elevEGM96: Float32Array, 
-  size: number, 
+  elevEGM96: Float32Array,
+  size: number,
   tx: { minX: number; maxX: number; minY: number; maxY: number }
 ): Float32Array {
   const elevWGS84 = new Float32Array(size * size);
   const pixelSize = (tx.maxX - tx.minX) / size;
-  
+
   // Convert Web Mercator bounds to lat/lon for each pixel
   const R = 6378137; // WGS84 equatorial radius
-  
+
   for (let row = 0; row < size; row++) {
     for (let col = 0; col < size; col++) {
       const idx = row * size + col;
-      
+
       // Get Web Mercator coordinates for this pixel center
       const x = tx.minX + (col + 0.5) * pixelSize;
       const y = tx.maxY - (row + 0.5) * pixelSize; // Note: y decreases as row increases
-      
+
       // Convert Web Mercator to WGS84 lat/lon
       const lon = (x / R) * (180 / Math.PI);
       const lat = Math.atan(Math.sinh(y / R)) * (180 / Math.PI);
-      
+
       // Get original EGM96 elevation
       const elevEGM96Value = elevEGM96[idx];
-      
+
       // Convert from EGM96 geoid to WGS84 ellipsoid
       // egm96.egm96ToEllipsoid(lat, lon, heightAboveGeoid) returns height above ellipsoid
       const elevWGS84Value = egm96.egm96ToEllipsoid(lat, lon, elevEGM96Value);
-      
+
       elevWGS84[idx] = elevWGS84Value;
     }
   }
-  
+
   return elevWGS84;
 }
 
@@ -244,7 +244,7 @@ self.onmessage = (ev: MessageEvent<Msg>) => {
   const elevEGM96 = decodeTerrainRGBToElev(data, size);
   const tileBounds = tileMetersBounds(z, x, y);
   const elevWGS84 = convertElevationsToWGS84Ellipsoid(elevEGM96, size, tileBounds);
-  
+
   // Now use elevWGS84 instead of raw elevEGM96 for all calculations
   const elev = elevWGS84;
 
@@ -275,7 +275,7 @@ self.onmessage = (ev: MessageEvent<Msg>) => {
   for (let c=0;c<size;c++) xwColRaw[c] = minXRaw + (c+0.5)*pixSizeRaw;
   for (let r=0;r<size;r++) ywRowRaw[r] = maxYRaw - (r+0.5)*pixSizeRaw;
   const cosLatPerRow = new Float64Array(size);
-  for (let r=0;r<size;r++){ const latRad=Math.atan(Math.sinh(ywRowRaw[r]/Rm)); cosLatPerRow[r]=Math.cos(latRad);}  
+  for (let r=0;r<size;r++){ const latRad=Math.atan(Math.sinh(ywRowRaw[r]/Rm)); cosLatPerRow[r]=Math.cos(latRad);}
 
   // Mercator scale correction (approx): convert x/y to local ground meters
   const latCenter = Math.atan(Math.sinh(((tx.minY + tx.maxY) * 0.5) / Rm));
@@ -405,7 +405,7 @@ self.onmessage = (ev: MessageEvent<Msg>) => {
       const dx2 = xw - p.x, dy2 = yw - p.y; if (dx2*dx2 + dy2*dy2 > p.radiusSq) continue;
       const camIdx = p.camIndex; const cam = camModels[camIdx];
       const camHit = camRayToPixel(cam, p.RT, p.x, p.y, p.z, xw, yw, zw); if (!camHit) continue;
-      
+
       // --- Jacobian-based surface GSD (pinhole-correct) ---
       const vz = (zw - p.z);
       const L = Math.hypot(dx2, dy2, vz);
@@ -455,7 +455,7 @@ self.onmessage = (ev: MessageEvent<Msg>) => {
       const gsdx = Math.hypot(Jux, Juy, Juz) * sx;
       const gsdy = Math.hypot(Jvx, Jvy, Jvz) * sy;
       const gsd = Math.sqrt(gsdx * gsdy);
-      
+
       // Debug logging (optional)
       // if (poseIdx < 3) console.log(`GSD for pose ${poseIdx}: ${gsd.toFixed(4)}m (gsdx: ${gsdx.toFixed(4)}, gsdy: ${gsdy.toFixed(4)})`);
        const globalPoseIndex = poseIdx; for (let pi=0; pi<polysHere.length; pi++) poseHitsPerPoly[polysHere[pi]].add(globalPoseIndex);

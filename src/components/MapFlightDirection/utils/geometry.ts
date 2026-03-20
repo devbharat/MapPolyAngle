@@ -8,7 +8,6 @@
 
 import {
   queryElevationAtPoint,
-  queryMaxElevationAlongLine,
   destination as geoDestination,
   calculateBearing as geoBearing,
   TerrainTile,
@@ -26,39 +25,30 @@ function convertElevationToWGS84(lat: number, lng: number, elevationEGM96: numbe
 }
 
 /**
- * Query elevation at a point and convert to WGS84 ellipsoid
- */
-function queryElevationAtPointWGS84(lng: number, lat: number, tiles: TerrainTile[]): number {
-  const elevationEGM96 = queryElevationAtPoint(lng, lat, tiles);
-  if (!Number.isFinite(elevationEGM96)) return elevationEGM96;
-  return convertElevationToWGS84(lat, lng, elevationEGM96);
-}
-
-/**
  * Query maximum elevation along a line and convert to WGS84 ellipsoid
  */
 function queryMaxElevationAlongLineWGS84(
-  startLng: number, 
-  startLat: number, 
-  endLng: number, 
-  endLat: number, 
-  tiles: TerrainTile[], 
+  startLng: number,
+  startLat: number,
+  endLng: number,
+  endLat: number,
+  tiles: TerrainTile[],
   samples: number = 20
 ): number {
   let maxElevationWGS84 = -Infinity;
-  
+
   for (let i = 0; i <= samples; i++) {
     const t = i / samples;
     const lng = startLng + t * (endLng - startLng);
     const lat = startLat + t * (endLat - startLat);
-    
+
     const elevationEGM96 = queryElevationAtPoint(lng, lat, tiles);
     if (Number.isFinite(elevationEGM96)) {
       const elevationWGS84 = convertElevationToWGS84(lat, lng, elevationEGM96);
       maxElevationWGS84 = Math.max(maxElevationWGS84, elevationWGS84);
     }
   }
-  
+
   return Number.isFinite(maxElevationWGS84) ? maxElevationWGS84 : -Infinity;
 }
 
@@ -134,6 +124,65 @@ export function haversineDistance(coords1: [number, number], coords2: [number, n
   const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 
   return R * c;
+}
+
+function midpoint2D(line: number[][]): [number, number] {
+  const first = line[0] as [number, number];
+  const last = line[line.length - 1] as [number, number];
+  return [
+    (first[0] + last[0]) * 0.5,
+    (first[1] + last[1]) * 0.5,
+  ];
+}
+
+function axialBearingDeltaDeg(a: number, b: number): number {
+  const diff = ((a - b + 540) % 360) - 180;
+  return Math.abs(Math.abs(diff) > 90 ? 180 - Math.abs(diff) : diff);
+}
+
+function projectedOffsetMeters(
+  from: [number, number],
+  to: [number, number],
+  bearingDeg: number,
+): { alongTrackM: number; crossTrackM: number } {
+  const avgLatRad = ((from[1] + to[1]) * 0.5 * Math.PI) / 180;
+  const eastM = (to[0] - from[0]) * 111_320 * Math.cos(avgLatRad);
+  const northM = (to[1] - from[1]) * 110_540;
+  const bearingRad = (bearingDeg * Math.PI) / 180;
+  const alongX = Math.sin(bearingRad);
+  const alongY = Math.cos(bearingRad);
+  const crossX = Math.sin(bearingRad + Math.PI / 2);
+  const crossY = Math.cos(bearingRad + Math.PI / 2);
+  return {
+    alongTrackM: eastM * alongX + northM * alongY,
+    crossTrackM: eastM * crossX + northM * crossY,
+  };
+}
+
+function isSameSweepLine(
+  previousLine: number[][],
+  currentLine: number[][],
+  lineSpacing: number,
+): boolean {
+  if (previousLine.length < 2 || currentLine.length < 2) return false;
+
+  const previousBearing = geoBearing(
+    previousLine[0] as [number, number],
+    previousLine[previousLine.length - 1] as [number, number],
+  );
+  const currentBearing = geoBearing(
+    currentLine[0] as [number, number],
+    currentLine[currentLine.length - 1] as [number, number],
+  );
+  if (axialBearingDeltaDeg(previousBearing, currentBearing) > 10) {
+    return false;
+  }
+
+  const previousMidpoint = midpoint2D(previousLine);
+  const currentMidpoint = midpoint2D(currentLine);
+  const { alongTrackM, crossTrackM } = projectedOffsetMeters(previousMidpoint, currentMidpoint, previousBearing);
+
+  return Math.abs(crossTrackM) <= Math.max(6, lineSpacing * 0.25) && Math.abs(alongTrackM) > 2;
 }
 
 export function getPolygonBounds(ring: number[][]) {
@@ -246,7 +295,7 @@ function buildFillet(
 
   // Control distance should be proportional to the turn radius and geometry
   const controlDistance = Math.min(r, directDistance * 0.4);
-  
+
   // FIX: For tangential connections, control points must be along the line directions
   // P1_control: move from P0 in the direction of the incoming line (dir0)
   // P2_control: move from P2 in the REVERSE direction of the outgoing line (dir2)
@@ -286,7 +335,17 @@ export function build3DFlightPath(
   const minClearance = usingLegacySig ? 60 : Math.max(0, (opts as any).minClearance ?? 60);
   const turnExtendM = usingLegacySig ? 0 : Math.max(0, (opts as any).turnExtendM ?? 0);
 
+  let directionForward = true;
+  let previousRawLine: number[][] | null = null;
+
   lines.forEach((line, i) => {
+    const sameSweepAsPrevious = previousRawLine
+      ? isSameSweepLine(previousRawLine, line, lineSpacing)
+      : false;
+    if (i > 0 && !sameSweepAsPrevious) {
+      directionForward = !directionForward;
+    }
+
     // Compute min/max along the sweep line
     const { min: lineMinElev, max: lineMaxElev } = queryMinMaxElevationAlongPolylineWGS84(line as any, tiles, 20);
     // Also consider the straight extensions beyond the ends (turnaround area)
@@ -296,7 +355,6 @@ export function build3DFlightPath(
       const L0 = line[0] as [number,number];
       const L1 = line[1] as [number,number];
       const LN = line[line.length-1] as [number,number];
-      const LN1 = line[line.length-2] as [number,number];
       // Sweep bearing from first to second point
       const sweepBrg = geoBearing([L0[0], L0[1]], [L1[0], L1[1]]);
       const startExt = geoDestination([L0[0], L0[1]], (sweepBrg + 180) % 360, te);
@@ -321,7 +379,7 @@ export function build3DFlightPath(
       const a2 = Number.isFinite(extendedMax) ? (extendedMax + minClearance) : altitudeAGL;
       flightAltitude = Math.max(a1, a2);
     }
-    const coords = (i % 2 === 0 ? line : [...line].reverse()).map(
+    const coords = (directionForward ? line : [...line].reverse()).map(
       ([lng, lat]) => [lng, lat, flightAltitude] as [number, number, number]
     );
 
@@ -359,14 +417,18 @@ export function build3DFlightPath(
             fillet = fillet.map(p => [p[0], p[1], needed] as [number, number, number]);
           }
         }
-        // If extended, add straight lead-out/lead-in to meet the fillet cleanly
-        if (turnExtendM > 0) {
-          path.push([P0, startForFillet]);
-          path.push(fillet);
-          path.push([endForFillet, P2]);
-        } else {
-          path.push(fillet);
-        }
+        // Keep every inter-line transition as a single connector polyline so
+        // downstream trigger sampling can reliably skip all turns/connectors.
+        const connector = turnExtendM > 0
+          ? [
+              P0,
+              startForFillet,
+              ...fillet.slice(1, -1),
+              endForFillet,
+              P2,
+            ]
+          : fillet;
+        path.push(connector);
       } else {
         let connectorAltitude = Math.max(P0[2], P2[2]);
         if (mode === 'min-clearance') {
@@ -377,14 +439,19 @@ export function build3DFlightPath(
         if (turnExtendM > 0) {
           const p0ext = geoDestination([P0[0], P0[1]], dirPrev, turnExtendM);
           const p2ext = geoDestination([P2[0], P2[1]], (dirNext + 180) % 360, turnExtendM);
-          path.push([[P0[0], P0[1], connectorAltitude], [p0ext[0], p0ext[1], connectorAltitude]]);
-          path.push([[p2ext[0], p2ext[1], connectorAltitude], [P2[0], P2[1], connectorAltitude]]);
+          path.push([
+            [P0[0], P0[1], connectorAltitude],
+            [p0ext[0], p0ext[1], connectorAltitude],
+            [p2ext[0], p2ext[1], connectorAltitude],
+            [P2[0], P2[1], connectorAltitude],
+          ]);
         } else {
           path.push([[P0[0], P0[1], connectorAltitude], [P2[0], P2[1], connectorAltitude]]);
         }
       }
     }
     path.push(coords);
+    previousRawLine = line;
   });
   return path;
 }
@@ -409,41 +476,41 @@ export function sampleCameraPositionsOnFlightPath(
     if (!includeTurns && (segIndex % 2 === 1)) continue;
     const segment = path3D[segIndex];
     if (segment.length < 2) continue;
-    
+
     let totalDistance = 0;
     let lastPhotoDistance = 0;
-    
+
     // For the first point, calculate initial bearing from first to second point
     if (segment.length >= 2) {
       const initialBearing = geoBearing([segment[0][0], segment[0][1]], [segment[1][0], segment[1][1]]);
       cameraPositions.push([segment[0][0], segment[0][1], segment[0][2], initialBearing]);
     }
-    
+
     for (let i = 1; i < segment.length; i++) {
       const prevPoint = segment[i - 1];
       const currPoint = segment[i];
-      
+
       // Calculate bearing for this segment (flight direction)
       const segmentBearing = geoBearing([prevPoint[0], prevPoint[1]], [currPoint[0], currPoint[1]]);
-      
+
       // Calculate distance between consecutive points
       const stepDistance = haversineDistance([prevPoint[0], prevPoint[1]], [currPoint[0], currPoint[1]]);
       const stepStartDistance = totalDistance;
       totalDistance += stepDistance;
-      
+
       // Check if we need to add camera positions along this step
       while (lastPhotoDistance + photoSpacingMeters <= totalDistance) {
         const targetDistance = lastPhotoDistance + photoSpacingMeters;
-        
+
         // How far along this step is the target distance?
         const distanceIntoStep = targetDistance - stepStartDistance;
         const interpolationRatio = stepDistance > 0 ? distanceIntoStep / stepDistance : 0;
-        
+
         // Interpolate position along the step
         const lng = prevPoint[0] + (currPoint[0] - prevPoint[0]) * interpolationRatio;
         const lat = prevPoint[1] + (currPoint[1] - prevPoint[1]) * interpolationRatio;
         const alt = prevPoint[2] + (currPoint[2] - prevPoint[2]) * interpolationRatio;
-        
+
         // Use the bearing of this segment as the yaw (flight direction)
         cameraPositions.push([lng, lat, alt, segmentBearing]);
         lastPhotoDistance = targetDistance;
@@ -462,7 +529,7 @@ export function sampleCameraPositionsOnFlightPath(
       }
     }
   }
-  
+
   return cameraPositions;
 }
 

@@ -27,13 +27,13 @@ async function getTileData(
     ctx.drawImage(image, 0, 0);
     const imageData = ctx.getImageData(0, 0, image.width, image.height);
     const data = new Uint8ClampedArray(imageData.data);
-    
+
     // Calculate tile coordinates from URL
     const urlParts = url.split('/');
     const z = parseInt(urlParts[urlParts.length - 3]);
     const x = parseInt(urlParts[urlParts.length - 2]);
     const y = parseInt(urlParts[urlParts.length - 1].split('.')[0]);
-    
+
     return {
       x,
       y,

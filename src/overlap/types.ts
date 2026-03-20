@@ -8,6 +8,7 @@ export type CameraModel = {
   h_px: number;
   cx_px?: number;   // default: w/2
   cy_px?: number;   // default: h/2
+  names?: string[];
 };
 
 export type PoseMeters = {

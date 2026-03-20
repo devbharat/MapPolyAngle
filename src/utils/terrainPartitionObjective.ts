@@ -10,7 +10,7 @@ import {
   lineSpacingRotated,
 } from "@/domain/camera";
 import {
-  DEFAULT_LIDAR,
+  DEFAULT_LIDAR_MAX_RANGE_M,
   getLidarMappingFovDeg,
   getLidarModel,
   lidarDeliverableDensity,
@@ -819,7 +819,7 @@ function evaluateQuality(
       .reduce((sum, item) => sum + item.areaWeight, 0) /
       Math.max(1, weightedMismatches.reduce((sum, item) => sum + item.areaWeight, 0));
     const halfSwathWidthM = lidarSwathWidth(params.altitudeAGL, mappingFovDeg) * 0.5;
-    const maxRangeM = params.maxLidarRangeM ?? model.defaultMaxRangeM ?? DEFAULT_LIDAR.defaultMaxRangeM;
+    const maxRangeM = params.maxLidarRangeM ?? model.defaultMaxRangeM ?? DEFAULT_LIDAR_MAX_RANGE_M;
     const liftedP90SlantRangeM = Math.sqrt(
       (params.altitudeAGL + lineLift.p90LineLiftM) ** 2 + halfSwathWidthM ** 2,
     );
@@ -935,10 +935,8 @@ export function evaluateSensorNodeCostForCells(
     const returnMode = params.lidarReturnMode ?? "single";
     const targetDensityPtsM2 = params.pointDensityPtsM2
       ?? lidarDeliverableDensity(model, params.altitudeAGL, params.sideOverlap, speedMps, returnMode, mappingFovDeg);
-    const maxRangeM = params.maxLidarRangeM ?? model.defaultMaxRangeM ?? DEFAULT_LIDAR.defaultMaxRangeM;
+    const maxRangeM = params.maxLidarRangeM ?? model.defaultMaxRangeM ?? DEFAULT_LIDAR_MAX_RANGE_M;
     const halfSwathWidthM = lidarSwathWidth(params.altitudeAGL, mappingFovDeg) * 0.5;
-    const baseSlantRangeM = Math.sqrt(params.altitudeAGL * params.altitudeAGL + halfSwathWidthM * halfSwathWidthM);
-
     const localDensityFactors = weightedCells.map((item) => {
       const terrainLiftFactor = item.crossSlopeFactor * (0.55 + 0.45 * item.cell.confidence);
       const inducedAltitudeM = params.altitudeAGL * (1 + 0.65 * terrainLiftFactor);
