@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 from shapely.geometry import Polygon, box
 
 from terrain_splitter.costs import RegionObjective
@@ -7,13 +9,17 @@ from terrain_splitter.features import CellFeatures, FeatureField
 from terrain_splitter.geometry import simplify_polygon_coverage
 from terrain_splitter.grid import GridCell, GridData, GridEdge
 from terrain_splitter.schemas import FlightParamsModel
-from terrain_splitter.solver_graphcut import solve_partition_hierarchy
 from terrain_splitter.solver_frontier import (
     BoundaryStats,
     EvaluatedRegion,
     RootSplitTask,
-    SubtreeSolveTask,
     SolverContext,
+    SubtreeSolveTask,
+    _relaxed_region_failure_sets,
+    _region_basic_validity,
+    _region_gate_diagnostics,
+    _region_practical,
+    _cell_lookup,
     _deserialize_partition_plan,
     _feature_lookup,
     _neighbor_lookup,
@@ -23,43 +29,87 @@ from terrain_splitter.solver_frontier import (
     _serialize_solver_context,
     _solve_root_split_branch_with_context,
     _solve_subtree_task_with_context,
-    _cell_lookup,
     solve_root_split_branch_event,
     solve_subtree_task_event,
 )
+from terrain_splitter.solver_graphcut import solve_partition_hierarchy
 
 
 def _toy_grid() -> GridData:
     cells = [
-        GridCell(index=0, row=0, col=0, x=0, y=10, lng=0, lat=0, area_m2=100, terrain_z=100, polygon=box(0, 10, 10, 20)),
-        GridCell(index=1, row=0, col=1, x=10, y=10, lng=0, lat=0, area_m2=100, terrain_z=105, polygon=box(10, 10, 20, 20)),
-        GridCell(index=2, row=1, col=0, x=0, y=0, lng=0, lat=0, area_m2=100, terrain_z=120, polygon=box(0, 0, 10, 10)),
-        GridCell(index=3, row=1, col=1, x=10, y=0, lng=0, lat=0, area_m2=100, terrain_z=125, polygon=box(10, 0, 20, 10)),
+        GridCell(index=0, row=0, col=0, x=0, y=100, lng=0, lat=0, area_m2=10_000, terrain_z=100, polygon=box(0, 100, 100, 200)),
+        GridCell(index=1, row=0, col=1, x=100, y=100, lng=0, lat=0, area_m2=10_000, terrain_z=105, polygon=box(100, 100, 200, 200)),
+        GridCell(index=2, row=1, col=0, x=0, y=0, lng=0, lat=0, area_m2=10_000, terrain_z=120, polygon=box(0, 0, 100, 100)),
+        GridCell(index=3, row=1, col=1, x=100, y=0, lng=0, lat=0, area_m2=10_000, terrain_z=125, polygon=box(100, 0, 200, 100)),
     ]
     edges = [
-        GridEdge(a=0, b=1, shared_boundary_m=10),
-        GridEdge(a=0, b=2, shared_boundary_m=10),
-        GridEdge(a=1, b=3, shared_boundary_m=10),
-        GridEdge(a=2, b=3, shared_boundary_m=10),
+        GridEdge(a=0, b=1, shared_boundary_m=100),
+        GridEdge(a=0, b=2, shared_boundary_m=100),
+        GridEdge(a=1, b=3, shared_boundary_m=100),
+        GridEdge(a=2, b=3, shared_boundary_m=100),
     ]
     return GridData(
         ring=[(0, 0), (0, 1), (1, 1), (1, 0), (0, 0)],
-        polygon_mercator=box(0, 0, 20, 20),
+        polygon_mercator=box(0, 0, 200, 200),
         cells=cells,
         edges=edges,
-        grid_step_m=10,
-        area_m2=400,
+        grid_step_m=100,
+        area_m2=40_000,
+    )
+
+
+def _multimodal_grid() -> GridData:
+    cell_size = 100.0
+    cols = 4
+    rows = 2
+    cells: list[GridCell] = []
+    edges: list[GridEdge] = []
+
+    def cell_index(row: int, col: int) -> int:
+        return row * cols + col
+
+    for row in range(rows):
+        for col in range(cols):
+            x = col * cell_size
+            y = (rows - 1 - row) * cell_size
+            cells.append(
+                GridCell(
+                    index=cell_index(row, col),
+                    row=row,
+                    col=col,
+                    x=x,
+                    y=y,
+                    lng=0,
+                    lat=0,
+                    area_m2=cell_size * cell_size,
+                    terrain_z=100 + cell_index(row, col),
+                    polygon=box(x, y, x + cell_size, y + cell_size),
+                )
+            )
+
+    for row in range(rows):
+        for col in range(cols):
+            if col + 1 < cols:
+                edges.append(GridEdge(a=cell_index(row, col), b=cell_index(row, col + 1), shared_boundary_m=cell_size))
+            if row + 1 < rows:
+                edges.append(GridEdge(a=cell_index(row, col), b=cell_index(row + 1, col), shared_boundary_m=cell_size))
+
+    return GridData(
+        ring=[(0, 0), (0, 1), (1, 1), (1, 0), (0, 0)],
+        polygon_mercator=box(0, 0, cols * cell_size, rows * cell_size),
+        cells=cells,
+        edges=edges,
+        grid_step_m=cell_size,
+        area_m2=cols * rows * cell_size * cell_size,
     )
 
 
 def test_solver_returns_coarse_to_fine_options_for_multimodal_grid() -> None:
-    grid = _toy_grid()
+    grid = _multimodal_grid()
     feature_field = FeatureField(
         cells=[
-            CellFeatures(index=0, preferred_bearing_deg=0, slope_magnitude=0.3, break_strength=18, confidence=0.9, aspect_deg=270),
-            CellFeatures(index=1, preferred_bearing_deg=0, slope_magnitude=0.25, break_strength=18, confidence=0.85, aspect_deg=270),
-            CellFeatures(index=2, preferred_bearing_deg=90, slope_magnitude=0.28, break_strength=18, confidence=0.88, aspect_deg=0),
-            CellFeatures(index=3, preferred_bearing_deg=90, slope_magnitude=0.26, break_strength=18, confidence=0.86, aspect_deg=0),
+            CellFeatures(index=index, preferred_bearing_deg=(0 if (index % 4) < 2 else 90), slope_magnitude=0.25, break_strength=18, confidence=0.9, aspect_deg=(270 if (index % 4) < 2 else 0))
+            for index in range(8)
         ],
         dominant_preferred_bearing_deg=45,
     )
@@ -71,13 +121,11 @@ def test_solver_returns_coarse_to_fine_options_for_multimodal_grid() -> None:
 
 
 def test_solver_frontier_contains_face_aligned_quality_solution() -> None:
-    grid = _toy_grid()
+    grid = _multimodal_grid()
     feature_field = FeatureField(
         cells=[
-            CellFeatures(index=0, preferred_bearing_deg=0, slope_magnitude=0.3, break_strength=18, confidence=0.9, aspect_deg=270),
-            CellFeatures(index=1, preferred_bearing_deg=0, slope_magnitude=0.25, break_strength=18, confidence=0.85, aspect_deg=270),
-            CellFeatures(index=2, preferred_bearing_deg=90, slope_magnitude=0.28, break_strength=18, confidence=0.88, aspect_deg=0),
-            CellFeatures(index=3, preferred_bearing_deg=90, slope_magnitude=0.26, break_strength=18, confidence=0.86, aspect_deg=0),
+            CellFeatures(index=index, preferred_bearing_deg=(0 if (index % 4) < 2 else 90), slope_magnitude=0.25, break_strength=18, confidence=0.9, aspect_deg=(270 if (index % 4) < 2 else 0))
+            for index in range(8)
         ],
         dominant_preferred_bearing_deg=45,
     )
@@ -156,6 +204,7 @@ def test_lambda_root_split_worker_event_matches_direct_branch_solver() -> None:
         feature_lookup=_feature_lookup(feature_field),
         cell_lookup=_cell_lookup(grid),
         neighbors=_neighbor_lookup(grid),
+        line_length_scale=0.4,
     )
     task = RootSplitTask(
         left_ids=(0, 1),
@@ -203,6 +252,7 @@ def test_lambda_subtree_worker_event_matches_direct_subtree_solver() -> None:
         feature_lookup=_feature_lookup(feature_field),
         cell_lookup=_cell_lookup(grid),
         neighbors=_neighbor_lookup(grid),
+        line_length_scale=0.4,
     )
     task = SubtreeSolveTask(cell_ids=(0, 1), depth=1)
 
@@ -272,7 +322,7 @@ def test_pareto_frontier_preserves_practical_plan_against_non_practical_dominato
     non_practical = _plan_from_regions(
         (
             _mock_region(500.0, 260.0, region_id=4, bearing_deg=0.0),
-            _mock_region(500.0, 180.0, region_id=5, bearing_deg=90.0),
+            _mock_region(500.0, 120.0, region_id=5, bearing_deg=90.0),
         ),
         0.0,
         0.0,
@@ -300,7 +350,7 @@ def test_pareto_frontier_preserves_practical_plan_against_non_practical_dominato
         region_count=non_practical.region_count,
     )
 
-    frontier = _pareto_frontier([baseline, practical, non_practical], root_area_m2)
+    frontier = _pareto_frontier([baseline, practical, non_practical], root_area_m2, 0.4)
     assert any(plan.region_count == 2 and abs(plan.quality_cost - 5.0) < 1e-6 for plan in frontier)
 
 
@@ -329,3 +379,51 @@ def test_coverage_simplify_reduces_vertices_while_preserving_shared_boundary() -
     shared_edge = simplified[0].boundary.intersection(simplified[1].boundary)
     assert shared_edge.length > 0
     assert shared_edge.geom_type in {"LineString", "MultiLineString"}
+
+
+def test_relaxed_region_failure_sets_keep_convexity_and_20m_floor_hard() -> None:
+    region = _mock_region(500.0, 260.0, region_id=9)
+    objective = replace(
+        region.objective,
+        mean_line_length_m=18.0,
+        convexity=0.5,
+    )
+    adjusted_region = region.__class__(
+        cell_ids=region.cell_ids,
+        polygon=region.polygon,
+        ring=region.ring,
+        objective=objective,
+        score=region.score,
+        hard_invalid=region.hard_invalid,
+    )
+
+    diagnostics = _region_gate_diagnostics(adjusted_region, 1_000.0, practical=False, line_length_scale=0.37)
+    hard_failures, soft_failures = _relaxed_region_failure_sets(diagnostics, practical=False)
+
+    assert "convexity" in hard_failures
+    assert "mean_line_length_hard_floor_m" in hard_failures
+    assert "mean_line_length_m" not in soft_failures
+
+
+def test_relaxed_region_failure_sets_treat_scaled_line_length_as_soft() -> None:
+    region = _mock_region(500.0, 260.0, region_id=10)
+    objective = replace(
+        region.objective,
+        along_track_length_m=500.0,
+        cross_track_width_m=1_200.0,
+        mean_line_length_m=300.0,
+    )
+    adjusted_region = region.__class__(
+        cell_ids=region.cell_ids,
+        polygon=region.polygon,
+        ring=region.ring,
+        objective=objective,
+        score=region.score,
+        hard_invalid=region.hard_invalid,
+    )
+
+    diagnostics = _region_gate_diagnostics(adjusted_region, 1_000.0, practical=False, line_length_scale=0.37)
+    hard_failures, soft_failures = _relaxed_region_failure_sets(diagnostics, practical=False)
+
+    assert "mean_line_length_hard_floor_m" not in hard_failures
+    assert "mean_line_length_m" in soft_failures
