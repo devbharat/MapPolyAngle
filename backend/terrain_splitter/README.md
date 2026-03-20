@@ -74,6 +74,18 @@ export MAPBOX_TOKEN=YOUR_MAPBOX_TOKEN
 ./deploy_aws.sh
 ```
 
+To deploy a separate staging stack and Function URL without touching the current production stack:
+
+```bash
+export MAPBOX_TOKEN=YOUR_MAPBOX_TOKEN
+./deploy_aws_staging.sh
+```
+
+The staging deploy uses the `staging` SAM config environment from
+[samconfig.toml](/Users/bharat/Documents/src/MapPolyAngle-main-backend-sync-20260320/backend/terrain_splitter/samconfig.toml),
+which points at a separate stack name (`terrain-splitter-staging`) and S3 prefix
+(`terrain-splitter-staging`).
+
 After deploy, set the frontend to the Function URL:
 
 ```bash
