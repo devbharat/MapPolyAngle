@@ -101,5 +101,6 @@ Notes:
   - `TERRAIN_SPLITTER_ROOT_PARALLEL_MODE=lambda`
   - `TERRAIN_SPLITTER_ROOT_PARALLEL_WORKERS`
   - `TERRAIN_SPLITTER_ROOT_PARALLEL_GRANULARITY=branch|subtree`
+  - `TERRAIN_SPLITTER_ROOT_PARALLEL_MAX_INFLIGHT`
 - Local runs still default to exact process-based root fan-out when `TERRAIN_SPLITTER_ROOT_PARALLEL_WORKERS > 1`.
 - Timeout is `900s`, matching Lambda's maximum.

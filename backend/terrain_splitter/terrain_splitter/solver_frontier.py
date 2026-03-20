@@ -65,6 +65,9 @@ OUTPUT_RING_SIMPLIFY_FACTOR = 0.4
 OUTPUT_RING_SIMPLIFY_MIN_M = 6.0
 OUTPUT_RING_SIMPLIFY_MAX_M = 24.0
 logger = logging.getLogger("uvicorn.error")
+_LAMBDA_CLIENT: Any | None = None
+_LAMBDA_CLIENT_MAX_POOL_CONNECTIONS = 0
+_LAMBDA_CLIENT_READ_TIMEOUT_SEC = 0
 
 
 @dataclass(slots=True)
@@ -248,6 +251,52 @@ def _resolve_root_parallel_granularity(requested: Literal["branch", "subtree"] |
     if raw == "subtree":
         return "subtree"
     return "branch"
+
+
+def _resolve_root_parallel_max_inflight(requested: int | None) -> int | None:
+    if requested is not None:
+        return max(0, int(requested))
+    raw = os.environ.get("TERRAIN_SPLITTER_ROOT_PARALLEL_MAX_INFLIGHT")
+    if raw is None or raw.strip() == "":
+        return None
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        logger.warning(
+            "[terrain-split-backend] invalid TERRAIN_SPLITTER_ROOT_PARALLEL_MAX_INFLIGHT=%r; falling back to worker limit",
+            raw,
+        )
+        return None
+
+
+def _resolve_lambda_invoke_read_timeout_sec(requested: int | None) -> int:
+    if requested is not None:
+        return max(1, int(requested))
+    raw = os.environ.get("TERRAIN_SPLITTER_LAMBDA_INVOKE_READ_TIMEOUT_SEC")
+    if raw is None or raw.strip() == "":
+        return 300
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        logger.warning(
+            "[terrain-split-backend] invalid TERRAIN_SPLITTER_LAMBDA_INVOKE_READ_TIMEOUT_SEC=%r; falling back to 300s",
+            raw,
+        )
+        return 300
+
+
+def _resolve_lambda_parallel_invocations(
+    task_count: int,
+    fallback_workers: int,
+    max_inflight: int | None,
+) -> int:
+    if task_count <= 0:
+        return 0
+    if max_inflight is None:
+        return min(task_count, max(1, fallback_workers))
+    if max_inflight <= 0:
+        return task_count
+    return min(task_count, max_inflight)
 
 
 def _init_parallel_solver_context(context: SolverContext) -> None:
@@ -2423,21 +2472,44 @@ def solve_subtree_task_event(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _invoke_root_split_branch_lambda(
-    function_name: str,
-    context: SolverContext,
-    task: RootSplitTask,
-) -> tuple[list[PartitionPlan], dict[str, float]]:
+def _lambda_client(max_pool_connections: int, read_timeout_sec: int) -> Any:
+    global _LAMBDA_CLIENT, _LAMBDA_CLIENT_MAX_POOL_CONNECTIONS, _LAMBDA_CLIENT_READ_TIMEOUT_SEC
+    required_pool_connections = max(8, int(max_pool_connections))
+    required_read_timeout_sec = max(1, int(read_timeout_sec))
+    if (
+        _LAMBDA_CLIENT is not None
+        and _LAMBDA_CLIENT_MAX_POOL_CONNECTIONS >= required_pool_connections
+        and _LAMBDA_CLIENT_READ_TIMEOUT_SEC == required_read_timeout_sec
+    ):
+        return _LAMBDA_CLIENT
     try:
         import boto3
+        from botocore.config import Config
     except Exception as exc:  # noqa: BLE001
         raise RuntimeError("boto3 is required for Lambda root fan-out mode.") from exc
 
-    client = boto3.client("lambda")
+    _LAMBDA_CLIENT = boto3.client(
+        "lambda",
+        config=Config(
+            max_pool_connections=required_pool_connections,
+            read_timeout=required_read_timeout_sec,
+        ),
+    )
+    _LAMBDA_CLIENT_MAX_POOL_CONNECTIONS = required_pool_connections
+    _LAMBDA_CLIENT_READ_TIMEOUT_SEC = required_read_timeout_sec
+    return _LAMBDA_CLIENT
+
+
+def _invoke_root_split_branch_lambda(
+    function_name: str,
+    serialized_context: dict[str, Any],
+    task: RootSplitTask,
+    client: Any,
+) -> tuple[list[PartitionPlan], dict[str, float]]:
     payload = {
         "terrainSplitterInternal": "root-split",
         "payload": {
-            "context": _serialize_solver_context(context),
+            "context": serialized_context,
             "task": _serialize_root_split_task(task),
         },
     }
@@ -2459,19 +2531,14 @@ def _invoke_root_split_branch_lambda(
 
 def _invoke_subtree_lambda(
     function_name: str,
-    context: SolverContext,
+    serialized_context: dict[str, Any],
     task: SubtreeSolveTask,
+    client: Any,
 ) -> tuple[list[PartitionPlan], dict[str, float]]:
-    try:
-        import boto3
-    except Exception as exc:  # noqa: BLE001
-        raise RuntimeError("boto3 is required for Lambda subtree fan-out mode.") from exc
-
-    client = boto3.client("lambda")
     payload = {
         "terrainSplitterInternal": "subtree",
         "payload": {
-            "context": _serialize_solver_context(context),
+            "context": serialized_context,
             "task": _serialize_subtree_task(task),
         },
     }
@@ -2501,9 +2568,12 @@ def _solve_root_splits_via_lambda(
         raise RuntimeError("AWS_LAMBDA_FUNCTION_NAME is required for Lambda root fan-out mode.")
     perf = _make_perf()
     plans: list[PartitionPlan] = []
+    serialized_context = _serialize_solver_context(context)
+    read_timeout_sec = _resolve_lambda_invoke_read_timeout_sec(None)
+    client = _lambda_client(max_workers, read_timeout_sec)
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [
-            executor.submit(_invoke_root_split_branch_lambda, function_name, context, task)
+            executor.submit(_invoke_root_split_branch_lambda, function_name, serialized_context, task, client)
             for task in tasks
         ]
         for future in futures:
@@ -2523,9 +2593,12 @@ def _solve_subtrees_via_lambda(
         raise RuntimeError("AWS_LAMBDA_FUNCTION_NAME is required for Lambda subtree fan-out mode.")
     perf = _make_perf()
     subtree_results: dict[int, dict[str, list[PartitionPlan]]] = defaultdict(dict)
+    serialized_context = _serialize_solver_context(context)
+    read_timeout_sec = _resolve_lambda_invoke_read_timeout_sec(None)
+    client = _lambda_client(max_workers, read_timeout_sec)
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [
-            (index, side, executor.submit(_invoke_subtree_lambda, function_name, context, task))
+            (index, side, executor.submit(_invoke_subtree_lambda, function_name, serialized_context, task, client))
             for index, side, task in tasks
         ]
         for index, side, future in futures:
@@ -2546,6 +2619,7 @@ def solve_partition_hierarchy(
     root_parallel_workers: int | None = None,
     root_parallel_mode: Literal["process", "lambda"] | None = None,
     root_parallel_granularity: Literal["branch", "subtree"] | None = None,
+    root_parallel_max_inflight: int | None = None,
     line_length_scale: float | None = None,
     debug_output: dict[str, Any] | None = None,
 ) -> list[PartitionSolutionPreviewModel]:
@@ -2581,6 +2655,7 @@ def solve_partition_hierarchy(
     requested_workers = _resolve_root_parallel_workers(root_parallel_workers)
     parallel_mode = _resolve_root_parallel_mode(root_parallel_mode)
     parallel_granularity = _resolve_root_parallel_granularity(root_parallel_granularity)
+    lambda_max_inflight = _resolve_root_parallel_max_inflight(root_parallel_max_inflight)
     all_plans: list[PartitionPlan]
     if requested_workers <= 1:
         all_plans = _solve_region_recursive(root_cell_ids, max_depth, context, caches, perf)
@@ -2609,6 +2684,8 @@ def solve_partition_hierarchy(
                     perf["root_parallel_requested_workers"] = requested_workers
                     perf["root_parallel_workers_used"] = usable_workers
                     perf["root_parallel_split_count"] = len(root_splits)
+                    if lambda_max_inflight is not None:
+                        perf["root_parallel_max_inflight"] = lambda_max_inflight
                     branch_started_at = time.perf_counter()
                     branch_candidates: list[PartitionPlan] = []
                     tasks = [
@@ -2629,7 +2706,11 @@ def solve_partition_hierarchy(
                                 for index, split in enumerate(root_splits):
                                     subtree_tasks.append((index, "left", SubtreeSolveTask(cell_ids=split.left_ids, depth=max_depth - 1)))
                                     subtree_tasks.append((index, "right", SubtreeSolveTask(cell_ids=split.right_ids, depth=max_depth - 1)))
-                                subtree_workers = min(max(requested_workers, len(tasks)), len(subtree_tasks))
+                                subtree_workers = _resolve_lambda_parallel_invocations(
+                                    len(subtree_tasks),
+                                    min(max(requested_workers, len(tasks)), len(subtree_tasks)),
+                                    lambda_max_inflight,
+                                )
                                 perf["root_parallel_subtree_tasks"] = len(subtree_tasks)
                                 perf["root_parallel_workers_used"] = subtree_workers
                                 subtree_results, lambda_perf = _solve_subtrees_via_lambda(
@@ -2652,7 +2733,13 @@ def solve_partition_hierarchy(
                                             branch_candidates.append(combined)
                                             perf["combined_plan_candidates"] += 1
                             else:
-                                lambda_plans, lambda_perf = _solve_root_splits_via_lambda(tasks, context, usable_workers)
+                                branch_workers = _resolve_lambda_parallel_invocations(
+                                    len(tasks),
+                                    usable_workers,
+                                    lambda_max_inflight,
+                                )
+                                perf["root_parallel_workers_used"] = branch_workers
+                                lambda_plans, lambda_perf = _solve_root_splits_via_lambda(tasks, context, branch_workers)
                                 branch_candidates.extend(lambda_plans)
                                 _merge_perf(perf, lambda_perf)
                         else:

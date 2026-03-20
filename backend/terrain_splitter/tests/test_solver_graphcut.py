@@ -27,6 +27,9 @@ from terrain_splitter.solver_frontier import (
     _neighbor_lookup,
     _pareto_frontier,
     _plan_from_regions,
+    _resolve_lambda_invoke_read_timeout_sec,
+    _resolve_lambda_parallel_invocations,
+    _resolve_root_parallel_max_inflight,
     _serialize_partition_plan,
     _serialize_solver_context,
     _solve_root_split_branch_with_context,
@@ -183,6 +186,22 @@ def test_solver_parallel_root_path_matches_serial_frontier() -> None:
 
     assert summarize(serial) == summarize(parallel)
     assert summarize(serial) == summarize(subtree_parallel)
+
+
+def test_lambda_parallel_invocations_respects_explicit_max_inflight() -> None:
+    assert _resolve_lambda_parallel_invocations(16, 8, 12) == 12
+    assert _resolve_lambda_parallel_invocations(16, 8, 0) == 16
+    assert _resolve_lambda_parallel_invocations(8, 4, None) == 4
+
+
+def test_root_parallel_max_inflight_reads_environment(monkeypatch) -> None:
+    monkeypatch.setenv("TERRAIN_SPLITTER_ROOT_PARALLEL_MAX_INFLIGHT", "24")
+    assert _resolve_root_parallel_max_inflight(None) == 24
+
+
+def test_lambda_invoke_read_timeout_reads_environment(monkeypatch) -> None:
+    monkeypatch.setenv("TERRAIN_SPLITTER_LAMBDA_INVOKE_READ_TIMEOUT_SEC", "300")
+    assert _resolve_lambda_invoke_read_timeout_sec(None) == 300
 
 
 def test_lambda_root_split_worker_event_matches_direct_branch_solver() -> None:

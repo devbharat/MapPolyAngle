@@ -14,8 +14,34 @@ fi
 DOCKER_SOCKET="${DOCKER_HOST:-unix://$HOME/.docker/run/docker.sock}"
 export DOCKER_HOST="$DOCKER_SOCKET"
 
+CONFIG_PARAMETER_OVERRIDES="$(
+python3 - "$CONFIG_ENV" <<'PY'
+from __future__ import annotations
+
+import pathlib
+import sys
+import tomllib
+
+config_env = sys.argv[1]
+config_path = pathlib.Path("samconfig.toml")
+with config_path.open("rb") as fh:
+    config = tomllib.load(fh)
+
+section = config.get(config_env, {})
+deploy = section.get("deploy", {})
+parameters = deploy.get("parameters", {})
+print(parameters.get("parameter_overrides", ""))
+PY
+)"
+
+if [ -n "$CONFIG_PARAMETER_OVERRIDES" ]; then
+  PARAMETER_OVERRIDES="$CONFIG_PARAMETER_OVERRIDES MapboxToken=$MAPBOX_TOKEN"
+else
+  PARAMETER_OVERRIDES="MapboxToken=$MAPBOX_TOKEN"
+fi
+
 echo "Building terrain splitter Lambda with SAM (config env: $CONFIG_ENV)..."
 sam build --config-env "$CONFIG_ENV" --use-container
 
 echo "Deploying terrain splitter Lambda (config env: $CONFIG_ENV)..."
-sam deploy --config-env "$CONFIG_ENV" --parameter-overrides "MapboxToken=$MAPBOX_TOKEN"
+sam deploy --config-env "$CONFIG_ENV" --parameter-overrides "$PARAMETER_OVERRIDES"
